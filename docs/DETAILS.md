@@ -1259,7 +1259,9 @@ candidate and the prompt agree on (not the candidate's length), and
 the SELECTED source was used, and `deeper_rejection_reason` (with
 `deeper_candidate_tokens`) names why a DEEPER candidate was refused, so a successful
 shallow reuse does not hide the deeper refusal (`TOKEN_MISMATCH`, `IMAGE_MISMATCH`,
-`STEERING_MISMATCH`, `ABSENT`, `INELIGIBLE`, `CACHE_DISABLED`, ...). A checkpoint
+`STEERING_MISMATCH`, `ABSENT`, `INELIGIBLE`, `CACHE_DISABLED`, ...). A refused candidate
+that was SHORTER than what was selected is not what stopped the request from reusing
+more, so it is not reported as the deeper one (`deeper_rejection_reason=UNKNOWN`). A checkpoint
 that leaves the chain, a refused park and a parked conversation evicted to make room
 get their own lines (`event=checkpoint_evict`, `event=park_refused`,
 `event=park_evict`, `event=checkpoint_super`). The fields are counts, positions

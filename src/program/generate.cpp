@@ -8813,7 +8813,9 @@ int main(int argc, char** argv) {
             int64_t best_mismatch = -1;    ///< the first mismatch of that candidate
             strata::program::cache_diag::Reason best_reason = strata::program::cache_diag::Reason::unknown;
             // The DEEPER candidate that was refused while a shallower one was selected.  Without this the event
-            // says only that the selected source matched, which hides WHY the deeper one was not used.
+            // says only that the selected source matched, which hides WHY the deeper one was not used.  It is
+            // resolved at the decision boundary: only a candidate DEEPER than what was selected counts (a refused
+            // candidate that was shallower is not what stopped the request from reusing more).
             int64_t deeper_tokens = 0;
             strata::program::cache_diag::Reason deeper_reason = strata::program::cache_diag::Reason::unknown;
             strata::program::cache_diag::Reason reason = strata::program::cache_diag::Reason::unknown;
@@ -8843,9 +8845,9 @@ int main(int argc, char** argv) {
                 // the best candidate is the one that agrees with the prompt for the most tokens: its reason is
                 // the reason the request could not reuse more.
                 if (lcp > best_lcp) { best_lcp = lcp; best_mismatch = mismatch; best_reason = reason; }
-                // The DEEPER candidate that was refused: the one the request wanted but could not have.  It is the
-                // longest candidate that was NOT usable.  It is reported separately from the selected source, so a
-                // successful shallow reuse does not hide the deeper refusal.
+                // The refused candidate the request wanted but could not have: the longest one that was NOT usable.
+                // Whether it really was DEEPER than the selected source is settled at the decision boundary, when
+                // the selected prefix is known.
                 if (!usable && tokens > deeper_tokens) { deeper_tokens = tokens; deeper_reason = reason; }
             }
             /// The event, ready to write.  `reason` is the reason the SELECTED source is used; when nothing was
@@ -8862,8 +8864,12 @@ int main(int argc, char** argv) {
                 e.longest_common_prefix_tokens = best_lcp;
                 e.first_mismatch_position = best_mismatch;
                 e.rejection_reason = reason;
-                e.deeper_rejection_reason = deeper_reason;
-                e.deeper_candidate_tokens = deeper_tokens;
+                // The deeper refused candidate, but only when it really was deeper than what was selected: a
+                // refused candidate that was SHORTER is not what stopped the request from reusing more.
+                if (deeper_tokens > selected_prefix) {
+                    e.deeper_rejection_reason = deeper_reason;
+                    e.deeper_candidate_tokens = deeper_tokens;
+                }
                 e.cache_parked_entries = cache.size();
                 e.cache_parked_bytes = cache.bytes();
                 e.cache_evictions_total = cache.evictions();

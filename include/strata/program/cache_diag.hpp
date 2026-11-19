@@ -153,7 +153,9 @@ struct CacheDiagEvent {
     // event says only that the selected source matched ("EXACT_MATCH"), which hides WHY the deeper one - the one
     // the request wanted - was not used.  UNKNOWN when no deeper candidate was refused.
     Reason deeper_rejection_reason = Reason::unknown;
-    // The deeper refused candidate's own length, 0 when there was none.  It says how much was NOT reused.
+    // The deeper refused candidate's own length, 0 when there was none.  It says how much was NOT reused.  It is
+    // the length of a candidate DEEPER than the selected one: a refused candidate that was SHORTER than what was
+    // selected is not what stopped the request from reusing more, so it is not reported here.
     int64_t deeper_candidate_tokens = 0;
     size_t cache_parked_entries = 0;
     size_t cache_parked_bytes = 0;

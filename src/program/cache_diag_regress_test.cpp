@@ -122,8 +122,12 @@ struct CacheDiagCollector {
         e.longest_common_prefix_tokens = best_lcp;
         e.first_mismatch_position = best_mismatch;
         e.rejection_reason = reason;
-        e.deeper_rejection_reason = deeper_reason;
-        e.deeper_candidate_tokens = deeper_tokens;
+        // The deeper refused candidate, but only when it really was deeper than what was selected: a refused
+        // candidate that was SHORTER is not what stopped the request from reusing more.
+        if (deeper_tokens > selected_prefix) {
+            e.deeper_rejection_reason = deeper_reason;
+            e.deeper_candidate_tokens = deeper_tokens;
+        }
         e.cache_parked_entries = cache.size();
         e.cache_parked_bytes = cache.bytes();
         e.cache_evictions_total = cache.evictions();
@@ -221,6 +225,11 @@ int64_t run_request(Request& r, CacheDiagCollector& cdiag) {
                 cdiag_consider(Source::slot, c.ids, c.imgs, true);
         }
     }
+    // the engine's selection, exactly as generate.cpp does it:
+    //   borrow:      parked.tokens > std::max(resume, slot_tokens) && conversations.borrows(parked)
+    //   parked take: parked.tokens > std::max(resume, slot_tokens) && !borrow  ->  incoming
+    //   then:        if (incoming || borrow) slot_source = -1;   (the parked side cancels the slot)
+    //   the slot:    slot_source >= 0  ->  resume = slot_tokens; from_live = true;
     bool parked_used = false, parked_borrowed = false, parked_taken_live = false;
     const auto parked = r.conversations->best(ids, r.req_imgs, r.want_cvec);
     if (cdiag.on) {
@@ -241,17 +250,27 @@ int64_t run_request(Request& r, CacheDiagCollector& cdiag) {
             cdiag.add(src, c.tokens, lcp, mismatch, rr, c.prefix > 0);
         }
     }
-    const bool borrow = parked.tokens > resume && r.conversations->borrows(parked);
-    if (parked.tokens > resume) {
+    // PRODUCTION (generate.cpp): the parked side competes with the SLOT, not only with the live prefix.
+    const bool borrow = parked.tokens > std::max(resume, slot_tokens) && r.conversations->borrows(parked);
+    bool incoming = false;
+    if (parked.tokens > std::max(resume, slot_tokens) && !borrow) incoming = true;
+    if (incoming || borrow) slot_source = -1;   // the parked side cancels the slot
+    if (incoming) {
         parked_used = true;
         parked_borrowed = borrow;
         parked_taken_live = parked.live;
         resume = parked.tokens;
         from_live = parked.live;
-    } else if (slot_source >= 0 && slot_tokens > resume) {
-        // the slot's tokens are mounted (generate.cpp: the slot's sessions are copied back, the new part is read)
-        resume = slot_tokens;
+    } else if (borrow) {
+        parked_used = true;
+        parked_borrowed = true;
+        parked_taken_live = false;   // a borrow mounts a CHECKPOINT of the donor, not its live state
+        resume = parked.tokens;
         from_live = false;
+    } else if (slot_source >= 0) {
+        // the slot's tokens are mounted (generate.cpp: resume = slot_tokens; from_live = true;)
+        resume = slot_tokens;
+        from_live = true;
     }
     // the decision, resolved (generate.cpp)
     if (cdiag.on) {
@@ -428,6 +447,151 @@ int main() {
         check(resume == 6, "R2c: the parked side wins, as before");
         const auto e = cdiag.event(cache);
         check(e.selected_source == Source::parked_live, "R2c: the parked side is the source, not the slot");
+    }
+    {   // R5: the image identity at the checkpoint's boundary.
+        // The picture sits at index 5, INSIDE a six-token checkpoint: the checkpoint's own length is 6, so the
+        // picture is below its end and the checkpoint's identity depends on it.
+        //   (a) the checkpoint's picture IS the prompt's -> the checkpoint is reusable
+        //   (b) the checkpoint's picture is NOT the prompt's -> the checkpoint is refused
+        //   (c) a shallower checkpoint that ends BEFORE the picture (4 tokens) is still reusable
+        const Ids prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<ImgKey> img_prompt = {{5, 222}};   // the picture at index 5
+
+        {   // (a) the same image identity: the six-token checkpoint is used
+            ConversationCache cache(1 << 20, 4);
+            CacheDiagCollector cdiag;
+            cdiag.on = true;
+            Request r;
+            r.ids = prompt;
+            r.req_imgs = img_prompt;
+            ConversationCheckpoint deep;
+            deep.ids = {1, 2, 3, 4, 5, 6};
+            deep.imgs = {{5, 222}};   // the SAME identity as the prompt's
+            r.checks = {deep};
+            r.conversations = &cache;
+            const int64_t resume = run_request(r, cdiag);
+            check(resume == 6, "R5a: the matching six-token checkpoint is reused");
+            const auto e = cdiag.event(cache);
+            check(e.selected_source == Source::active_checkpoint, "R5a: the source is the checkpoint");
+            check(e.selected_prefix_tokens == 6, "R5a: the reported prefix is the checkpoint's length");
+            check(e.deeper_rejection_reason == Reason::unknown,
+                  "R5a: nothing deeper was refused, so the reason is UNKNOWN");
+            check(e.deeper_candidate_tokens == 0, "R5a: nothing deeper was refused, so there is no deeper candidate");
+        }
+        {   // (b) a different image identity: the six-token checkpoint is refused
+            ConversationCache cache(1 << 20, 4);
+            CacheDiagCollector cdiag;
+            cdiag.on = true;
+            Request r;
+            r.ids = prompt;
+            r.req_imgs = img_prompt;
+            ConversationCheckpoint deep;
+            deep.ids = {1, 2, 3, 4, 5, 6};
+            deep.imgs = {{5, 111}};   // NOT the prompt's identity
+            r.checks = {deep};
+            r.conversations = &cache;
+            const int64_t resume = run_request(r, cdiag);
+            check(resume == 0, "R5b: the six-token checkpoint with another identity is refused");
+            const auto e = cdiag.event(cache);
+            check(e.selected_source == Source::none, "R5b: no source was mounted");
+            check(e.deeper_rejection_reason == Reason::image_mismatch,
+                  "R5b: the event names the image identity mismatch");
+            check(e.deeper_candidate_tokens == 6, "R5b: the refused candidate's length is reported");
+        }
+        {   // (c) a shallower checkpoint that ends BEFORE the picture: it is still reusable
+            ConversationCache cache(1 << 20, 4);
+            CacheDiagCollector cdiag;
+            cdiag.on = true;
+            Request r;
+            r.ids = prompt;
+            r.req_imgs = img_prompt;
+            ConversationCheckpoint shallow;   // 4 tokens: the picture at index 5 is BELOW its end
+            shallow.ids = {1, 2, 3, 4};
+            ConversationCheckpoint deep;      // 6 tokens: the picture is inside it, and the identity differs
+            deep.ids = {1, 2, 3, 4, 5, 6};
+            deep.imgs = {{5, 111}};
+            r.checks = {shallow, deep};
+            r.conversations = &cache;
+            const int64_t resume = run_request(r, cdiag);
+            check(resume == 4, "R5c: the shallower checkpoint that ends before the picture is reused");
+            const auto e = cdiag.event(cache);
+            check(e.selected_source == Source::active_checkpoint, "R5c: the source is the active checkpoint");
+            check(e.selected_prefix_tokens == 4, "R5c: the reported prefix is the shallower checkpoint's length");
+            check(e.deeper_rejection_reason == Reason::image_mismatch,
+                  "R5c: the deeper checkpoint's image mismatch is named");
+            check(e.deeper_candidate_tokens == 6, "R5c: the deeper checkpoint's length is reported");
+        }
+    }
+    {   // R6: the batch slot against a parked checkpoint.
+        // slot_tokens=6000, parked.tokens=5000, resume=0.  Production (generate.cpp):
+        //   the parked side is taken only when `parked.tokens > std::max(resume, slot_tokens)`, so 5000 > 6000 is
+        //   FALSE: the parked side does NOT win, the slot does.  The event must name the SLOT.
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(image({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20})),
+              "R6: park a conversation of 20 tokens");
+        CacheDiagCollector cdiag;
+        cdiag.on = true;
+        Request r;
+        // the prompt: 6002 tokens, so a 6000-token slot is below it
+        r.ids.resize(6002);
+        for (size_t i = 0; i < r.ids.size(); ++i) r.ids[i] = (int32_t) (i + 1);
+        r.slot_present = true;
+        r.slot_ids.assign(r.ids.begin(), r.ids.begin() + 6000);   // the slot's own 6000 tokens
+        r.conversations = &cache;
+        // the parked conversation's live state must be a 5000-token prefix of the prompt, so parked.tokens == 5000
+        // (the cache's best() walks the parked conversation's live state)
+        {
+            ConversationCache probe(1 << 20, 4);
+            SavedConversation donor;
+            donor.live.ids.assign(r.ids.begin(), r.ids.begin() + 5000);
+            donor.live.gdn.resize(64, 7);
+            check(probe.put(std::move(donor)), "R6: park a 5000-token donor");
+            const auto m = probe.best(r.ids, {}, true);
+            check(m.tokens == 5000, "R6: the parked side's best is 5000 tokens");
+        }
+        {
+            // replace the cache's entry with the 5000-token donor
+            ConversationCache c2(1 << 20, 4);
+            SavedConversation donor;
+            donor.live.ids.assign(r.ids.begin(), r.ids.begin() + 5000);
+            donor.live.gdn.resize(64, 7);
+            check(c2.put(std::move(donor)), "R6: park the 5000-token donor");
+            r.conversations = &c2;
+            const int64_t resume = run_request(r, cdiag);
+            check(resume == 6000, "R6: the SLOT wins: 6000 tokens, not the parked 5000");
+            const auto e = cdiag.event(c2);
+            check(e.selected_source == Source::slot, "R6: the event names the SLOT, not the parked side");
+            check(e.selected_prefix_tokens == 6000, "R6: the reported prefix is the slot's 6000 tokens");
+            check(e.rejection_reason == Reason::slot_source, "R6: the reason is the slot");
+        }
+    }
+    {   // R4: a REJECTED candidate that is SHORTER than the selected one is not a "deeper" candidate.
+        // The event's deeper_candidate_tokens must be 0 and its deeper_rejection_reason UNKNOWN: the
+        // shorter refusal is not what stopped the request from reusing more.
+        ConversationCache cache(1 << 20, 4);
+        CacheDiagCollector cdiag;
+        cdiag.on = true;
+        Request r;
+        // the prompt: 6002 tokens
+        r.ids.resize(6002);
+        for (size_t i = 0; i < r.ids.size(); ++i) r.ids[i] = (int32_t) (i + 1);
+        // the SELECTED checkpoint: 6000 tokens
+        ConversationCheckpoint selected;
+        selected.ids.assign(r.ids.begin(), r.ids.begin() + 6000);
+        // the REJECTED candidate: 2000 tokens, and its tokens differ from the prompt's
+        ConversationCheckpoint rejected;
+        rejected.ids.assign(r.ids.begin(), r.ids.begin() + 2000);
+        rejected.ids[1000] = 999999;   // a different token
+        r.checks = {selected, rejected};
+        r.conversations = &cache;
+        const int64_t resume = run_request(r, cdiag);
+        check(resume == 6000, "R4: the engine mounts the 6000-token checkpoint");
+        const auto e = cdiag.event(cache);
+        check(e.selected_prefix_tokens == 6000, "R4: the reported prefix is 6000");
+        check(e.deeper_candidate_tokens == 0,
+              "R4: a SHORTER rejected candidate is not a deeper one: deeper_candidate_tokens is 0");
+        check(e.deeper_rejection_reason == Reason::unknown,
+              "R4: a SHORTER rejected candidate leaves deeper_rejection_reason UNKNOWN");
     }
     {   // R2d: with the switch OFF the slot is still not selected in the event (nothing is recorded)
         ConversationCache cache(1 << 20, 4);

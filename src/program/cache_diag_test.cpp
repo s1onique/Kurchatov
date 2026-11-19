@@ -208,6 +208,13 @@ Reported report(const Ids& prompt, const std::vector<ConversationImageKey>& prom
                                               : (c.image_mismatch ? Reason::image_mismatch : Reason::token_mismatch);
         }
     }
+    // R4: a refused candidate that is SHORTER than what was selected is not what stopped the request from
+    // reusing more, so it is not the "deeper" candidate.  The production collector settles this at the
+    // decision boundary, against the selected prefix.
+    if (r.deeper_tokens <= r.prefix) {
+        r.deeper_tokens = 0;
+        r.deeper_reason = Reason::unknown;
+    }
     return r;
 }
 
@@ -225,7 +232,6 @@ std::string render(const strata::program::cache_diag::CacheDiagEvent& e) {
     std::fclose(f);
     return std::string(buf, n);
 }
-
 }  // namespace
 
 int main() {
@@ -290,6 +296,21 @@ int main() {
         check(r.deeper_tokens == 6, "the DEEPER refused candidate's length is reported");
         check(r.deeper_reason == Reason::image_mismatch,
               "the DEEPER refused candidate's reason is reported: a successful shallow reuse does not hide it");
+    }
+    {   // 3c. a refused candidate that is SHORTER than the selected one is not a "deeper" candidate
+        ConversationCache cache(1 << 20, 4);
+        Ids prompt(6002);
+        for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = (int32_t) (i + 1);
+        const std::vector<Ids> chain = {{prompt.begin(), prompt.begin() + 6000},   // the selected one
+                                        {prompt.begin(), prompt.begin() + 2000}};  // the refused one
+        std::vector<Ids> chain2 = chain;
+        chain2[1][1000] = 999999;   // its tokens differ from the prompt's
+        const auto d = decide(prompt, {}, {}, {}, chain2, {}, cache);
+        const auto r = report(prompt, {}, {}, {}, chain2, {}, cache);
+        check(d.source == Source::active_checkpoint && d.tokens == 6000, "the engine mounts the 6000-token checkpoint");
+        check(r.source == d.source && r.prefix == 6000, "the diagnostic reports the 6000-token checkpoint");
+        check(r.deeper_tokens == 0, "a SHORTER refused candidate is not a deeper one");
+        check(r.deeper_reason == Reason::unknown, "a SHORTER refused candidate leaves the deeper reason UNKNOWN");
     }
     {   // 4. an image identity mismatch
         ConversationCache cache(1 << 20, 4);
