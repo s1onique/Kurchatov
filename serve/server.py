@@ -688,11 +688,19 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 class ConvCacheLog:
     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
-    which is the log): read on from where it was last read, from the start of the engine's current run."""
+    which is the log): read on from where it was last read, from the start of the engine's current run.
+
+    STRATA_CACHE_DIAG=1 makes the engine write one structured line per request ("STRATA_CACHE_DIAG event=decision
+    request_seq=... selected_source=... ...: why this request reused what it reused).  Those lines are read here
+    too, so /metrics shows the last decision without the log being read by hand.  The engine writes them only with
+    the switch on, so with it off nothing changes."""
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # the engine's diagnostic line: key=value pairs after the tag, one line per event
+    DIAG = re.compile(r"^STRATA_CACHE_DIAG\s+(.*)$")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
+    DIAG_KEEP = 64                                      # at most this many diagnostic events are kept
 
     def __init__(self):
         self.key, self.pos = None, 0
@@ -701,6 +709,43 @@ class ConvCacheLog:
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
                       "last_tokens": None, "last_at": None}
+        self.diag = []            # the last diagnostic events, newest last
+        self.diag_counts = {}     # how many events of each kind
+
+    def _diag_line(self, fields: str) -> None:
+        """One diagnostic event, as the engine wrote it: a fixed set of key=value pairs.  Only the keys the
+        Monitor shows are kept; nothing here can carry user data (the engine writes counts and positions)."""
+        kv = {}
+        for part in fields.split():
+            if "=" not in part:
+                continue
+            key, _, value = part.partition("=")
+            kv[key] = value
+        event = kv.get("event")
+        if not event:
+            return
+        self.diag_counts[event] = self.diag_counts.get(event, 0) + 1
+        try:
+            item = {
+                "event": event,
+                "request_seq": int(kv.get("request_seq", 0)),
+                "prompt_tokens": int(kv.get("prompt_tokens", 0)),
+                "selected_source": kv.get("selected_source", "none"),
+                "selected_prefix_tokens": int(kv.get("selected_prefix_tokens", 0)),
+                "candidate_count": int(kv.get("candidate_count", 0)),
+                "max_candidate_prefix_tokens": int(kv.get("max_candidate_prefix_tokens", 0)),
+                "longest_common_prefix_tokens": int(kv.get("longest_common_prefix_tokens", 0)),
+                "first_mismatch_position": int(kv.get("first_mismatch_position", -1)),
+                "rejection_reason": kv.get("rejection_reason", "UNKNOWN"),
+                "cache_parked_entries": int(kv.get("cache_parked_entries", 0)),
+                "cache_parked_bytes": int(kv.get("cache_parked_bytes", 0)),
+                "cache_evictions_total": int(kv.get("cache_evictions_total", 0)),
+            }
+        except ValueError:
+            return
+        self.diag.append(item)
+        if len(self.diag) > self.DIAG_KEEP:
+            del self.diag[:len(self.diag) - self.DIAG_KEEP]
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
@@ -724,6 +769,10 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            m = self.DIAG.match(line)
+            if m:                                      # a diagnostic event: its own line, nothing else to parse
+                self._diag_line(m.group(1))
+                continue
             if "conversation cache:" not in line:
                 continue
             m = self.EVENT.search(line)
@@ -760,17 +809,25 @@ def conversation_slots(engine) -> int | None:
     return slots if isinstance(slots, int) else None
 
 
-def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
+def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, diag: list | None = None,
+                            diag_counts: dict | None = None) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
-    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
+    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
+
+    `diag` are the engine's STRATA_CACHE_DIAG events (the last ones), `diag_counts` how many of each kind were
+    seen: with the switch off there are none and the card shows the rest as before."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
-    return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
-            "slots": info.get("conversation_cache_slots"), **parked,
-            "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
-            "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
-            "last_reused": last.get("reused") if last else None,
-            "last_prompt": last.get("prompt_tokens") if last else None}
+    out = {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
+           "slots": info.get("conversation_cache_slots"), **parked,
+           "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
+           "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
+           "last_reused": last.get("reused") if last else None,
+           "last_prompt": last.get("prompt_tokens") if last else None}
+    if diag is not None:
+        out["diagnostics"] = diag
+        out["diagnostic_counts"] = dict(diag_counts or {})
+    return out
 
 
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
@@ -4400,7 +4457,8 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": conversation_cache_view(engine, hist, totals, parked,
+                                                               self.conv_log.diag, self.conv_log.diag_counts),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}

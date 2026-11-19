@@ -137,6 +137,18 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # STRATA_CACHE_DIAG: the conversation cache's decision observability (include/strata/program/cache_diag.hpp).
+  # The first test drives the real cache through the real decision rules; the second reproduces the engine's
+  # request-loop wiring (generate.cpp) over the same cache, without a GPU.
+  add_executable(cache_diag_test src/program/cache_diag_test.cpp)
+  target_include_directories(cache_diag_test PRIVATE include)
+  add_test(NAME cache_diag_test COMMAND cache_diag_test)
+  add_executable(cache_diag_engine_test src/program/cache_diag_engine_test.cpp)
+  target_include_directories(cache_diag_engine_test PRIVATE include)
+  add_test(NAME cache_diag_engine_test COMMAND cache_diag_engine_test)
+  # the engine's writer on its own: the server's reader is checked against it (tools/test_cache_diag_log.py)
+  add_executable(cache_diag_roundtrip src/program/cache_diag_roundtrip.cpp)
+  target_include_directories(cache_diag_roundtrip PRIVATE include)
 endif()
 
 if(STRATA_HIP_GFX906)

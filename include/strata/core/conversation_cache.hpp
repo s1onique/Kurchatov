@@ -265,6 +265,71 @@ public:
         return best;
     }
 
+    /// The candidates best() examined, one per candidate, with the reason each was or was not usable.  The
+    /// caller uses this for the diagnostics (STRATA_CACHE_DIAG): the same walk, the same order and the same
+    /// decision, so the reported selection is the selection the engine made.  `out` is cleared first.
+    ///
+    /// A candidate of another steering mode is reported with `cvec_mismatch` set: it was NOT examined by best()
+    /// (which skips the whole entry), but the caller wants to know that a candidate with the right tokens exists
+    /// and was refused for the mode.
+    struct Candidate {
+        bool live = false;             ///< the entry's live state (else one of its checkpoints)
+        uint64_t serial = 0;           ///< the entry's identity
+        int64_t tokens = 0;            ///< the candidate's length
+        int64_t prefix = 0;            ///< the tokens it can contribute (conversation_prefix's answer)
+        bool cvec_mismatch = false;    ///< the entry is in another steering mode
+        bool image_mismatch = false;   ///< the tokens agree but the pictures do not
+        const int32_t* ids = nullptr;  ///< the candidate's own tokens (the diagnostic compares them with the prompt)
+    };
+    template<class Token>
+    void candidates(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+                    std::vector<Candidate>& out) const {
+        out.clear();
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            if (e.cvec != cvec) {
+                // another steering mode: the entry is skipped whole.  Its live state and its checkpoints are
+                // reported so the caller can name the reason, but they are not candidates for this request.
+                Candidate c;
+                c.live = true;
+                c.serial = serials_[i];
+                c.tokens = (int64_t) e.live.ids.size();
+                c.ids = e.live.ids.data();
+                c.cvec_mismatch = true;
+                out.push_back(c);
+                for (const auto& k : e.checkpoints) {
+                    Candidate kc;
+                    kc.live = false;
+                    kc.serial = serials_[i];
+                    kc.tokens = (int64_t) k.ids.size();
+                    kc.ids = k.ids.data();
+                    kc.cvec_mismatch = true;
+                    out.push_back(kc);
+                }
+                continue;
+            }
+            auto consider = [&](const ConversationCheckpoint& c, bool live) {
+                Candidate kc;
+                kc.live = live;
+                kc.serial = serials_[i];
+                kc.tokens = (int64_t) c.ids.size();
+                kc.ids = c.ids.data();
+                kc.prefix = conversation_prefix(c, prompt, images);
+                // conversation_prefix answers 0 both for a token mismatch and for an image mismatch.  Tell them
+                // apart here, so the diagnostic can name the right reason: the tokens must be the prompt's start.
+                if (kc.prefix == 0 && c.ids.size() > 0 && c.ids.size() < prompt.size()) {
+                    bool same = true;
+                    for (size_t j = 0; j < c.ids.size(); ++j)
+                        if ((int32_t) prompt[j] != c.ids[j]) { same = false; break; }
+                    kc.image_mismatch = same;   // the tokens agree: only the pictures differ
+                }
+                out.push_back(kc);
+            };
+            consider(e.live, true);
+            for (const auto& c : e.checkpoints) consider(c, false);
+        }
+    }
+
     SavedConversation take(size_t index) {
         SavedConversation out = std::move(entries_.at(index));
         bytes_ -= out.bytes();

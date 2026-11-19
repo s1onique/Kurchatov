@@ -1239,6 +1239,35 @@ Unknown telemetry or insufficient RAM skips parking, and the same figure and flo
 decide whether a session file may be saved or restored (below). An 8 GiB budget
 is a cap, not a recommendation for every machine.
 
+**Why a request reused what it reused (`STRATA_CACHE_DIAG=1`).** The log says
+*what* the cache gave back (`RESUME N`, "conversation cache: restored N tokens
+(live|checkpoint)") but not *why* a deeper candidate was refused. With
+`STRATA_CACHE_DIAG=1` the engine writes one structured line per request to stderr:
+
+```
+STRATA_CACHE_DIAG event=decision request_seq=7 prompt_tokens=1200 selected_source=active_checkpoint
+selected_prefix_tokens=900 candidate_count=4 max_candidate_prefix_tokens=1024
+longest_common_prefix_tokens=900 first_mismatch_position=-1 rejection_reason=EXACT_MATCH
+cache_parked_entries=2 cache_parked_bytes=3145728 cache_evictions_total=1
+```
+
+`selected_source` is `live`, `active_checkpoint`, `parked_live`, `parked_checkpoint`
+or `none`; `longest_common_prefix_tokens` is the ACTUAL number of tokens the
+candidate and the prompt agree on (not the candidate's length), and
+`first_mismatch_position` is where they first differ; `rejection_reason` names why
+the best candidate was refused (`TOKEN_MISMATCH`, `IMAGE_MISMATCH`,
+`STEERING_MISMATCH`, `ABSENT`, `INELIGIBLE`, `CACHE_DISABLED`, ...). A checkpoint
+that leaves the chain, a refused park and a parked conversation evicted to make room
+get their own lines (`event=checkpoint_evict`, `event=park_refused`,
+`event=park_evict`, `event=checkpoint_super`). The fields are counts, positions
+and fixed words: no prompt text, no token ids, no image content.
+
+The switch is off by default and the engine's behaviour is the same either way: with
+it off no extra token comparison happens, no record is allocated and the per-token
+path is untouched. The server reads the lines into `/metrics`
+(`conversation_cache.diagnostics`). The full schema and the decision map are in
+[forensics/strata-cache-observability-01.md](forensics/strata-cache-observability-01.md).
+
 **The RAM figure (`available_host_bytes()`).** The headroom is the smallest of three
 numbers, sampled each time it is asked and not a reservation (other writers can take the
 room afterwards):

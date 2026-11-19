@@ -69,6 +69,7 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/cache_diag.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -8787,6 +8788,77 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // STRATA_CACHE_DIAG: the cache's decision observability.  `cdiag_on` is read once, so with the switch off
+        // the collector below is never filled and the engine does no extra token comparison at all.  The collector
+        // holds only counts and positions - never a token id, a prompt text or an image - so it cannot carry user
+        // data.
+        const bool cdiag_on = strata::program::cache_diag::enabled();
+        struct CacheDiagCollector {
+            bool on = false;
+            uint64_t seq = 0;
+            // the candidates the engine examined, in the order it examined them
+            struct Entry {
+                strata::program::cache_diag::Source source = strata::program::cache_diag::Source::none;
+                int64_t tokens = 0;          ///< the candidate's length
+                int64_t lcp = 0;            ///< the ACTUAL common token prefix with the prompt
+                int64_t mismatch = -1;      ///< the first differing token's position
+                strata::program::cache_diag::Reason reason = strata::program::cache_diag::Reason::unknown;
+                bool usable = false;        ///< the engine could have used it
+            };
+            std::vector<Entry> entries;
+            strata::program::cache_diag::Source selected = strata::program::cache_diag::Source::none;
+            int64_t selected_prefix = 0;
+            int64_t max_candidate = 0;     ///< the longest candidate's length
+            int64_t best_lcp = 0;          ///< the longest common prefix over all candidates
+            int64_t best_mismatch = -1;    ///< the first mismatch of that candidate
+            strata::program::cache_diag::Reason best_reason = strata::program::cache_diag::Reason::unknown;
+            strata::program::cache_diag::Reason reason = strata::program::cache_diag::Reason::unknown;
+            int64_t prompt_tokens = 0;
+
+            void reset(int64_t n) {
+                if (!on) return;   // with the switch off nothing is collected and no id is spent
+                entries.clear();
+                selected = strata::program::cache_diag::Source::none;
+                selected_prefix = 0;
+                max_candidate = 0;
+                best_lcp = 0;
+                best_mismatch = -1;
+                best_reason = strata::program::cache_diag::Reason::unknown;
+                reason = strata::program::cache_diag::Reason::unknown;
+                prompt_tokens = n;
+                seq = strata::program::cache_diag::next_seq();
+            }
+            /// One candidate the engine examined.  `usable` says whether the engine's own rule accepted it.
+            void add(strata::program::cache_diag::Source source, int64_t tokens, int64_t lcp, int64_t mismatch,
+                     strata::program::cache_diag::Reason reason, bool usable) {
+                if (!on) return;
+                entries.push_back({source, tokens, lcp, mismatch, reason, usable});
+                if (tokens > max_candidate) max_candidate = tokens;
+                // the best candidate is the one that agrees with the prompt for the most tokens: its reason is
+                // the reason the request could not reuse more.
+                if (lcp > best_lcp) { best_lcp = lcp; best_mismatch = mismatch; best_reason = reason; }
+            }
+            /// The event, ready to write.  `reason` is the reason the SELECTED source is used; when nothing was
+            /// reused it is the reason the best candidate was refused.
+            strata::program::cache_diag::CacheDiagEvent event(const strata::core::ConversationCache& cache) const {
+                strata::program::cache_diag::CacheDiagEvent e;
+                e.kind = strata::program::cache_diag::EventKind::decision;
+                e.request_seq = seq;
+                e.prompt_tokens = prompt_tokens;
+                e.selected_source = selected;
+                e.selected_prefix_tokens = selected_prefix;
+                e.candidate_count = (int64_t) entries.size();
+                e.max_candidate_prefix_tokens = max_candidate;
+                e.longest_common_prefix_tokens = best_lcp;
+                e.first_mismatch_position = best_mismatch;
+                e.rejection_reason = reason;
+                e.cache_parked_entries = cache.size();
+                e.cache_parked_bytes = cache.bytes();
+                e.cache_evictions_total = cache.evictions();
+                return e;
+            }
+        } cdiag;
+        cdiag.on = cdiag_on;
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -8956,6 +9028,18 @@ int main(int argc, char** argv) {
             if (!conversations.make_room(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
+                // STRATA_CACHE_DIAG: the park was refused: the snapshot does not fit the cache's budget.
+                if (cdiag.on) {
+                    strata::program::cache_diag::CacheDiagEvent ev;
+                    ev.kind = strata::program::cache_diag::EventKind::park_refused;
+                    ev.request_seq = cdiag.seq;
+                    ev.rejection_reason = strata::program::cache_diag::Reason::budget_refused;
+                    ev.subject_tokens = (int64_t) live.size();
+                    ev.cache_parked_entries = conversations.size();
+                    ev.cache_parked_bytes = conversations.bytes();
+                    ev.cache_evictions_total = conversations.evictions();
+                    strata::program::cache_diag::Sink::instance().record(ev);
+                }
                 return true;
             }
             const auto t0 = Clock::now();
@@ -8987,12 +9071,38 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size());
+                    // STRATA_CACHE_DIAG: the park was refused by the physical-RAM admission.  The evictions it
+                    // caused ARE observed here (the gate called evict_oldest()), so the counter is reported with it.
+                    if (cdiag.on) {
+                        strata::program::cache_diag::CacheDiagEvent ev;
+                        ev.kind = strata::program::cache_diag::EventKind::park_refused;
+                        ev.request_seq = cdiag.seq;
+                        ev.rejection_reason = strata::program::cache_diag::Reason::budget_refused;
+                        ev.subject_tokens = (int64_t) live.size();
+                        ev.cache_parked_entries = conversations.size();
+                        ev.cache_parked_bytes = conversations.bytes();
+                        ev.cache_evictions_total = conversations.evictions();
+                        strata::program::cache_diag::Sink::instance().record(ev);
+                    }
                     return true;
                 }
                 if (evicted)
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
+                // STRATA_CACHE_DIAG: the parked conversations the gate evicted to make room for this one.  These
+                // removals ARE observed (the gate evicted them), so they are reported as evictions.
+                if (cdiag.on && evicted) {
+                    strata::program::cache_diag::CacheDiagEvent ev;
+                    ev.kind = strata::program::cache_diag::EventKind::park_evict;
+                    ev.request_seq = cdiag.seq;
+                    ev.rejection_reason = strata::program::cache_diag::Reason::evicted;
+                    ev.subject_tokens = (int64_t) evicted;
+                    ev.cache_parked_entries = conversations.size();
+                    ev.cache_parked_bytes = conversations.bytes();
+                    ev.cache_evictions_total = conversations.evictions();
+                    strata::program::cache_diag::Sink::instance().record(ev);
+                }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
@@ -9016,7 +9126,24 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // STRATA_CACHE_DIAG: how many parked conversations this park supersedes.  put() drops them (the
+                // outgoing chain holds their deepest checkpoint), so the removal IS observed here.
+                const size_t superseded_before = conversations.superseded();
                 const bool stored = conversations.put(std::move(image), held);
+                if (cdiag.on) {
+                    const size_t dropped = conversations.superseded() - superseded_before;
+                    if (dropped) {
+                        strata::program::cache_diag::CacheDiagEvent ev;
+                        ev.kind = strata::program::cache_diag::EventKind::checkpoint_super;
+                        ev.request_seq = cdiag.seq;
+                        ev.rejection_reason = strata::program::cache_diag::Reason::superseded;
+                        ev.subject_tokens = (int64_t) dropped;
+                        ev.cache_parked_entries = conversations.size();
+                        ev.cache_parked_bytes = conversations.bytes();
+                        ev.cache_evictions_total = conversations.evictions();
+                        strata::program::cache_diag::Sink::instance().record(ev);
+                    }
+                }
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -11720,6 +11847,9 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // STRATA_CACHE_DIAG: this request's correlation id, taken before anything is parked or read, so the
+            // parking events (the outgoing conversation's) and the decision event carry the same id.
+            cdiag.reset(n);
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -11915,6 +12045,27 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
+            // STRATA_CACHE_DIAG: the candidates the engine examines, with the reason each was (not) usable.  The
+            // analysis runs ONLY with the switch on; the selection below is the engine's own code, untouched.
+            auto cdiag_consider = [&](strata::program::cache_diag::Source source, const std::vector<int32_t>& pre,
+                                      const std::vector<ImgKey>& pre_imgs, bool steering_ok) {
+                if (!cdiag.on) return;
+                strata::program::cache_diag::Candidate c;
+                c.source = source;
+                c.ids = pre.data();
+                c.n_ids = pre.size();
+                c.imgs = &pre_imgs;
+                c.steering_matches = steering_ok;
+                const auto a = strata::program::cache_diag::analyse(
+                    c, ids, [&](int64_t L) { return imgs_below(req_imgs, L); },
+                    [](const std::vector<ImgKey>& below, const void* own) {
+                        return own != nullptr && below == *static_cast<const std::vector<ImgKey>*>(own);
+                    });
+                // the engine's own rule for this candidate (the caller knows it): starts_with plus the steering mode
+                const bool usable = steering_ok && starts_with(pre, pre_imgs);
+                cdiag.add(source, (int64_t) pre.size(), a.lcp, a.mismatch,
+                          usable ? strata::program::cache_diag::Reason::exact_match : a.reason, usable);
+            };
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
@@ -11922,6 +12073,17 @@ int main(int argc, char** argv) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
+                if (cdiag.on) {
+                    // the candidates the engine examined above: the live state and every checkpoint of the chain
+                    if (live_ok)
+                        cdiag_consider(strata::program::cache_diag::Source::live, live, live_imgs, true);
+                    for (const ConvCheckpoint& c : checks)
+                        cdiag_consider(strata::program::cache_diag::Source::active_checkpoint, c.ids, c.imgs, true);
+                }
+            } else if (cdiag.on) {
+                // the cache is off for this request: no candidate was examined at all
+                cdiag.reason = (o.prompt_cache > 0) ? strata::program::cache_diag::Reason::steering_mismatch
+                                                    : strata::program::cache_diag::Reason::cache_disabled;
             }
             // STRATA_SLOT_CKPT_MOVE: a turn checkpoint a batch admission moved into its slot is still one of the main
             // session's while the main session holds its tokens (the cells below it are the ones it was taken over):
@@ -12010,6 +12172,30 @@ int main(int argc, char** argv) {
                 }
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            // STRATA_CACHE_DIAG: the parked candidates, with the reason each was or was not usable.  The walk is
+            // the cache's own (ConversationCache::candidates), so the reported candidates are the ones best()
+            // examined.  The decision below is untouched.
+            if (cdiag.on) {
+                std::vector<strata::core::ConversationCache::Candidate> parked_cands;
+                conversations.candidates(ids, req_imgs, want_cvec, parked_cands);
+                for (const auto& c : parked_cands) {
+                    const strata::program::cache_diag::Source src =
+                        c.live ? strata::program::cache_diag::Source::parked_live
+                               : strata::program::cache_diag::Source::parked_checkpoint;
+                    // the ACTUAL common token prefix with the prompt, for the event's longest_common_prefix_tokens
+                    int64_t lcp = 0, mismatch = -1;
+                    if (c.ids != nullptr)
+                        lcp = strata::program::cache_diag::common_prefix(c.ids, (size_t) c.tokens, ids.data(),
+                                                                        ids.size(), &mismatch);
+                    strata::program::cache_diag::Reason r = strata::program::cache_diag::Reason::unknown;
+                    if (c.cvec_mismatch) r = strata::program::cache_diag::Reason::steering_mismatch;
+                    else if (c.image_mismatch) r = strata::program::cache_diag::Reason::image_mismatch;
+                    else if (c.prefix > 0) r = strata::program::cache_diag::Reason::exact_match;
+                    else if (c.tokens > 0) r = strata::program::cache_diag::Reason::token_mismatch;
+                    else r = strata::program::cache_diag::Reason::absent;
+                    cdiag.add(src, c.tokens, lcp, mismatch, r, c.prefix > 0);
+                }
+            }
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
@@ -12018,6 +12204,12 @@ int main(int argc, char** argv) {
             // start of this prompt wins as before)
             bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
+            // STRATA_CACHE_DIAG: what the parked side contributed, for the decision event below.
+            // `parked_used` is set only where the engine ACTUALLY mounts the parked state, so a snapshot that is
+            // discarded (an invalid image, a stage-count mismatch) is never reported as the selected source.
+            bool parked_used = false;
+            bool parked_borrowed = false;
+            bool parked_taken_live = false;
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
             if (incoming || borrow) slot_source = -1;
@@ -12183,6 +12375,9 @@ int main(int argc, char** argv) {
                 resume = parked.tokens;
                 from_live = false;
                 conversations.count_borrow();
+                parked_used = true;   // STRATA_CACHE_DIAG: the donor's prefix is mounted
+                parked_borrowed = true;
+                parked_taken_live = false;   // a borrow mounts a CHECKPOINT of the donor, not its live state
                 std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
                              "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
                              (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -12236,6 +12431,8 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
+                parked_used = true;   // STRATA_CACHE_DIAG: the parked conversation is mounted
+                parked_taken_live = parked.live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
@@ -12253,12 +12450,72 @@ int main(int argc, char** argv) {
                 checks.clear();
                 cvec_cached = want_cvec;
             }
+            // STRATA_CACHE_DIAG: the decision, resolved.  `resume` is final here: every source (the live session,
+            // the active chain, a parked conversation, a batch slot) has had its say, and the engine is about to
+            // mount the source that carries `resume`.  The reported source must be the one the engine uses.
+            if (cdiag.on) {
+                cdiag.selected_prefix = resume;
+                if (resume > 0) {
+                    // which source carried it?  The order is the engine's own: a restored parked conversation (or
+                    // a borrow) first, then a batch slot, then the live session, then the active chain.
+                    if (parked_used) {
+                        cdiag.selected = parked_taken_live ? strata::program::cache_diag::Source::parked_live
+                                                            : strata::program::cache_diag::Source::parked_checkpoint;
+                        cdiag.reason = parked_borrowed ? strata::program::cache_diag::Reason::borrowed
+                                                        : strata::program::cache_diag::Reason::exact_match;
+                    } else if (slot_source >= 0) {
+                        // a batch slot gave the conversation back: its own checkpoint or all it holds.  It is not
+                        // one of the conversation cache's own sources, so the reason says so.
+                        cdiag.selected = strata::program::cache_diag::Source::active_checkpoint;
+                        cdiag.reason = strata::program::cache_diag::Reason::slot_source;
+                    } else if (from_live) {
+                        cdiag.selected = strata::program::cache_diag::Source::live;
+                        cdiag.reason = strata::program::cache_diag::Reason::exact_match;
+                    } else {
+                        cdiag.selected = strata::program::cache_diag::Source::active_checkpoint;
+                        cdiag.reason = strata::program::cache_diag::Reason::exact_match;
+                    }
+                } else {
+                    cdiag.selected = strata::program::cache_diag::Source::none;
+                    cdiag.selected_prefix = 0;
+                    if (cdiag.reason == strata::program::cache_diag::Reason::unknown) {
+                        // nothing was reused.  The reason is the BEST candidate's refusal (the one that agrees
+                        // with the prompt for the most tokens), when there was one.
+                        cdiag.reason = cdiag.entries.empty()
+                                           ? strata::program::cache_diag::Reason::absent
+                                           : cdiag.best_reason;
+                        if (cdiag.reason == strata::program::cache_diag::Reason::unknown)
+                            cdiag.reason = strata::program::cache_diag::Reason::absent;
+                        if (cdiag.reason == strata::program::cache_diag::Reason::exact_match)
+                            cdiag.reason = strata::program::cache_diag::Reason::ineligible;
+                    }
+                }
+                strata::program::cache_diag::Sink::instance().record(cdiag.event(conversations));
+            }
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             auto off_path = [&](const ConvCheckpoint& c) {
                 return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
             };
+            // STRATA_CACHE_DIAG: the checkpoints that leave the chain because this request rewrites their cells (the
+            // retention policy's off-path pruning).  This is an OBSERVED removal with the checkpoint's own length:
+            // the event does not claim the checkpoint was evicted, only that it left the chain here.
+            if (cdiag.on) {
+                for (const ConvCheckpoint& c : checks)
+                    if (off_path(c)) {
+                        strata::program::cache_diag::CacheDiagEvent ev;
+                        ev.kind = strata::program::cache_diag::EventKind::checkpoint_evict;
+                        ev.request_seq = cdiag.seq;
+                        ev.prompt_tokens = n;
+                        ev.rejection_reason = strata::program::cache_diag::Reason::retention_removed;
+                        ev.subject_tokens = (int64_t) c.ids.size();
+                        ev.cache_parked_entries = conversations.size();
+                        ev.cache_parked_bytes = conversations.bytes();
+                        ev.cache_evictions_total = conversations.evictions();
+                        strata::program::cache_diag::Sink::instance().record(ev);
+                    }
+            }
             if (ckpt_pool.on())   // STRATA_CKPT_POOL: their storage is the next checkpoint's
                 ckpt_pool.erase_if(checks, off_path);
             else
