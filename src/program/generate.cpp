@@ -8812,6 +8812,10 @@ int main(int argc, char** argv) {
             int64_t best_lcp = 0;          ///< the longest common prefix over all candidates
             int64_t best_mismatch = -1;    ///< the first mismatch of that candidate
             strata::program::cache_diag::Reason best_reason = strata::program::cache_diag::Reason::unknown;
+            // The DEEPER candidate that was refused while a shallower one was selected.  Without this the event
+            // says only that the selected source matched, which hides WHY the deeper one was not used.
+            int64_t deeper_tokens = 0;
+            strata::program::cache_diag::Reason deeper_reason = strata::program::cache_diag::Reason::unknown;
             strata::program::cache_diag::Reason reason = strata::program::cache_diag::Reason::unknown;
             int64_t prompt_tokens = 0;
 
@@ -8824,6 +8828,8 @@ int main(int argc, char** argv) {
                 best_lcp = 0;
                 best_mismatch = -1;
                 best_reason = strata::program::cache_diag::Reason::unknown;
+                deeper_tokens = 0;
+                deeper_reason = strata::program::cache_diag::Reason::unknown;
                 reason = strata::program::cache_diag::Reason::unknown;
                 prompt_tokens = n;
                 seq = strata::program::cache_diag::next_seq();
@@ -8837,6 +8843,10 @@ int main(int argc, char** argv) {
                 // the best candidate is the one that agrees with the prompt for the most tokens: its reason is
                 // the reason the request could not reuse more.
                 if (lcp > best_lcp) { best_lcp = lcp; best_mismatch = mismatch; best_reason = reason; }
+                // The DEEPER candidate that was refused: the one the request wanted but could not have.  It is the
+                // longest candidate that was NOT usable.  It is reported separately from the selected source, so a
+                // successful shallow reuse does not hide the deeper refusal.
+                if (!usable && tokens > deeper_tokens) { deeper_tokens = tokens; deeper_reason = reason; }
             }
             /// The event, ready to write.  `reason` is the reason the SELECTED source is used; when nothing was
             /// reused it is the reason the best candidate was refused.
@@ -8852,6 +8862,8 @@ int main(int argc, char** argv) {
                 e.longest_common_prefix_tokens = best_lcp;
                 e.first_mismatch_position = best_mismatch;
                 e.rejection_reason = reason;
+                e.deeper_rejection_reason = deeper_reason;
+                e.deeper_candidate_tokens = deeper_tokens;
                 e.cache_parked_entries = cache.size();
                 e.cache_parked_bytes = cache.bytes();
                 e.cache_evictions_total = cache.evictions();
@@ -12116,6 +12128,22 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan resume_plan;
             int64_t resume_plan_at = -1, resume_plan_end = -1;   // where it goes on, and the segment end it needs
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
+            // STRATA_CACHE_DIAG: the slot's candidates, so the event can name them.  They are examined only with
+            // the switch on; the selection below is the engine's own code, untouched.  The rules are the engine's
+            // own: an idle slot gives its own tokens, an active slot only its checkpoints.
+            if (cdiag.on && o.prompt_cache > 0 && req_imgs.empty())
+                for (const BSlot& sl : bs) {
+                    const bool idle_source = !sl.active && sl.cached;
+                    // (an active slot only where the drafter's rows come along or are not drafted from: the copy
+                    // takes the main layers' cells, so the main drafter would keep another conversation's below it)
+                    const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
+                                               (!use_mtp || batch_mtp || admit_slot >= 0);
+                    if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
+                    if (idle_source && !sl.ids.empty())
+                        cdiag_consider(strata::program::cache_diag::Source::slot, sl.ids, {}, true);
+                    for (const ConvCheckpoint& c : sl.checks)
+                        cdiag_consider(strata::program::cache_diag::Source::slot, c.ids, c.imgs, true);
+                }
             if (o.prompt_cache > 0 && req_imgs.empty())
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
@@ -12465,8 +12493,8 @@ int main(int argc, char** argv) {
                                                         : strata::program::cache_diag::Reason::exact_match;
                     } else if (slot_source >= 0) {
                         // a batch slot gave the conversation back: its own checkpoint or all it holds.  It is not
-                        // one of the conversation cache's own sources, so the reason says so.
-                        cdiag.selected = strata::program::cache_diag::Source::active_checkpoint;
+                        // one of the conversation cache's own sources, so it has its own source name.
+                        cdiag.selected = strata::program::cache_diag::Source::slot;
                         cdiag.reason = strata::program::cache_diag::Reason::slot_source;
                     } else if (from_live) {
                         cdiag.selected = strata::program::cache_diag::Source::live;

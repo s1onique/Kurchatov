@@ -146,6 +146,11 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(cache_diag_engine_test src/program/cache_diag_engine_test.cpp)
   target_include_directories(cache_diag_engine_test PRIVATE include)
   add_test(NAME cache_diag_engine_test COMMAND cache_diag_engine_test)
+  # ACT-02: the three observability defects the ACT-01 review found, as regression tests (a shallower reuse that
+  # hid the deeper refusal, a batch slot that was not named, and the reader's lost records).
+  add_executable(cache_diag_regress_test src/program/cache_diag_regress_test.cpp)
+  target_include_directories(cache_diag_regress_test PRIVATE include)
+  add_test(NAME cache_diag_regress_test COMMAND cache_diag_regress_test)
   # the engine's writer on its own: the server's reader is checked against it (tools/test_cache_diag_log.py)
   add_executable(cache_diag_roundtrip src/program/cache_diag_roundtrip.cpp)
   target_include_directories(cache_diag_roundtrip PRIVATE include)

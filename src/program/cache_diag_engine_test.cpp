@@ -90,6 +90,8 @@ struct CacheDiagCollector {
     int64_t best_lcp = 0;
     int64_t best_mismatch = -1;
     Reason best_reason = Reason::unknown;
+    int64_t deeper_tokens = 0;
+    Reason deeper_reason = Reason::unknown;
     Reason reason = Reason::unknown;
     int64_t prompt_tokens = 0;
 
@@ -102,6 +104,8 @@ struct CacheDiagCollector {
         best_lcp = 0;
         best_mismatch = -1;
         best_reason = Reason::unknown;
+        deeper_tokens = 0;
+        deeper_reason = Reason::unknown;
         reason = Reason::unknown;
         prompt_tokens = n;
         seq = strata::program::cache_diag::next_seq();
@@ -111,6 +115,8 @@ struct CacheDiagCollector {
         entries.push_back({source, tokens, lcp, mismatch, reason, usable});
         if (tokens > max_candidate) max_candidate = tokens;
         if (lcp > best_lcp) { best_lcp = lcp; best_mismatch = mismatch; best_reason = reason; }
+        // the DEEPER candidate that was refused: the longest one that was not usable
+        if (!usable && tokens > deeper_tokens) { deeper_tokens = tokens; deeper_reason = reason; }
     }
     strata::program::cache_diag::CacheDiagEvent event(const ConversationCache& cache) const {
         strata::program::cache_diag::CacheDiagEvent e;
@@ -124,6 +130,8 @@ struct CacheDiagCollector {
         e.longest_common_prefix_tokens = best_lcp;
         e.first_mismatch_position = best_mismatch;
         e.rejection_reason = reason;
+        e.deeper_rejection_reason = deeper_reason;
+        e.deeper_candidate_tokens = deeper_tokens;
         e.cache_parked_entries = cache.size();
         e.cache_parked_bytes = cache.bytes();
         e.cache_evictions_total = cache.evictions();
@@ -366,6 +374,30 @@ int main() {
         check(cdiag.selected_prefix == 4, "the reported prefix is the shallower checkpoint's length");
         check(cdiag.best_lcp == 5, "the common prefix is where the tokens differ");
     }
+    {   // the deeper candidate is refused: the event names WHY the request could not reuse more
+        ConversationCache cache(1 << 20, 4);
+        CacheDiagCollector cdiag;
+        cdiag.on = true;
+        Request r;
+        r.ids = {1, 2, 3, 4, 5, 6, 7, 8};
+        r.req_imgs = {{6, 222}};   // the prompt's picture, at token 6
+        ConversationCheckpoint shallow;
+        shallow.ids = {1, 2, 3, 4};
+        ConversationCheckpoint deep;
+        deep.ids = {1, 2, 3, 4, 5, 6};
+        deep.imgs = {{6, 111}};   // the deep one's picture is NOT the prompt's
+        r.checks = {shallow, deep};
+        r.conversations = &cache;
+        Source selected = Source::none;
+        const int64_t resume = run_request(r, cdiag, &selected);
+        check(resume == 4, "the engine falls back to the shallower checkpoint");
+        check(selected == Source::active_checkpoint, "the diagnostic names the active checkpoint");
+        const auto e = cdiag.event(cache);
+        check(e.rejection_reason == Reason::exact_match, "the selected source's own reason is reported");
+        check(e.deeper_rejection_reason == Reason::image_mismatch,
+              "the DEEPER candidate's refusal is reported too");
+        check(e.deeper_candidate_tokens == 6, "the deeper candidate's length is reported");
+    }
     {   // the switch OFF: the collector does no work
         ConversationCache cache(1 << 20, 4);
         CacheDiagCollector cdiag;
@@ -515,6 +547,7 @@ int main() {
         for (const char* key : {"event=", "request_seq=", "prompt_tokens=", "selected_source=",
                                 "selected_prefix_tokens=", "candidate_count=", "max_candidate_prefix_tokens=",
                                 "longest_common_prefix_tokens=", "first_mismatch_position=", "rejection_reason=",
+                                "deeper_rejection_reason=", "deeper_candidate_tokens=",
                                 "cache_parked_entries=", "cache_parked_bytes=", "cache_evictions_total="}) {
             check(text.find(key) != std::string::npos, "the event line carries the field");
         }

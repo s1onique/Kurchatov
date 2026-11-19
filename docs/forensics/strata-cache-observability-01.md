@@ -82,13 +82,15 @@ STRATA_CACHE_DIAG event=decision request_seq=7 prompt_tokens=1200 selected_sourc
 |---|---|
 | `request_seq` | opaque, process-local correlation id (a counter, one per request) |
 | `prompt_tokens` | the request's actual input token count |
-| `selected_source` | `live`, `active_checkpoint`, `parked_live`, `parked_checkpoint` or `none` |
+| `selected_source` | `live`, `active_checkpoint`, `parked_live`, `parked_checkpoint`, `slot` or `none` |
 | `selected_prefix_tokens` | the reusable prefix the engine actually used (0 when none) |
 | `candidate_count` | the number of candidates examined |
 | `max_candidate_prefix_tokens` | the longest candidate's length |
 | `longest_common_prefix_tokens` | the **actual** matching token prefix with the prompt |
 | `first_mismatch_position` | the position of the first differing token (-1 when they agree throughout) |
-| `rejection_reason` | a typed reason (below), or `UNKNOWN` |
+| `rejection_reason` | a typed reason (below), or `UNKNOWN`: the **selected** source's own reason |
+| `deeper_rejection_reason` | the **deeper refused** candidate's reason, or `UNKNOWN`: WHY the request could not reuse more than it did. `UNKNOWN` when no deeper candidate was refused |
+| `deeper_candidate_tokens` | the deeper refused candidate's length (0 when there was none) |
 | `cache_parked_entries` | the number of parked conversations |
 | `cache_parked_bytes` | their retained footprint |
 | `cache_evictions_total` | the observed eviction counter |
@@ -263,10 +265,10 @@ blocks were therefore checked two ways:
 
 1. **No GPU run.** The diagnostic's output has not been seen from a real engine on real hardware. The engine
    path is exercised by the transcribed test, not by the engine itself.
-2. **`selected_source` for a batch slot is reported as `active_checkpoint` with the reason `SLOT_SOURCE`.** A
-   slot's conversation is not one of the conversation cache's own sources; there is no `slot` source in the
-   schema, so the reason carries the distinction. The four values above it (`live`, `active_checkpoint`,
-   `parked_live`, `parked_checkpoint`) are the cache's own.
+2. **A batch slot is reported as `selected_source=slot`** (ACT-02). Before ACT-02 a slot's conversation was
+   reported as `active_checkpoint` with the reason `SLOT_SOURCE`, which did not describe the actual selection:
+   a slot is not one of the conversation cache's own sources. It now has its own source name, and the slot's
+   candidates are examined by the diagnostic too (so the event can name them).
 3. **The steering mismatch of the parked side is reported per candidate.** `ConversationCache::best()` skips a
    whole entry of another mode, so the candidates list reports its live state and its checkpoints with
    `cvec_mismatch` set. They were not candidates for the decision; they are reported so the reason can be named.
@@ -277,6 +279,11 @@ blocks were therefore checked two ways:
    many went. The individual conversations are not named (the cache does not expose their identities here).
 6. **The events are on stderr.** The server reads them from the engine's log file. A deployment that discards
    the log loses them; `/metrics` keeps the last 64.
+7. **The server's event counts are not always comprehensive (ACT-02).** The reader's window is 1 MiB per poll.
+   When more than that arrives between two polls, the older lines are passed over. Before ACT-02 this was
+   silent; now the reader counts the passed-over events (`diag_lost`) and flags the truncation
+   (`diag_truncated`), and the `/metrics` card carries both (`diagnostic_lost`, `diagnostic_truncated`). The
+   counts are comprehensive only when `diagnostic_truncated` is false.
 
 ## Reproducing
 

@@ -1248,14 +1248,17 @@ is a cap, not a recommendation for every machine.
 STRATA_CACHE_DIAG event=decision request_seq=7 prompt_tokens=1200 selected_source=active_checkpoint
 selected_prefix_tokens=900 candidate_count=4 max_candidate_prefix_tokens=1024
 longest_common_prefix_tokens=900 first_mismatch_position=-1 rejection_reason=EXACT_MATCH
+deeper_rejection_reason=IMAGE_MISMATCH deeper_candidate_tokens=6000
 cache_parked_entries=2 cache_parked_bytes=3145728 cache_evictions_total=1
 ```
 
-`selected_source` is `live`, `active_checkpoint`, `parked_live`, `parked_checkpoint`
-or `none`; `longest_common_prefix_tokens` is the ACTUAL number of tokens the
+`selected_source` is `live`, `active_checkpoint`, `parked_live`, `parked_checkpoint`,
+`slot` or `none`; `longest_common_prefix_tokens` is the ACTUAL number of tokens the
 candidate and the prompt agree on (not the candidate's length), and
 `first_mismatch_position` is where they first differ; `rejection_reason` names why
-the best candidate was refused (`TOKEN_MISMATCH`, `IMAGE_MISMATCH`,
+the SELECTED source was used, and `deeper_rejection_reason` (with
+`deeper_candidate_tokens`) names why a DEEPER candidate was refused, so a successful
+shallow reuse does not hide the deeper refusal (`TOKEN_MISMATCH`, `IMAGE_MISMATCH`,
 `STEERING_MISMATCH`, `ABSENT`, `INELIGIBLE`, `CACHE_DISABLED`, ...). A checkpoint
 that leaves the chain, a refused park and a parked conversation evicted to make room
 get their own lines (`event=checkpoint_evict`, `event=park_refused`,

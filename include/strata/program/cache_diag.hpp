@@ -29,13 +29,16 @@
 //
 //   request_seq                  opaque, process-local correlation id (a counter)
 //   prompt_tokens                the request's input token count
-//   selected_source              live | active_checkpoint | parked_live | parked_checkpoint | none
+//   selected_source              live | active_checkpoint | parked_live | parked_checkpoint | slot | none
 //   selected_prefix_tokens       the reusable prefix the engine actually used (0 when none)
 //   candidate_count              how many candidates were examined
 //   max_candidate_prefix_tokens  the longest candidate's length
 //   longest_common_prefix_tokens the ACTUAL matching token prefix with the prompt (not a checkpoint's length)
 //   first_mismatch_position      where the tokens first differ (-1 when they do not differ)
-//   rejection_reason             a typed reason, or UNKNOWN
+//   rejection_reason             a typed reason, or UNKNOWN: the SELECTED source's own reason
+//   deeper_rejection_reason      the DEEPER refused candidate's reason, or UNKNOWN: WHY the request could not
+//                                reuse more than it did.  UNKNOWN when no deeper candidate was refused.
+//   deeper_candidate_tokens      the deeper refused candidate's length (0 when there was none)
 //   cache_parked_entries         the parked conversations
 //   cache_parked_bytes           their retained footprint
 //   cache_evictions_total        the observed eviction counter
@@ -61,6 +64,7 @@ enum class Source : int {
     active_checkpoint, ///< a checkpoint of the live session's chain
     parked_live,       ///< the live state of a parked conversation
     parked_checkpoint, ///< a checkpoint inside a parked conversation
+    slot,              ///< a batch SLOT's conversation (--batch): not one of the cache's own sources
 };
 
 inline const char* source_name(Source s) {
@@ -70,6 +74,7 @@ inline const char* source_name(Source s) {
         case Source::active_checkpoint: return "active_checkpoint";
         case Source::parked_live: return "parked_live";
         case Source::parked_checkpoint: return "parked_checkpoint";
+        case Source::slot: return "slot";
     }
     return "none";
 }
@@ -144,6 +149,12 @@ struct CacheDiagEvent {
     int64_t longest_common_prefix_tokens = 0;
     int64_t first_mismatch_position = -1;
     Reason rejection_reason = Reason::unknown;
+    // The DEEPER candidate's refusal, when one was refused while a shallower one was selected.  Without this the
+    // event says only that the selected source matched ("EXACT_MATCH"), which hides WHY the deeper one - the one
+    // the request wanted - was not used.  UNKNOWN when no deeper candidate was refused.
+    Reason deeper_rejection_reason = Reason::unknown;
+    // The deeper refused candidate's own length, 0 when there was none.  It says how much was NOT reused.
+    int64_t deeper_candidate_tokens = 0;
     size_t cache_parked_entries = 0;
     size_t cache_parked_bytes = 0;
     size_t cache_evictions_total = 0;
@@ -265,13 +276,15 @@ public:
                      "STRATA_CACHE_DIAG event=%s request_seq=%llu prompt_tokens=%lld selected_source=%s "
                      "selected_prefix_tokens=%lld candidate_count=%lld max_candidate_prefix_tokens=%lld "
                      "longest_common_prefix_tokens=%lld first_mismatch_position=%lld rejection_reason=%s "
+                     "deeper_rejection_reason=%s deeper_candidate_tokens=%lld "
                      "cache_parked_entries=%zu cache_parked_bytes=%zu cache_evictions_total=%zu "
                      "subject_tokens=%lld subject_serial=%lld\n",
                      event_kind_name(e.kind), (unsigned long long) e.request_seq, (long long) e.prompt_tokens,
                      source_name(e.selected_source), (long long) e.selected_prefix_tokens,
                      (long long) e.candidate_count, (long long) e.max_candidate_prefix_tokens,
                      (long long) e.longest_common_prefix_tokens, (long long) e.first_mismatch_position,
-                     reason_name(e.rejection_reason), e.cache_parked_entries, e.cache_parked_bytes,
+                     reason_name(e.rejection_reason), reason_name(e.deeper_rejection_reason),
+                     (long long) e.deeper_candidate_tokens, e.cache_parked_entries, e.cache_parked_bytes,
                      e.cache_evictions_total, (long long) e.subject_tokens, (long long) e.subject_serial);
         std::fflush(out_);
     }

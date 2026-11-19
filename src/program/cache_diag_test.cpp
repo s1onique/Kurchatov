@@ -134,6 +134,9 @@ struct Reported {
     int64_t lcp = 0;
     int64_t mismatch = -1;
     Reason reason = Reason::unknown;
+    // the DEEPER candidate that was refused: the longest one that was not usable
+    int64_t deeper_tokens = 0;
+    Reason deeper_reason = Reason::unknown;
 };
 
 Reported report(const Ids& prompt, const std::vector<ConversationImageKey>& prompt_imgs, const Ids& live,
@@ -161,6 +164,11 @@ Reported report(const Ids& prompt, const std::vector<ConversationImageKey>& prom
         ++r.candidate_count;
         r.max_candidate = std::max<int64_t>(r.max_candidate, (int64_t) pre.size());
         if (a.lcp > r.lcp) { r.lcp = a.lcp; r.mismatch = a.mismatch; }
+        // the DEEPER candidate that was refused: the longest one that was not usable
+        if (!usable && (int64_t) pre.size() > r.deeper_tokens) {
+            r.deeper_tokens = (int64_t) pre.size();
+            r.deeper_reason = a.reason;
+        }
         if (usable) {
             r.reason = Reason::exact_match;
             r.source = src;
@@ -193,28 +201,29 @@ Reported report(const Ids& prompt, const std::vector<ConversationImageKey>& prom
             r.reason = c.cvec_mismatch ? Reason::steering_mismatch
                                        : (c.image_mismatch ? Reason::image_mismatch : Reason::token_mismatch);
         }
+        // the DEEPER parked candidate that was refused
+        if (c.prefix <= 0 && c.tokens > r.deeper_tokens) {
+            r.deeper_tokens = c.tokens;
+            r.deeper_reason = c.cvec_mismatch ? Reason::steering_mismatch
+                                              : (c.image_mismatch ? Reason::image_mismatch : Reason::token_mismatch);
+        }
     }
     return r;
 }
 
-/// The event the engine would write, rendered as text (the writer's own format), for the no-user-data check.
+/// The event the engine would write, rendered as text.  The PRODUCTION writer does the rendering (the same
+/// Writer the engine uses), so this test cannot drift from the engine's own format.
 std::string render(const strata::program::cache_diag::CacheDiagEvent& e) {
-    char buf[2048];
-    std::snprintf(buf, sizeof buf,
-                  "STRATA_CACHE_DIAG event=%s request_seq=%llu prompt_tokens=%lld selected_source=%s "
-                  "selected_prefix_tokens=%lld candidate_count=%lld max_candidate_prefix_tokens=%lld "
-                  "longest_common_prefix_tokens=%lld first_mismatch_position=%lld rejection_reason=%s "
-                  "cache_parked_entries=%zu cache_parked_bytes=%zu cache_evictions_total=%zu "
-                  "subject_tokens=%lld subject_serial=%lld\n",
-                  strata::program::cache_diag::event_kind_name(e.kind), (unsigned long long) e.request_seq,
-                  (long long) e.prompt_tokens, strata::program::cache_diag::source_name(e.selected_source),
-                  (long long) e.selected_prefix_tokens, (long long) e.candidate_count,
-                  (long long) e.max_candidate_prefix_tokens, (long long) e.longest_common_prefix_tokens,
-                  (long long) e.first_mismatch_position,
-                  strata::program::cache_diag::reason_name(e.rejection_reason), e.cache_parked_entries,
-                  e.cache_parked_bytes, e.cache_evictions_total, (long long) e.subject_tokens,
-                  (long long) e.subject_serial);
-    return std::string(buf);
+    FILE* f = std::tmpfile();
+    if (f == nullptr) return std::string();
+    strata::program::cache_diag::Writer w(f);
+    w.write(e);
+    std::fflush(f);
+    std::rewind(f);
+    char buf[4096] = {};
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    return std::string(buf, n);
 }
 
 }  // namespace
@@ -264,6 +273,23 @@ int main() {
         check(r.source == d.source && r.prefix == 4, "the diagnostic reports the shallower checkpoint");
         check(r.lcp == 5 && r.mismatch == 5, "the common prefix stops at the changed token");
         check(r.max_candidate == 6, "the deeper candidate's length is reported, but it is not the selection");
+    }
+    {   // 3b. a shallower checkpoint is selected while a DEEPER one is refused for its picture
+        ConversationCache cache(1 << 20, 4);
+        // the picture sits at token 6: below a 6-token candidate, above a 4-token one
+        const Ids prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<ConversationImageKey> img_prompt = {{6, 222}};
+        const std::vector<Ids> chain = {{1, 2, 3, 4}, {1, 2, 3, 4, 5, 6}};
+        const std::vector<std::vector<ConversationImageKey>> chain_imgs = {{}, {{6, 111}}};
+        const auto d = decide(prompt, img_prompt, {}, {}, chain, chain_imgs, cache);
+        const auto r = report(prompt, img_prompt, {}, {}, chain, chain_imgs, cache);
+        check(d.source == Source::active_checkpoint && d.tokens == 4,
+              "the engine falls back to the shallower checkpoint");
+        check(r.source == d.source && r.prefix == 4, "the diagnostic reports the shallower checkpoint");
+        check(r.reason == Reason::exact_match, "the selected source's own reason is reported");
+        check(r.deeper_tokens == 6, "the DEEPER refused candidate's length is reported");
+        check(r.deeper_reason == Reason::image_mismatch,
+              "the DEEPER refused candidate's reason is reported: a successful shallow reuse does not hide it");
     }
     {   // 4. an image identity mismatch
         ConversationCache cache(1 << 20, 4);

@@ -711,6 +711,11 @@ class ConvCacheLog:
                       "last_tokens": None, "last_at": None}
         self.diag = []            # the last diagnostic events, newest last
         self.diag_counts = {}     # how many events of each kind
+        # R3: the reader's window is bounded (READ_MAX).  When more data arrives between two polls, the older
+        # lines are passed over: the counts are then NOT comprehensive.  These say so.
+        self.diag_lost = 0        # how many diagnostic events were passed over
+        self.diag_truncated = False   # whether the window was truncated at least once
+        self.diag_bytes_lost = 0  # how many bytes of the log were passed over
 
     def _diag_line(self, fields: str) -> None:
         """One diagnostic event, as the engine wrote it: a fixed set of key=value pairs.  Only the keys the
@@ -737,6 +742,8 @@ class ConvCacheLog:
                 "longest_common_prefix_tokens": int(kv.get("longest_common_prefix_tokens", 0)),
                 "first_mismatch_position": int(kv.get("first_mismatch_position", -1)),
                 "rejection_reason": kv.get("rejection_reason", "UNKNOWN"),
+                "deeper_rejection_reason": kv.get("deeper_rejection_reason", "UNKNOWN"),
+                "deeper_candidate_tokens": int(kv.get("deeper_candidate_tokens", 0)),
                 "cache_parked_entries": int(kv.get("cache_parked_entries", 0)),
                 "cache_parked_bytes": int(kv.get("cache_parked_bytes", 0)),
                 "cache_evictions_total": int(kv.get("cache_evictions_total", 0)),
@@ -758,8 +765,16 @@ class ConvCacheLog:
             size = os.path.getsize(path)
             if size < self.pos:                         # the log was emptied or replaced
                 self.pos = 0
+            skipped = 0
             if size - self.pos > self.READ_MAX:
-                self.pos = size - self.READ_MAX
+                # R3: more than the window arrived between two polls.  The older lines are passed over, so the
+                # counts are not comprehensive.  The passed-over region is counted (bounded: the window itself)
+                # so the loss is DETECTABLE instead of silent.
+                new_pos = size - self.READ_MAX
+                skipped = self._count_skipped(path, self.pos, new_pos)
+                self.diag_bytes_lost += new_pos - self.pos
+                self.pos = new_pos
+                self.diag_truncated = True
             with open(path, "rb") as f:
                 f.seek(self.pos)
                 data = f.read(size - self.pos)
@@ -788,7 +803,27 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+        if skipped:
+            # the passed-over diagnostic events: counted as lost, NOT added to the counts
+            self.diag_lost += skipped
         return dict(self.state)
+
+    def _count_skipped(self, path, frm, to) -> int:
+        """How many diagnostic events are in the log region the window passed over.  The region is bounded by
+        the window's own size, so this stays a bounded read."""
+        if to <= frm:
+            return 0
+        try:
+            with open(path, "rb") as f:
+                f.seek(frm)
+                data = f.read(to - frm)
+        except OSError:
+            return 0
+        n = 0
+        for line in data.decode("utf-8", "replace").splitlines():
+            if self.DIAG.match(line):
+                n += 1
+        return n
 
 
 def poly_engine(cfg: dict) -> bool:
@@ -810,7 +845,8 @@ def conversation_slots(engine) -> int | None:
 
 
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, diag: list | None = None,
-                            diag_counts: dict | None = None) -> dict:
+                            diag_counts: dict | None = None, diag_lost: int = 0,
+                            diag_truncated: bool = False) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
 
@@ -827,6 +863,9 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, 
     if diag is not None:
         out["diagnostics"] = diag
         out["diagnostic_counts"] = dict(diag_counts or {})
+        # R3: when records were passed over between two polls, the counts are NOT comprehensive.  The card says so.
+        out["diagnostic_lost"] = int(diag_lost or 0)
+        out["diagnostic_truncated"] = bool(diag_truncated)
     return out
 
 
@@ -4458,7 +4497,9 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked,
-                                                               self.conv_log.diag, self.conv_log.diag_counts),
+                                                               self.conv_log.diag, self.conv_log.diag_counts,
+                                                               self.conv_log.diag_lost,
+                                                               self.conv_log.diag_truncated),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
