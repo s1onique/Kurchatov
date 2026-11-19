@@ -92,6 +92,13 @@ async function refresh() {
     text("loaded", loading ? "Loading…" : inflight ? "In use" : status.loaded ? "Loaded" : "Unloaded");
     $("model-state").className = `value ${inflight || loading ? "busy" : status.loaded ? "loaded" : ""}`;
     text("model", status.model); text("count", records.length);
+    // The DEPLOYED build's identifier: from the server's status, which reads the BUILD.json beside the RUNNING
+    // executable.  Nothing is shown when the deployment's artifact does not carry the facts.
+    const build = status.build || {};
+    const buildParts = [build.commit, build.backend, build.cuda ? `CUDA ${build.cuda}` : null].filter(Boolean);
+    const buildText = buildParts.join(" · ");
+    const buildEl = $("build-id");
+    if (buildEl) { buildEl.textContent = buildText; buildEl.hidden = !buildText; }
     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
     const last = records.find(r => !active(r));
     text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));

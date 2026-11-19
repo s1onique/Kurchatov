@@ -473,6 +473,100 @@ assignments and one `if` block inside the diagnostic's own blocks. The types the
 `Reason`, `CacheDiagEvent::deeper_rejection_reason`, `CacheDiagEvent::deeper_candidate_tokens`) are the
 production header's own, and the same header compiles in the host tests. A CUDA build is still required.
 
+## ACT-KURCHATOV-P40-ANSIBLE-01, Gate 1: the Kurchatov web identity
+
+A further continuation of this ACT ran **Gate 1 only** (the visible web-app branding). Gate 0 of that mission
+(the Ansible host survey of `192.168.50.239:8080`) and Gates 2 to 7 (the source delivery, the CUDA 12 install,
+the compile, the P40 runtime, the deployment and the rollback) were **NOT EXECUTED** in that run.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `serve/web/index.html` | the browser title and `.st-header__brand` say **Kurchatov**; a small secondary build-identifier element was added; the user-facing description ("close ...'s window") names Kurchatov |
+| `serve/web/monitor.html` | the standalone monitor's title and brand say **Kurchatov**; the same secondary build-identifier element was added |
+| `serve/web/components.css` | the secondary build identifier's style (small, muted, secondary to the name) |
+| `serve/web/app.js` | renders the build identifier in the header and adds the About card's "Build" row |
+| `serve/web/monitor.js` | renders the build identifier in the standalone monitor's header |
+| `serve/server.py` | the deployed artifact's identity (`commit`, `backend`, `cuda`) is read from the BUILD.json beside the RUNNING executable and exposed as `build` on `/metrics` and `/v1/status` |
+| `tools/test_kurchatov_identity.py` | **new.** the identity and the build identifier as a regression test (7 checks) |
+
+### The build identifier comes from the DEPLOYED artifact
+
+The identifier is not a typed-in or assumed version. The server already read the engine's **release identity**
+from the `BUILD.json` beside the running executable (`serve/server.py`: `self.info["version"]`); this ACT
+extends that same reader to the artifact's `commit`, `backend` and `cuda`, and the web app renders them:
+
+```
+46d239c9e1fe · cuda · CUDA 12.9
+```
+
+The commit is the artifact's own source revision, the backend and the CUDA version are the artifact's own build
+facts. A deployment whose artifact does not carry them shows **nothing** - the identifier is never invented
+(the `build` fields are `None` and the element stays hidden).
+
+### What is preserved
+
+- the upstream project's link and its text ("PolyStrata on GitHub") - the upstream reference is credited as before;
+- the run config's file name (`strata-<model>.json`) - it is part of the API;
+- the model names, the endpoints, the API dialects, the storage keys and the monitor's tagline;
+- the About card's "Engine" row: the release identity is still reported as before.
+
+### The evidence (this machine: macOS arm64, no browser available)
+
+The project's own server was run and the pages fetched over HTTP.
+
+```
+$ python serve/server.py --engine mock --api-monitor --port 8392
+
+$ curl -s http://127.0.0.1:8391/ | grep -n '<title>\|st-header__brand\|build-id'
+6:<title>Kurchatov</title>
+22:  <span class="st-header__brand">Kurchatov</span>
+23:  <span class="st-header__build" id="build-id" title="The deployed build"></span>
+
+$ curl -s http://127.0.0.1:8392/api-monitor | grep -n '<title>\|class="brand"'
+:<title>Kurchatov API Monitor</title>
+:<header><div class="brand">Kurchatov <span>Local inference</span><span class="build" id="build-id" hidden></span></div>...
+
+$ curl -s http://127.0.0.1:8391/v1/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["build"])'
+{'commit': None, 'backend': None, 'cuda': None}      # the mock engine has no BUILD.json: nothing is invented
+
+$ curl -s http://127.0.0.1:8391/metrics | python3 -c 'import json,sys; print(json.load(sys.stdin)["build"])'
+{'commit': None, 'backend': None, 'cuda': None}
+```
+
+The identifier with a real artifact (`BUILD.json` beside the executable, read by the production reader):
+
+```
+version      : 0.1.45
+build        : {'commit': '46d239c9e1fe', 'backend': 'cuda', 'cuda': '12.9'}
+identifier   : 46d239c9e1fe · cuda · CUDA 12.9
+no BUILD.json -> version None, build all None: OK
+```
+
+The project's own tests, run with the server's dependencies available (`jinja2`, `regex` in an isolated venv):
+
+```
+$ python -m unittest serve.test_monitor
+Ran 11 tests in 5.232s
+OK
+
+$ python tools/test_kurchatov_identity.py
+Ran 7 tests in 0.000s
+OK
+
+$ python tools/test_cache_diag_log.py
+Ran 10 tests in 0.834s
+OK
+```
+
+`serve/test_monitor.py` is the Monitor view's own test (the page, its relative assets, the request accounting).
+It passes with the new branding.
+
+**No browser was available on this host**, so the views were verified over HTTP (the served markup, the served
+assets and the endpoints) and by the project's own view tests, not by a rendered screenshot.
+
+
 ## What ACT-02 deliberately does not do
 
 - It does not change the cache's selection, eviction, retention or matching.

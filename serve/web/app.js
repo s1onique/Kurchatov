@@ -227,9 +227,34 @@ function setPill(state, text) {
   $("pill-text").textContent = text;
 }
 
+// The DEPLOYED build's identifier, for the header and the About card.  Every part comes from the server's
+// metrics, which reads them from the BUILD.json beside the RUNNING executable: it names what is actually
+// deployed.  A deployment that does not carry them shows nothing - the identifier is never invented here.
+let buildId = "";
+function buildIdText() {
+  return buildId;
+}
+function renderBuildId(m) {
+  // The identity may come as the payload's own "build" (/metrics, /v1/status) or inside the engine's facts
+  // (the same BUILD.json, spread into "engine").  Both name the DEPLOYED artifact.
+  const b = (m && m.build) || (m && m.engine && m.engine.build) ||
+            {commit: m?.engine?.build_commit, backend: m?.engine?.build_backend, cuda: m?.engine?.build_cuda};
+  const parts = [];
+  if (b.commit) parts.push(b.commit);
+  if (b.backend) parts.push(b.backend);
+  if (b.cuda) parts.push(`CUDA ${b.cuda}`);
+  buildId = parts.join(" · ");
+  const el = $("build-id");
+  if (el) {
+    el.textContent = buildId;
+    el.hidden = !buildId;
+  }
+}
+
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
+  renderBuildId(m);
   // the header pill
   if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
@@ -424,6 +449,7 @@ function renderAbout(eng, hw, st) {
   facts($("facts-engine"), [
     ["Model", eng.model],
     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
+    ["Build", buildIdText()],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],

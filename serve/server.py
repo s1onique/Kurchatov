@@ -826,6 +826,20 @@ class ConvCacheLog:
         return n
 
 
+def build_identity(info: dict) -> dict:
+    """The DEPLOYED engine artifact's identity, for the web app's small build identifier.
+
+    Every field comes from the BUILD.json beside the running executable (the engine's own INFO), so the
+    identifier names what is actually deployed.  A field the artifact does not carry is None: the identifier
+    then shows only what is known, never an assumed or hand-entered version."""
+    commit = (info.get("build_commit") or "").strip() or None
+    if commit and len(commit) > 12:
+        commit = commit[:12]          # the short revision the log and the manifests use
+    backend = (info.get("build_backend") or "").strip() or None
+    cuda = (info.get("build_cuda") or "").strip() or None
+    return {"commit": commit, "backend": backend, "cuda": cuda}
+
+
 def poly_engine(cfg: dict) -> bool:
     """The run config starts strata-poly (the engine of the models PolyStrata adds), not the Strata project's."""
     return Path(str(cfg.get("exe") or "")).stem.lower() in ("strata-poly", "strata-glm")   # its name before 10-05
@@ -951,9 +965,20 @@ class StrataEngine:
         self.silent_note = None
         self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
-            self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
+            meta = json.loads((Path(exe).parent / "BUILD.json").read_text())
+            self.info["version"] = meta.get("version")
+            # The DEPLOYED artifact's own identity: the source revision it was built from and the backend it was
+            # built for.  These come from the BUILD.json beside the running executable, so the web app's build
+            # identifier names what is actually running - never an assumed or hand-entered version.  They are
+            # absent (not guessed) when the artifact does not carry them.
+            self.info["build_commit"] = meta.get("commit")
+            self.info["build_backend"] = meta.get("backend")
+            self.info["build_cuda"] = meta.get("cuda")
         except (OSError, ValueError):
             self.info["version"] = None
+            self.info["build_commit"] = None
+            self.info["build_backend"] = None
+            self.info["build_cuda"] = None
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
@@ -4496,6 +4521,9 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+                # the DEPLOYED artifact's identity (its BUILD.json): the web app's build identifier comes from
+                # here, so it names what is actually running.  None when the artifact does not carry it.
+                "build": build_identity(getattr(self.engine, "info", {}) or {}),
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked,
                                                                self.conv_log.diag, self.conv_log.diag_counts,
                                                                self.conv_log.diag_lost,
@@ -4561,6 +4589,9 @@ class Service:
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
+            # the DEPLOYED artifact's identity (its BUILD.json): the web app's build identifier comes from here,
+            # so it names what is actually running.  None when the artifact does not carry it.
+            "build": build_identity(getattr(self.engine, "info", {}) or {}),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
