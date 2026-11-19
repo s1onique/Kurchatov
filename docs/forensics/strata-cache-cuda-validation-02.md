@@ -199,6 +199,40 @@ OK
 
 `conversation_cache_test` (4 772 checks) and `conv_cache_test` are unchanged by ACT-02: they pass as before.
 
+### Through the project's own CMake and ctest
+
+```
+$ cmake -S . -B build-host-cmake -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=OFF \
+        -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DSTRATA_ENABLE_CUDA=OFF
+-- ggml version: 0.24.0
+-- ggml commit:  3cf03257f
+-- Configuring done (495.7s)
+-- Generating done (0.1s)
+CMAKE_EXIT=0
+
+$ cmake --build build-host-cmake --target cache_diag_test cache_diag_engine_test \
+        cache_diag_regress_test cache_diag_roundtrip conversation_cache_test conv_cache_test -j 4
+[100%] Built target cache_diag_test
+[100%] Built target cache_diag_engine_test
+[100%] Built target cache_diag_regress_test
+[100%] Built target cache_diag_roundtrip
+[100%] Built target conversation_cache_test
+[100%] Built target conv_cache_test
+BUILD_EXIT=0
+
+$ cd build-host-cmake && ctest -R 'cache_diag|conversation_cache_test|conv_cache' --output-on-failure
+1/5 Test  #1: conversation_cache_test ..........   Passed    0.22 sec
+2/5 Test  #8: cache_diag_test ..................   Passed    0.00 sec
+3/5 Test  #9: cache_diag_engine_test ...........   Passed    0.00 sec
+4/5 Test #10: cache_diag_regress_test ..........   Passed    0.00 sec
+5/5 Test #13: conv_cache_test ..................   Passed    0.16 sec
+
+100% tests passed, 0 tests failed out of 5
+```
+
+The configure took 495.7 s because it fetches llama.cpp (`ggml` 0.24.0, commit `3cf03257f`) over the network. The
+fetch succeeded. `cache_diag_regress_test` is registered by this ACT and runs under ctest.
+
 ### NOT EXECUTED in this run
 
 | Item | Status | Reason |
