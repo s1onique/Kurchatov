@@ -466,6 +466,50 @@ int main() {
               "a prefix of the prompt agrees throughout: no mismatch position");
         check(common_prefix(nullptr, 0, a.data(), a.size(), &mismatch) == 0, "an empty candidate shares nothing");
     }
+    {   // the engine's prompt is int64_t: the analysis accepts it, and the candidate stays int32_t
+        using Ids64 = std::vector<int64_t>;
+        // a token outside the int32_t range, so a narrowing comparison would alias it onto a different token
+        constexpr int64_t kBig = (int64_t) 1 << 40;
+        const Ids64 prompt = {1, 2, kBig, 4, 5, 6};
+        // the candidate keeps the checkpoint's own int32_t representation
+        const Ids pre = {1, 2, 3};
+        strata::program::cache_diag::Candidate c;
+        c.source = Source::active_checkpoint;
+        c.ids = pre.data();
+        c.n_ids = pre.size();
+        c.imgs = nullptr;
+        c.steering_matches = true;
+        const auto a = strata::program::cache_diag::analyse(
+            c, prompt, [](int64_t) { return 0; }, [](auto, const void*) { return true; });
+        // the tokens agree for two positions and differ at the third: the prompt's big token is NOT the candidate's 3
+        check(a.lcp == 2 && a.mismatch == 2,
+              "an int64_t prompt is compared without narrowing: the big token differs from the candidate's 3");
+        check(a.reason == Reason::token_mismatch, "the reason is a token mismatch");
+        // the same candidate against a prompt that agrees with it: the analysis is the engine's rule, unchanged
+        const Ids64 prompt_ok = {1, 2, 3, 4, 5, 6};
+        const auto ok = strata::program::cache_diag::analyse(
+            c, prompt_ok, [](int64_t) { return 0; }, [](auto, const void*) { return true; });
+        check(ok.lcp == 3 && ok.mismatch == -1, "an int64_t prompt that agrees reports the whole common prefix");
+        check(ok.tokens_match, "an int64_t prompt that agrees is a token match");
+        check(ok.reason == Reason::exact_match, "an int64_t prompt that agrees is an exact match");
+        // the common prefix with an int64_t prompt, called directly
+        int64_t mismatch = 0;
+        check(common_prefix(pre.data(), pre.size(), prompt.data(), prompt.size(), &mismatch) == 2 && mismatch == 2,
+              "the common prefix against an int64_t prompt stops at the first difference");
+        check(common_prefix(pre.data(), pre.size(), prompt_ok.data(), prompt_ok.size(), &mismatch) == 3 &&
+                  mismatch == -1,
+              "the common prefix against an int64_t prompt reports the whole prefix when they agree");
+        // a big token that EQUALS the candidate's token after widening: they agree
+        const Ids64 prompt_big = {1, 2, (int64_t) 3, 4, 5, 6};
+        check(common_prefix(pre.data(), pre.size(), prompt_big.data(), prompt_big.size(), &mismatch) == 3,
+              "the comparison is done in the wider type, so equal values agree");
+        // the int32_t path is unchanged: the same fixture with an int32_t prompt gives the same answers
+        const Ids prompt32 = {1, 2, 3, 4, 5, 6};
+        const auto a32 = strata::program::cache_diag::analyse(
+            c, prompt32, [](int64_t) { return 0; }, [](auto, const void*) { return true; });
+        check(a32.lcp == ok.lcp && a32.mismatch == ok.mismatch && a32.reason == ok.reason,
+              "the int32_t prompt path is unchanged by the generic one");
+    }
     std::printf("cache_diag_test: %d checks passed\n", checks);
     return 0;
 }

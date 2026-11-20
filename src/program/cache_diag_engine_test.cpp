@@ -703,6 +703,66 @@ int main() {
             check(text.find(key) != std::string::npos, "the event line carries the field");
         }
     }
+    {   // the engine's prompt is int64_t: the engine's own request shape, with the real prompt type
+        // generate.cpp's `ids` is std::vector<int64_t> (the pre-tokenized prompt) and the checkpoints' own tokens
+        // are int32_t.  The diagnostic's analysis must take the engine's shape, and must compare the two without
+        // narrowing the prompt's side.
+        using Ids64 = std::vector<int64_t>;
+        constexpr int64_t kBig = (int64_t) 1 << 40;   // outside the int32_t range
+        ConversationCache cache(1 << 20, 4);
+        CacheDiagCollector cdiag;
+        cdiag.on = true;
+        // the engine's request loop over an int64_t prompt, with the diagnostic's blocks in the engine's places
+        const Ids64 ids = {1, 2, 3, 4, 5, 6, 7};
+        const std::vector<int32_t> live_ids = {1, 2, 3, 4};
+        auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
+            std::vector<ImgKey> v;
+            for (const ImgKey& k : all)
+                if (k.start < L) v.push_back(k);
+            return v;
+        };
+        auto consider = [&](Source source, const std::vector<int32_t>& pre, bool steering_ok) {
+            strata::program::cache_diag::Candidate c;
+            c.source = source;
+            c.ids = pre.data();
+            c.n_ids = pre.size();
+            c.imgs = nullptr;
+            c.steering_matches = steering_ok;
+            const auto a = strata::program::cache_diag::analyse(
+                c, ids, [&](int64_t L) { return imgs_below({}, L); },
+                [](const std::vector<ImgKey>& below, const void* own) { return own == nullptr && below.empty(); });
+            cdiag.add(source, (int64_t) pre.size(), a.lcp, a.mismatch, a.reason, a.reason == Reason::exact_match);
+        };
+        consider(Source::live, live_ids, true);
+        check(cdiag.best_lcp == 4 && cdiag.best_mismatch == -1,
+              "the engine's int64_t prompt is compared with the checkpoint's int32_t tokens");
+        check(cdiag.entries.size() == 1 && cdiag.entries[0].reason == Reason::exact_match,
+              "the engine's int64_t prompt that agrees with the candidate is an exact match");
+        // a prompt token outside the int32_t range must not alias a different token
+        const Ids64 ids_big = {1, 2, kBig, 4, 5, 6, 7};
+        int64_t lcp = 0, mismatch = -1;
+        lcp = strata::program::cache_diag::common_prefix(live_ids.data(), live_ids.size(), ids_big.data(),
+                                                          ids_big.size(), &mismatch);
+        check(lcp == 2 && mismatch == 2,
+              "a prompt token outside the int32_t range differs from the candidate's token: no narrowing alias");
+        // and the engine's parked side, over an int64_t prompt
+        std::vector<strata::core::ConversationCache::Candidate> parked_cands;
+        cache.candidates(ids_big, {}, true, parked_cands);
+        check(parked_cands.empty(), "an empty cache has no parked candidates");
+        // the parked side with a conversation parked, over the int64_t prompt
+        check(cache.put(image({1, 2, 3, 4})), "park a conversation");
+        std::vector<strata::core::ConversationCache::Candidate> parked_cands2;
+        cache.candidates(ids_big, {}, true, parked_cands2);
+        check(parked_cands2.size() == 1, "the parked live state is a candidate");
+        if (!parked_cands2.empty()) {
+            int64_t lcp2 = 0, mismatch2 = -1;
+            lcp2 = strata::program::cache_diag::common_prefix(parked_cands2[0].ids,
+                                                              (size_t) parked_cands2[0].tokens, ids_big.data(),
+                                                              ids_big.size(), &mismatch2);
+            check(lcp2 == 2 && mismatch2 == 2,
+                  "the parked candidate's int32_t tokens are compared with the int64_t prompt without narrowing");
+        }
+    }
     std::printf("cache_diag_engine_test: %d checks passed\n", checks);
     return 0;
 }

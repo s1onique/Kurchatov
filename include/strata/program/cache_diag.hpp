@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 namespace strata::program::cache_diag {
@@ -184,10 +185,20 @@ inline uint64_t next_seq() {
 /// The ACTUAL number of leading tokens the two sequences share, and where they first differ.  `mismatch` is the
 /// position of the first differing token, or -1 when one is a prefix of the other and they agree throughout.
 /// This is the measurement the event reports: it is the common PREFIX, never a checkpoint's length.
-inline int64_t common_prefix(const int32_t* a, size_t na, const int32_t* b, size_t nb, int64_t* mismatch) {
+///
+/// The candidate's side is always `int32_t` (the checkpoint's own representation) and the prompt's side is a
+/// template parameter: the engine's prompt is `int64_t` (the pre-tokenized ids), the host tests' is `int32_t`.  The
+/// comparison is done in the WIDER of the two types, so an `int64_t` prompt token is never narrowed to `int32_t`
+/// and cannot silently alias a different token.
+template<class PromptToken>
+inline int64_t common_prefix(const int32_t* a, size_t na, const PromptToken* b, size_t nb, int64_t* mismatch) {
+    // The comparison's type: the WIDER of the two sides.  A prompt token outside the `int32_t` range keeps its own
+    // value and cannot alias a different token.
+    using Wide = typename std::conditional<(std::is_signed<PromptToken>::value && sizeof(PromptToken) > sizeof(int32_t)),
+                                           int64_t, int32_t>::type;
     const size_t n = na < nb ? na : nb;
     int64_t k = 0;
-    while (k < (int64_t) n && a[k] == b[k]) ++k;
+    while (k < (int64_t) n && (Wide) a[k] == (Wide) b[k]) ++k;
     if (mismatch != nullptr) *mismatch = (k < (int64_t) n) ? k : -1;
     return k;
 }
@@ -225,8 +236,13 @@ struct CandidateAnalysis {
 /// `imgs_below` gives the request's pictures below a length (the engine's imgs_below) and `images_equal` compares
 /// that with the candidate's own pictures.  Both are callables, because the picture key's type belongs to the
 /// engine's core and this header must not depend on it.
-template<class ImgsBelow, class ImagesEqual>
-inline CandidateAnalysis analyse(const Candidate& c, const std::vector<int32_t>& prompt, ImgsBelow imgs_below,
+///
+/// The prompt's token type is a template parameter: the engine's prompt is `int64_t` (the pre-tokenized ids) and
+/// the host tests' is `int32_t`.  The candidate's own tokens stay `int32_t` (the checkpoint's representation), and
+/// the comparison widens to the wider of the two types, so an `int64_t` prompt token outside the `int32_t` range
+/// compares as itself and never aliases a different token.
+template<class PromptToken, class ImgsBelow, class ImagesEqual>
+inline CandidateAnalysis analyse(const Candidate& c, const std::vector<PromptToken>& prompt, ImgsBelow imgs_below,
                                   ImagesEqual images_equal) {
     CandidateAnalysis a;
     // The engine's starts_with: a candidate of L tokens matches when L >= 1, L <= n - 1 (the last prompt token
