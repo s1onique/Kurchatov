@@ -154,6 +154,14 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   # the engine's writer on its own: the server's reader is checked against it (tools/test_cache_diag_log.py)
   add_executable(cache_diag_roundtrip src/program/cache_diag_roundtrip.cpp)
   target_include_directories(cache_diag_roundtrip PRIVATE include)
+  # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the native half of the per-request telemetry (the DONE line's
+  # key=value encoding and the token accounting's identities), checked without a GPU.
+  add_executable(reqtelemetry_test src/program/reqtelemetry_test.cpp)
+  target_include_directories(reqtelemetry_test PRIVATE include)
+  add_test(NAME reqtelemetry_test COMMAND reqtelemetry_test)
+  # the engine's telemetry writer on its own: the server's reader is checked against it
+  add_executable(reqtelemetry_roundtrip src/program/reqtelemetry_roundtrip.cpp)
+  target_include_directories(reqtelemetry_roundtrip PRIVATE include)
 endif()
 
 if(STRATA_HIP_GFX906)
