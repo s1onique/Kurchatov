@@ -1,0 +1,441 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-1.json",
+  "title": "Strata per-request telemetry record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "identity",
+    "lifecycle",
+    "prompt",
+    "cache",
+    "timing_ms",
+    "generation",
+    "measurement_quality"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "strata.request-telemetry/1"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "identity": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "client_request_id",
+        "engine_instance_id",
+        "server_instance_id",
+        "engine_invocation_id",
+        "slot_id",
+        "model_id",
+        "build_revision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "client_request_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "engine_instance_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_instance_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine_invocation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slot_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "build_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "required": [
+        "state",
+        "api",
+        "received_at",
+        "started_at",
+        "finished_at",
+        "http_status",
+        "finish_reason",
+        "detail"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": [
+            "queued",
+            "running",
+            "completed",
+            "cancelled",
+            "failed",
+            "rejected"
+          ]
+        },
+        "api": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "received_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "http_status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 100,
+          "maximum": 599
+        },
+        "finish_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "required": [
+        "rendered_tokens",
+        "submitted_tokens",
+        "matched_prefix_tokens",
+        "reused_prefix_tokens",
+        "evaluated_tokens",
+        "replayed_tokens",
+        "non_prefix_reused_tokens",
+        "evaluation_work_tokens",
+        "first_divergent_token_index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "rendered_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "submitted_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "matched_prefix_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reused_prefix_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evaluated_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "replayed_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "non_prefix_reused_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evaluation_work_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "first_divergent_token_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "required": [
+        "source",
+        "disposition",
+        "reason_code",
+        "restore_attempted",
+        "restore_succeeded",
+        "restore_ms",
+        "recurrent_state",
+        "attention_state",
+        "checkpoint_state",
+        "invalidations",
+        "evictions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "enum": [
+            "none",
+            "resident_slot",
+            "conversation_cache",
+            "restored_checkpoint",
+            "multiple",
+            "unknown"
+          ]
+        },
+        "disposition": {
+          "enum": [
+            "cold_miss",
+            "full_hit",
+            "partial_hit",
+            "match_without_usable_state",
+            "bypassed",
+            "invalidated",
+            "unknown"
+          ]
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "restore_attempted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "restore_succeeded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "restore_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "recurrent_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attention_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkpoint_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "invalidations": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evictions": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "timing_ms": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "minimum": 0
+      }
+    },
+    "generation": {
+      "type": "object",
+      "required": [
+        "requested_max_output_tokens",
+        "effective_max_output_tokens",
+        "generated_tokens",
+        "emitted_tokens",
+        "speculative_draft_tokens",
+        "speculative_accepted_tokens"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "requested_max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "effective_max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "generated_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "emitted_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "speculative_draft_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "speculative_accepted_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "measurement_quality": {
+      "type": "object",
+      "required": [
+        "state",
+        "unavailable_fields",
+        "timing_authority",
+        "first_token_includes_reasoning"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": [
+            "complete",
+            "partial",
+            "unsupported",
+            "instrumentation_error"
+          ]
+        },
+        "unavailable_fields": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "timing_authority": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "first_token_includes_reasoning": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

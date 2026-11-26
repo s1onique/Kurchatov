@@ -1,0 +1,14 @@
+$ /tmp/rtcache/reqtelemetry_test
+reqtelemetry_test: all checks passed
+
+$ /tmp/stratavenv/bin/python tools/test_reqtelemetry_roundtrip.py -v
+test_a_record_built_from_the_engines_figures_is_sound (__main__.Roundtrip.test_a_record_built_from_the_engines_figures_is_sound) ... ok
+test_the_client_id_is_validated_before_it_is_kept (__main__.Roundtrip.test_the_client_id_is_validated_before_it_is_kept) ... ok
+test_the_client_id_the_server_sends_is_one_the_engine_accepts (__main__.Roundtrip.test_the_client_id_the_server_sends_is_one_the_engine_accepts)
+test_the_field_names_are_the_same_on_both_sides (__main__.Roundtrip.test_the_field_names_are_the_same_on_both_sides)
+test_the_server_reads_what_the_engine_writes (__main__.Roundtrip.test_the_server_reads_what_the_engine_writes) ... ok
+Ran 5 tests in 0.008s
+OK
+
+$ /tmp/stratavenv/bin/python tools/test_reqtelemetry_schema.py
+test_reqtelemetry_schema: all checks passed

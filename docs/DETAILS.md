@@ -2296,6 +2296,31 @@ both and of neither were the same 128 tokens at 32K and parted at token 85 at 10
 
 ---
 
+## The request telemetry
+
+What the engine did with each request: the prompt tokens it reused, the ones it evaluated, where the reusable
+state came from, and how long each stage took.
+
+The **Telemetry** tab of the web app (or `http://127.0.0.1:8095/telemetry`) shows it. The same data is on the
+HTTP API (`/v1/telemetry/status`, `/v1/telemetry/summary`, `/v1/telemetry/requests`,
+`/v1/telemetry/requests/{id}`) and in the Prometheus exporter.
+
+The Monitor tab shows the **expert cache** (the GPU's weights); the telemetry shows the **conversation cache**
+(the prompt's prefix). They are different things and are not reinterpreted as each other.
+
+Two rules the telemetry keeps:
+
+* an unavailable measurement is `-` (or `null`), **never** `0`: `0` is a measured zero;
+* the engine is the authority for the cache state and the model execution; the server is the authority for the
+  request's lifecycle. Neither reconstructs the other's numbers.
+
+`STRATA_TELEMETRY=0` turns the whole thing off. `STRATA_TELEMETRY_EVIDENCE=<path>` writes one metadata-only
+JSON object per request to a file.
+
+**[docs/TELEMETRY.md](TELEMETRY.md)** has the record, the API, the metrics and the settings.
+
+---
+
 ## Troubleshooting
 
 | Symptom | What to do |

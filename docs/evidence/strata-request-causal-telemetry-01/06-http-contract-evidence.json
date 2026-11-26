@@ -1,0 +1,159 @@
+{
+  "act": "ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01",
+  "checks": [
+    {
+      "check": "the status route answers",
+      "request": "GET /v1/telemetry/status",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {
+        "Cache-Control": "no-store"
+      }
+    },
+    {
+      "check": "the summary route answers",
+      "request": "GET /v1/telemetry/summary",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "a request is answered and its id is echoed",
+      "request": "POST /v1/chat/completions",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {
+        "X-Strata-Request-ID": "a53f2bf27a974d30866aece432995f4d"
+      }
+    },
+    {
+      "check": "the collection answers",
+      "request": "GET /v1/telemetry/requests",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {
+        "Cache-Control": "no-store"
+      }
+    },
+    {
+      "check": "the record validates against the schema",
+      "request": "GET /v1/telemetry/requests",
+      "status": 200,
+      "ok": true,
+      "note": "the JSON Schema in docs/telemetry/"
+    },
+    {
+      "check": "one request by its id",
+      "request": "GET /v1/telemetry/requests/a53f2bf27a974d30866aece432995f4d",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "an unknown id is a 404",
+      "request": "GET /v1/telemetry/requests/deadbeef",
+      "status": 404,
+      "expected": 404,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "a too large page is a 400",
+      "request": "GET /v1/telemetry/requests?limit=100000",
+      "status": 400,
+      "expected": 400,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "a bad cursor is a 400",
+      "request": "GET /v1/telemetry/requests?cursor=nonsense",
+      "status": 400,
+      "expected": 400,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "the client id filter finds the request",
+      "request": "GET /v1/telemetry/requests?client_request_id=trace-1",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "the cache disposition filter works",
+      "request": "GET /v1/telemetry/requests?cache_disposition=partial_hit",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "the status filter works",
+      "request": "GET /v1/telemetry/requests?request_status=completed",
+      "status": 200,
+      "expected": 200,
+      "ok": true,
+      "note": "",
+      "headers": {}
+    },
+    {
+      "check": "the engine's figures reached the record",
+      "request": "GET /v1/telemetry/requests/a53f2bf27a974d30866aece432995f4d",
+      "status": 200,
+      "ok": true,
+      "note": "the engine's DONE-line figures, unchanged",
+      "observed": {
+        "matched": 40,
+        "reused": 40,
+        "evaluated": 60,
+        "disposition": "partial_hit"
+      }
+    },
+    {
+      "check": "the record carries no content",
+      "request": "GET /v1/telemetry/requests/a53f2bf27a974d30866aece432995f4d",
+      "status": 200,
+      "ok": true,
+      "note": "the prompt, the answer and the credentials are not in the record"
+    },
+    {
+      "check": "the Prometheus exporter still answers",
+      "request": "GET /metrics?format=prometheus",
+      "status": 200,
+      "ok": true,
+      "note": "the existing families are untouched; the telemetry's are added"
+    },
+    {
+      "check": "the telemetry's Prometheus families are there",
+      "request": "GET /metrics?format=prometheus",
+      "status": 200,
+      "ok": true,
+      "observed": [
+        "strata_requests_total{model_name=\"qwen3.8-flash-next\"} 1",
+        "strata_prompt_tokens_total{model_name=\"qwen3.8-flash-next\"} 249",
+        "strata_prompt_matched_tokens_total{model_name=\"qwen3.8-flash-next\"} 40",
+        "strata_prompt_reused_tokens_total{model_name=\"qwen3.8-flash-next\"} 40",
+        "strata_prompt_evaluated_tokens_total{model_name=\"qwen3.8-flash-next\"} 60",
+        "strata_prompt_replayed_tokens_total{model_name=\"qwen3.8-flash-next\"} 0"
+      ]
+    }
+  ],
+  "all_ok": true
+}

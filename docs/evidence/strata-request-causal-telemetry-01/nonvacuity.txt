@@ -1,0 +1,44 @@
+# The non-vacuity witnesses: each mutation was applied to a COPY of the file, the suite was run, and the file
+# was restored.  No mutation code is in the tree.
+
+$ # MUTATION 1: the matched prefix substituted for the actual reuse
+$ #   serve/reqtelemetry.py: reused_prefix=matched
+$ /tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry
+FAIL: test_a_failed_restore_is_not_a_successful_reuse (serve.test_reqtelemetry.EngineFigures.test_a_failed_restore_is_not_a_successful_reuse)
+AssertionError: 'partial_hit' != 'match_without_usable_state'
+Ran 40 tests in 8.321s
+FAILED (failures=1)
+
+$ # MUTATION 2: an unavailable measurement turned into a zero
+$ #   serve/reqtelemetry.py: record.matched_prefix_tokens = 0 when the engine did not report it
+$ /tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry
+FAIL: test_a_missing_figure_stays_null (serve.test_reqtelemetry.EngineFigures.test_a_missing_figure_stays_null)
+Ran 41 tests in 10.409s
+FAILED (failures=2)
+
+$ # MUTATION 3: a cancellation finalized as a successful completion
+$ #   serve/server.py: the state mapping always says "completed"
+$ /tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry
+FAIL: test_a_cancelled_request_is_not_a_completed_one (serve.test_reqtelemetry.Cancelled.test_a_cancelled_request_is_not_a_completed_one)
+Ran 41 tests in 10.409s
+FAILED (failures=2)
+
+$ # MUTATION 4: the request identity dropped at the native boundary
+$ #   serve/server.py: StrataEngine.request_key returns nothing
+$ /tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry
+FAIL: test_the_request_key_carries_the_id_to_the_engine (serve.test_reqtelemetry.Identity.test_the_request_key_carries_the_id_to_the_engine)
+Ran 45 tests in 10.440s
+FAILED (failures=3)
+
+$ # MUTATION 5: duplicate physical attempts collapsed into one record
+$ #   serve/reqtelemetry.py: the store drops a record whose client id matches an existing one
+$ /tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry
+FAIL: test_two_requests_with_the_same_client_id_are_two_records (serve.test_reqtelemetry.Api.test_two_requests_with_the_same_client_id_are_two_records)
+FAIL: test_two_attempts_with_one_client_id_are_two_stored_records (serve.test_reqtelemetry.Identity.test_two_attempts_with_one_client_id_are_two_stored_records)
+Ran 45 tests in 10.440s
+FAILED (failures=3)
+
+$ # after restoring every file
+$ /tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry
+Ran 45 tests in 9.931s
+OK
