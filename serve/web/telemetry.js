@@ -220,35 +220,33 @@ function renderDetail() {
 
   // The token accounting bar: the reused prefix, the evaluated positions and the replayed part of them.
   // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G7): a measurement that was NOT taken is not a zero.
-  // When the engine did not report the reuse or the evaluation, the bar says so instead of drawing an empty one.
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A7): the arithmetic is in ONE pure function
+  // (serve/web/telemetry_accounting.js), so the bar and its test cannot drift apart: the submitted prompt is the
+  // denominator, the positions nobody accounted for are shown, an unknown replay is not a measured zero, and a
+  // violated or unevaluated accounting gets no bar at all.
   const bar = $("detail-bar");
   bar.replaceChildren();
-  const measured = prompt.reused_prefix_tokens !== null && prompt.reused_prefix_tokens !== undefined
-    && prompt.evaluated_tokens !== null && prompt.evaluated_tokens !== undefined;
-  const reused = measured ? prompt.reused_prefix_tokens : 0;
-  const evaluated = measured ? prompt.evaluated_tokens : 0;
-  const replayed = prompt.replayed_tokens === null || prompt.replayed_tokens === undefined ? 0 : prompt.replayed_tokens;
-  const total = Math.max(1, reused + evaluated);
-  const parts = [["reused", reused, "Reused"], ["evaluated", Math.max(0, evaluated - replayed), "Evaluated"],
-                 ["replayed", replayed, "Replayed"]];
-  for (const [className, value, title] of parts) {
-    if (value <= 0) continue;
-    const part = document.createElement("div");
-    part.className = className;
-    part.style.width = `${(value / total) * 100}%`;
-    part.title = `${title}: ${value} tokens`;
-    bar.append(part);
+  const accounting_parts = accountingBarParts(prompt, quality);
+  const total = accounting_parts.total || 1;
+  for (const part of accounting_parts.parts) {
+    if (part.value <= 0) continue;
+    const node = document.createElement("div");
+    node.className = part.className;
+    node.style.width = `${(part.value / total) * 100}%`;
+    node.title = part.title;
+    bar.append(node);
   }
-  if (!measured) {
+  for (const text of accounting_parts.notes) {
     const note = document.createElement("span");
     note.className = "st-note";
-    note.textContent = "the engine reported no token accounting for this request";
+    note.textContent = text;
     bar.append(note);
   }
   const legend = $("detail-legend");
   legend.replaceChildren();
   for (const [className, title] of [["reused", "Reused (not evaluated)"], ["evaluated", "Evaluated"],
-                                    ["replayed", "Replayed (previously processed)"]]) {
+                                    ["replayed", "Replayed (previously processed)"],
+                                    ["unaccounted", "Not accounted for"]]) {
     const item = document.createElement("span");
     const swatch = document.createElement("i"); swatch.className = className; swatch.style.background = "var(--st-accent)";
     if (className === "evaluated") swatch.style.background = "var(--st-info)";

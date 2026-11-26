@@ -58,12 +58,31 @@ def _scrape(store) -> str:
 
 
 def _bucket(text: str, edge: str) -> int:
-    prefix = f"strata_request_duration_seconds_bucket{{model_name=\"test\",le=\"{edge}\"}}"
-    for line in text.splitlines():
-        if line.startswith(prefix + " "):
-            return int(line.rsplit(" ", 1)[1])
-    raise AssertionError(f"the scrape has no {prefix} line")
+    """The value of one histogram bucket line of the scrape.
 
+    ACT-...-AMENDMENT-02 (A8): the canonical telemetry metrics are process-scoped: they carry no model_name
+    label.  The witness accepts both shapes so it also works against the predecessor's exporter.
+    """
+    for prefix in (f"strata_request_duration_seconds_bucket{{le=\"{edge}\"}}",
+                   f"strata_request_duration_seconds_bucket{{model_name=\"test\",le=\"{edge}\"}}"):
+        for line in text.splitlines():
+            if line.startswith(prefix + " "):
+                return int(line.rsplit(" ", 1)[1])
+    raise AssertionError(f"the scrape has no bucket line for {edge}")
+
+
+
+def _run_witness(case, name):
+    """Run ONE witness of the amendment-02 suite and let its assertion failure through.
+
+    TestCase.run() swallows the failure (it records it), so the witness is called directly: the mutation must
+    make it fail, and the failure must reach the caller.
+    """
+    case.setUp()
+    try:
+        getattr(case, name)()
+    finally:
+        case.tearDown()
 
 
 class Mutations(unittest.TestCase):
@@ -80,11 +99,15 @@ class Mutations(unittest.TestCase):
             n = hist.get("count")
             if not isinstance(n, int) or n <= 0:
                 return
+            label_set = f"{lab}," if lab else ""
             out.append(f"# HELP {name} durations\n# TYPE {name} histogram")
             for b in prometheus.TELEMETRY_BUCKETS:
-                out.append(f'{name}_bucket{{{lab},le="{b}"}} {n}')
-            out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
-            out.append(f"{name}_sum{{{lab}}} {round(hist.get('sum') or 0.0, 6)}\n{name}_count{{{lab}}} {n}")
+                out.append(f'{name}_bucket{{{label_set}le="{b}"}} {n}')
+            out.append(f'{name}_bucket{{{label_set}le="+Inf"}} {n}')
+            if lab:
+                out.append(f"{name}_sum{{{lab}}} {round(hist.get('sum') or 0.0, 6)}\n{name}_count{{{lab}}} {n}")
+            else:
+                out.append(f"{name}_sum {round(hist.get('sum') or 0.0, 6)}\n{name}_count {n}")
 
         with patched(prometheus, "telemetry", fabricated):
             text = _scrape(_store_with(2000, 20000, 120000))
@@ -206,6 +229,85 @@ class Mutations(unittest.TestCase):
             tel.finish(rec, state="completed", http_status=200)
         self.assertEqual(tel.store.list()["records"], [],
                          "the lost receipt passes the witness")
+
+    # ---------------------------------------------------------------- the AMENDMENT-02 witnesses
+    def test_the_queue_duration_is_not_overwritten(self):
+        """QUEUE_DURATION_OVERWRITTEN: the finalization overwrites the queue wait with the request time.
+
+        The witness is the PRODUCTION path of serve/test_telemetry_amendment02.py: two real HTTP requests, the
+        second one waiting for its turn.
+        """
+        import time as _time
+
+        from serve import server as server_module
+        from serve.test_telemetry_amendment02 import HttpWitnesses
+
+        real = server_module.Service._finish_telemetry
+
+        def overwriting(self, tele, last, seen, submitted, generated, finish, started, emitted=None,
+                        queue_s=None, first_token_s=None, invocations=1):
+            if tele is not None:
+                # the defect: the queue wait becomes the time the request spent running
+                tele.set_timing("queue", (_time.perf_counter() - tele.clock) * 1000.0, "http_server")
+            return real(self, tele, last, seen, submitted, generated, finish, started, emitted=emitted,
+                        queue_s=queue_s, first_token_s=first_token_s, invocations=invocations)
+
+        with patched(server_module.Service, "_finish_telemetry", overwriting):
+            case = HttpWitnesses("test_the_queue_wait_is_the_wait_and_not_the_whole_request")
+            with self.assertRaises(AssertionError):
+                _run_witness(case, "test_the_queue_wait_is_the_wait_and_not_the_whole_request")
+
+    def test_the_first_content_is_not_the_generation_observation(self):
+        """HTTP_FIRST_TOKEN_MISATTRIBUTED: the first token is the generation loop's, not the first byte written."""
+        from serve import server as server_module
+        from serve.test_telemetry_amendment02 import HttpWitnesses
+
+        real = server_module.Service._finish_telemetry
+
+        def misattributing(self, tele, last, seen, submitted, generated, finish, started, emitted=None,
+                           queue_s=None, first_token_s=None, invocations=1):
+            if tele is not None and first_token_s is not None:
+                # the defect: the service's observation is published as the HTTP first-content time
+                tele.set_timing("http_first_token", float(first_token_s) * 1000.0, "http_server")
+            return real(self, tele, last, seen, submitted, generated, finish, started, emitted=emitted,
+                        queue_s=queue_s, first_token_s=first_token_s, invocations=invocations)
+
+        with patched(server_module.Service, "_finish_telemetry", misattributing):
+            case = HttpWitnesses("test_the_first_content_is_timed_at_the_write_boundary")
+            with self.assertRaises(AssertionError):
+                _run_witness(case, "test_the_first_content_is_timed_at_the_write_boundary")
+
+    def test_the_invocation_id_is_not_reused(self):
+        """INVOCATION_ID_REUSED: every dispatch gets its own invocation id."""
+        from serve import reqtelemetry as rt
+        from serve.test_telemetry_amendment02 import HttpWitnesses
+
+        def constant():
+            return "0123456789abcdef0123456789abcdef"
+
+        with patched(rt, "new_invocation_id", constant):
+            case = HttpWitnesses("test_two_requests_never_share_an_invocation_id")
+            with self.assertRaises(AssertionError):
+                _run_witness(case, "test_two_requests_never_share_an_invocation_id")
+
+    def test_the_flush_does_not_return_while_the_writer_is_busy(self):
+        """FLUSH_RETURNS_WHILE_WRITER_BUSY: the flush ignores the record the writer is writing."""
+        from serve.reqtelemetry import evidence as evidence_module
+        from serve.test_telemetry_amendment02 import EvidenceWriter
+
+        real = evidence_module.EvidenceLog.flush
+
+        def busy_flush(self, timeout=2.0):
+            # the defect: only the QUEUE is looked at, the record being written is not
+            with self.lock:
+                if not self.queue:
+                    return True
+            return real(self, timeout)
+
+        with patched(evidence_module.EvidenceLog, "flush", busy_flush):
+            case = EvidenceWriter("test_a_blocked_writer_is_not_flushed")
+            with self.assertRaises(AssertionError):
+                _run_witness(case, "test_a_blocked_writer_is_not_flushed")
 
 
 if __name__ == "__main__":

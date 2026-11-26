@@ -12671,7 +12671,17 @@ int main(int argc, char** argv) {
                         tele_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - tr0).count();
                     tele_restore_succeeded = restored;
                     if (!restored) {
-                        std::printf("ERR restoring a conversation checkpoint failed\n");
+                        // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G4): the failure is CORRELATED
+                        // evidence, not a bare message.  The telemetry the engine DID measure goes out with the
+                        // ERR line - the request's own id, the restoration it tried and how long it took - so the
+                        // server can tie the partial evidence to this request instead of losing it.  The engine
+                        // still fails exactly as before: the inference outcome does not change.
+                        tele.restore_attempted = tele_restore_attempted;
+                        tele.restore_succeeded = false;
+                        const std::string tele_err_txt =
+                            tele_on ? strata::program::reqtelemetry::encode(tele) : std::string();
+                        std::printf("ERR restoring a conversation checkpoint failed%s\n", tele_err_txt.c_str());
+                        std::fflush(stdout);
                         return 1;
                     }
                 }
@@ -14980,7 +14990,14 @@ int main(int argc, char** argv) {
                 tele.evaluated = std::clamp<int64_t>(pp_reached - tele_from, 0, n - tele_from);
                 // the positions that were previously processed prompt material and were evaluated again.
                 tele.replayed = reread_state ? std::min<int64_t>(reread_to, tele.evaluated) : 0;
-                tele.work = tele.evaluated;
+                // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G3): the CUMULATIVE work is the number of
+                // prompt-token evaluations this request executed, repeats included.  On the plain path every
+                // position is read exactly once, so the cumulative work IS the number of distinct positions - and
+                // only there is the alias kept.  When the state was RE-READ, the positions that were read before
+                // are evaluated a second time and their total is not established here: the field stays NOT
+                // MEASURED (-1) instead of repeating the distinct count, which would be a smaller number than
+                // the work that really happened.
+                tele.work = reread_state ? -1 : tele.evaluated;
                 tele.first_divergent = cdiag.on ? (cdiag.best_mismatch >= 0 ? cdiag.best_mismatch : -1) : -2;
                 tele.slot = admit_slot >= 0 ? admit_slot : -1;
                 tele.evictions = static_cast<int64_t>(conversations.evictions());
