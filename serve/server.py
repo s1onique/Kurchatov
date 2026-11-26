@@ -298,6 +298,15 @@ ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 
 
 # ------------------------------------------------------------------------------------------------ engines
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the keys the engine puts on its DONE line (include/strata/program/
+# reqtelemetry.hpp).  The engine writes only the measurements it made; a key it did not write stays absent, and the
+# record reports it as unavailable - never as a zero.
+REQTELEMETRY_INT_KEYS = ("matched", "reused", "evaluated", "replayed", "work", "divergent", "slot",
+                          "invalidations", "evictions")
+REQTELEMETRY_FLOAT_KEYS = ("restore_ms", "lookup_ms")
+REQTELEMETRY_TEXT_KEYS = ("cache_source", "cache_reason", "restore", "rid")
+
+
 class Engine(Protocol):
     max_context: int
     def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
@@ -314,6 +323,16 @@ class MockEngine:
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
+        self._req_local = threading.local()             # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this thread's
+                                                       # request id (the mock engine reports nothing)
+
+    def set_request_id(self, request_id: str | None):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the mock engine reports no cache measurements, so the id is only
+        kept so the telemetry's record and the engine's (absent) figures line up."""
+        self._req_local.request_id = request_id
+
+    def request_id(self) -> str | None:
+        return getattr(self._req_local, "request_id", None)
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
@@ -1135,6 +1154,8 @@ class StrataEngine:
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
+        self._req_local = threading.local()             # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this thread's
+                                                       # request id (each request carries its own)
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
@@ -1301,6 +1322,18 @@ class StrataEngine:
                     self.last[key] = int(value)
                 except ValueError:
                     pass
+            elif eq and key in REQTELEMETRY_INT_KEYS:    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the engine's
+                try:                                      # own measurements for THIS request (its DONE line)
+                    self.last.setdefault("telemetry", {})[key] = int(value)
+                except ValueError:
+                    pass
+            elif eq and key in REQTELEMETRY_FLOAT_KEYS:     # the engine's own durations (milliseconds)
+                try:
+                    self.last.setdefault("telemetry", {})[key] = float(value)
+                except ValueError:
+                    pass
+            elif eq and key in REQTELEMETRY_TEXT_KEYS:
+                self.last.setdefault("telemetry", {})[key] = value
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1332,6 +1365,32 @@ class StrataEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    @staticmethod
+    def request_key(request_id: str | None) -> str:
+        """`rid=<hex>`: the request's own id, sent to the engine so the numbers it measures can be tied to THIS
+        request.  The engine echoes it back on its DONE line; it is a label, never a key and never a credential.
+        Only hex is sent (the engine accepts nothing else), so nothing untrusted goes into the engine's output."""
+        if not request_id or len(request_id) > 64:
+            return ""
+        if not all(c in "0123456789abcdefABCDEF" for c in request_id):
+            return ""
+        return f" rid={request_id}"
+
+    def set_request_id(self, request_id: str | None):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the id of the request this thread is sending.  It is a THREAD's
+        own, not the engine's: with parallel batch slots several requests share one engine process, and each must
+        carry its own id.  The engine echoes it back on its DONE line, so the numbers it measures belong to the
+        request that asked for them - by construction, not by timing."""
+        local = getattr(self, "_req_local", None)
+        if local is None:
+            local = self._req_local = threading.local()
+        local.request_id = request_id
+
+    def request_id(self) -> str | None:
+        """The id of the request this thread is sending (None: none was set)."""
+        local = getattr(self, "_req_local", None)
+        return getattr(local, "request_id", None) if local is not None else None
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1747,7 +1806,7 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.sampling_keys(sampling or {})
+        keys = self.sampling_keys(sampling or {}) + self.request_key(self.request_id())
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -2134,7 +2193,7 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        keys = self.sampling_keys(sampling or {}) + self.turn_key(ids)
+        keys = self.sampling_keys(sampling or {}) + self.turn_key(ids) + self.request_key(self.request_id())
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
@@ -3126,6 +3185,11 @@ def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ)
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the engine measures the cache state and the model execution for the
+    # per-request telemetry, and reports it on its DONE line.  The switch is OFF unless it is asked for, so an
+    # engine started by hand behaves exactly as before; the server asks for it when its telemetry is on, and
+    # STRATA_TELEMETRY=0 turns the whole thing off (the DONE line is then byte-identical to the release's).
+    env["STRATA_TELEMETRY"] = "0" if os.environ.get("STRATA_TELEMETRY", "1") == "0" else "1"
     if hip_visible(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (hip_visible)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
@@ -3448,6 +3512,15 @@ class Service:
         self.api_monitor = False
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the per-request telemetry.  It is INDEPENDENT of the API monitor
+        # below: nothing here keeps a prompt, an answer, a header or a key - only counts, positions and ids.
+        self.telemetry_trace = threading.local()
+        from serve.reqtelemetry import ServerTelemetry
+        self.telemetry_requests = ServerTelemetry(
+            max_records=int(os.environ.get("STRATA_TELEMETRY_RECORDS") or 0) or 2048,
+            max_bytes=(int(os.environ.get("STRATA_TELEMETRY_BYTES") or 0) or (16 << 20)),
+            evidence_path=os.environ.get("STRATA_TELEMETRY_EVIDENCE") or None)
+        self.telemetry_requests.enabled = os.environ.get("STRATA_TELEMETRY", "1") != "0"
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -4459,6 +4532,133 @@ class Service:
         self.request_trace.record = record
         return record
 
+    def telemetry_summary(self) -> dict:
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry's totals, for /metrics and the Prometheus exporter.
+
+        The process-lifetime counters never fall when a record is evicted from the bounded store: the store is a
+        window on the recent requests, the counters are the totals since the server started.
+        """
+        summary = self.telemetry_requests.store.summary()
+        summary["inflight"] = self.telemetry_requests.inflight()
+        summary["enabled"] = self.telemetry_requests.enabled
+        with self.status_lock:
+            summary["queued"] = int(self.status.get("queued") or 0)
+        return summary
+
+    def loopback_only(self) -> bool:
+        """Whether this server listens on this PC's own loopback only.  The telemetry's request-level endpoints fail
+        closed when it does not and there is no API key."""
+        bind = getattr(self, "bind_host", None)
+        if not bind:
+            return True                       # a server not started through serve() (a test): the loopback's trust
+        return host_name(bind) in LOOPBACK_NAMES
+
+    def telemetry_api(self, path: str, query: dict) -> tuple[int, dict]:
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry API's answers.
+
+        Read-only, bounded and metadata-only.  The collection is paginated with a cursor that stays stable while new
+        requests arrive, the page size has a hard maximum, and nothing here exposes a prompt, an answer, a header or
+        a key.  A ValueError means the request was malformed (a bad cursor, a bad filter).
+        """
+        from serve import reqtelemetry as rt
+        store = self.telemetry_requests.store
+        if path == "/v1/telemetry/status":
+            status = self.telemetry_requests.status()
+            status["engine_instance_id"] = self.engine_instance_id()
+            status["build_revision"] = build_identity(getattr(self.engine, "info", {}) or {}).get("commit")
+            status["model"] = self.model
+            status["inflight"] = self.telemetry_requests.inflight()
+            return 200, status
+        if path == "/v1/telemetry/summary":
+            summary = store.summary()
+            summary["inflight"] = self.telemetry_requests.inflight()
+            summary["engine_instance_id"] = self.engine_instance_id()
+            summary["model"] = self.model
+            return 200, summary
+        if path == "/v1/telemetry/requests":
+            limit = query.get("limit", [None])[0]
+            try:
+                limit = int(limit) if limit is not None else rt.DEFAULT_PAGE_SIZE
+            except (TypeError, ValueError):
+                raise ValueError("limit must be a whole number") from None
+            if limit < 1:
+                raise ValueError("limit must be at least 1")
+            if limit > rt.MAXIMUM_PAGE_SIZE:
+                raise ValueError(f"limit must be at most {rt.MAXIMUM_PAGE_SIZE}")
+            cursor = query.get("cursor", [None])[0]
+            try:
+                page = store.list(limit=limit, cursor=cursor,
+                                  client_request_id=(query.get("client_request_id") or [None])[0],
+                                  state=(query.get("request_status") or [None])[0],
+                                  disposition=(query.get("cache_disposition") or [None])[0])
+            except ValueError as e:
+                raise ValueError(str(e)) from None
+            return 200, {"records": page["records"], "next_cursor": page["next_cursor"],
+                         "limit": limit, "schema_version": rt.SCHEMA_VERSION}
+        # /v1/telemetry/requests/{request_id}
+        request_id = path[len("/v1/telemetry/requests/"):]
+        if not request_id or "/" in request_id:
+            raise ValueError("the request id is missing")
+        record = store.get(request_id)
+        if record is None:
+            return 404, {"error": {"type": "not_found",
+                                   "message": "no request with that id is kept (the store is bounded and not durable)"}}
+        return 200, record
+
+    def engine_instance_id(self) -> str | None:
+        """This engine process's identity.  It changes when the engine is restarted, so a record from the old process
+        is never mistaken for one from the new."""
+        proc = getattr(self.engine, "proc", None)
+        if proc is None:
+            return None
+        return f"pid-{proc.pid}-gen-{getattr(self.engine, 'gen', 0)}"
+
+    def _finish_telemetry(self, tele, last, seen, submitted, generated, finish, started):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: close this request's telemetry record.
+
+        The engine's own figures (the cache state, the tokens it evaluated, its prefill and decode time) come from
+        its DONE line - the engine is the authority for them.  The server's own figures (the queue wait, the time to
+        the first byte the client sees, the total time) are measured here.  A request that failed before the engine
+        answered keeps whatever it has and says the accounting is partial: nothing is invented to look complete.
+        """
+        if tele is None:
+            return None
+        from serve import reqtelemetry as rt
+        try:
+            engine_figures = (last or {}).get("telemetry") or {}
+            rt.apply_engine(tele, engine_figures)
+            # the engine's own clock: the prefill and the decode it measured
+            if last and last.get("prompt_ms") is not None:
+                tele.set_timing("prefill_wall", float(last["prompt_ms"]), "native_engine")
+            if last and last.get("decode_ms") is not None:
+                tele.set_timing("decode_wall", float(last["decode_ms"]), "native_engine")
+            # the prompt: what the server rendered and tokenized, and what the engine was given
+            tele.set_prompt_tokens(rendered=submitted, submitted=submitted, authority="server")
+            # the generation: the engine's count, and what the client actually received
+            tele.set_generation(generated=generated, emitted=generated,
+                                 draft_tokens=last.get("drafts_offered") if last else None,
+                                 accepted_tokens=last.get("drafts_accepted") if last else None,
+                                 finish_reason=finish)
+            # the lifecycle: the queue wait, the time to the first byte the client sees, the total
+            now = time.time()
+            if started:
+                tele.set_timing("total", (now - started) * 1000.0, "http_server")
+            ft0 = self.status.get("first_token") if isinstance(self.status, dict) else None
+            if ft0 and started:
+                tele.set_timing("http_first_token", (ft0 - started) * 1000.0, "http_server")
+            # the outcome: a request that never reached the engine, or that was cut short, says so
+            state = {"completed": "completed", "cancel": "cancelled", "disconnect": "cancelled",
+                     "error": "failed", "length": "completed", "stop": "completed"}.get(finish, "completed")
+            if not engine_figures and finish != "completed":
+                tele.mark_unavailable("cache", "the engine reported no measurements for this request")
+            self.telemetry_requests.finish(tele, state=state, finish_reason=finish,
+                                           detail=None if finish == "completed" else finish)
+        except Exception as e:                       # noqa: BLE001 - the telemetry must never break a request
+            print(f"[strata] the telemetry could not finish a request: {type(e).__name__}: {e}", flush=True)
+        finally:
+            self.telemetry_trace.record = None
+        return tele
+
     def request_records(self, request_id=None):
         with self.status_lock:
             records = list(self.api_requests)
@@ -4524,6 +4724,9 @@ class Service:
                 # the DEPLOYED artifact's identity (its BUILD.json): the web app's build identifier comes from
                 # here, so it names what is actually running.  None when the artifact does not carry it.
                 "build": build_identity(getattr(self.engine, "info", {}) or {}),
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry's own totals, so /metrics and the
+                # Prometheus exporter say the same thing about the requests the engine measured.
+                "telemetry": self.telemetry_summary(),
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked,
                                                                self.conv_log.diag, self.conv_log.diag_counts,
                                                                self.conv_log.diag_lost,
@@ -5123,6 +5326,15 @@ class Service:
         # so the generated reasoning must not become this request's cached input (#615).
         segments = []
         trace = getattr(self.request_trace, "record", None)
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's telemetry record.  The HTTP layer made it (it knows
+        # the API and the client's own request id); this thread picks it up.  A request that did not come through the
+        # HTTP layer (a tool's own call) gets one of its own, so no request is ever unmeasured.
+        tele = getattr(self.telemetry_trace, "record", None)
+        if tele is None:
+            tele = self.telemetry_requests.begin(model_id=self.model,
+                                                 build_revision=build_identity(
+                                                     getattr(self.engine, "info", {}) or {}).get("commit"))
+        tele.started_at = time.time()
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
@@ -5201,6 +5413,8 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        if hasattr(self.engine, "set_request_id"):
+                            self.engine.set_request_id(tele.request_id)   # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
@@ -5433,6 +5647,11 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's telemetry record.  The engine's
+                            # own figures (the cache state, the tokens it evaluated) come from its DONE line; the
+                            # lifecycle figures (the queue wait, the render, the tokenization, the model load, the
+                            # time to the first byte the client sees) are the server's own.
+                            self._finish_telemetry(tele, last, seen, len(ids), n, finish, started)
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
@@ -6002,6 +6221,7 @@ def make_handler(svc: Service):
         def handle_one_request(self):
             self.answer_started = False
             self.held = contextlib.ExitStack()
+            self.telemetry = None                    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's record
             super().handle_one_request()
             self._drain_body()
 
@@ -6227,6 +6447,10 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the request's own id, echoed so the client can quote it in a
+            # bug report and find the request in the telemetry.  It is the server's id, not the client's.
+            if getattr(self, "telemetry", None) is not None:
+                self.send_header("X-Strata-Request-ID", self.telemetry.request_id)
             for k, v in (headers or {}).items():
                 self.send_header(k, str(v))
             self._cors()
@@ -6242,6 +6466,19 @@ def make_handler(svc: Service):
             if key_matches(given, svc.api_key):
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+            return False
+
+        def _telemetry_allowed(self) -> bool:
+            """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the request-level telemetry needs the same access control as
+            the rest of the management surface, and it FAILS CLOSED when there is none on a listener that is not this
+            PC's own.  An inference endpoint that lets anonymous callers in does NOT make the request metadata
+            anonymous: the answers are the client's business, the request's timing and cache attribution are not."""
+            if svc.api_key:
+                return True                      # the key is checked by _authorized()
+            if svc.loopback_only():
+                return True                      # this PC's own loopback: the same trust as the rest of the server
+            self._json(403, {"error": {"type": "forbidden",
+                                       "message": "the request telemetry needs an API key on this listener"}})
             return False
 
         def do_GET(self):
@@ -6288,6 +6525,24 @@ def make_handler(svc: Service):
                     self.end_headers()
                     self.wfile.write(body)
                 return
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry API.  It is READ-ONLY, it exposes METADATA ONLY
+            # (no prompt, no answer, no reasoning, no header, no key) and it needs the same access control as the
+            # rest of the management surface: on a listener that is not this PC's own, it fails closed.
+            if path == "/v1/telemetry/status" or path == "/v1/telemetry/summary" or path == "/v1/telemetry/requests" \
+                    or path.startswith("/v1/telemetry/requests/"):
+                if not self._telemetry_allowed():
+                    return
+                if not self._authorized():
+                    return
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    code, body = svc.telemetry_api(path, query)
+                except ValueError as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                # a request-level diagnostic must not be cached by a proxy or a browser
+                self._json(code, body, headers={"Cache-Control": "no-store"})
+                return
             if path == "/metrics":
                 from serve import prometheus
                 if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
@@ -6325,8 +6580,12 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
-            if path == "" or (path == "/api-monitor" and svc.api_monitor):
-                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
+            if path == "" or (path == "/api-monitor" and svc.api_monitor) or path == "/telemetry":
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry view.  It is its own page (like the API
+                # monitor) so it does not grow the chat app, and it works WITHOUT the API monitor: the telemetry
+                # keeps no prompts and no answers.
+                name = {"": "index.html", "/api-monitor": "monitor.html", "/telemetry": "telemetry.html"}[path]
+                body = (ROOT / "serve" / "web" / name).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -6508,6 +6767,19 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
+                    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's telemetry record.  The server's own id
+                    # is the primary key; the client's X-Request-ID is kept beside it as a label for the operator -
+                    # it is never a key, never an authentication and never trusted beyond its characters.
+                    client_id = self.headers.get("X-Request-ID") or self.headers.get("X-Request-Id")
+                    from serve import reqtelemetry as _rt
+                    tele = svc.telemetry_requests.begin(
+                        api={"v1/chat/completions": "openai", "v1/messages": "anthropic",
+                             "v1/responses": "responses"}.get(path, path),
+                        client_request_id=client_id if _rt.valid_client_request_id(client_id) else None,
+                        model_id=req.get("model") or svc.model,
+                        build_revision=build_identity(getattr(svc.engine, "info", {}) or {}).get("commit"))
+                    svc.telemetry_trace.record = tele
+                    self.telemetry = tele
                     # #38: the request holds its model to its end (no switch comes between its prompt and its answer);
                     # with switch_on_request a request naming another installed model loads it first.  Its client is
                     # watched from here (#430 #431, #1999), so a client that leaves while it waits gives up its place.
@@ -6821,6 +7093,9 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the request's own id, on the stream's headers too.
+            if getattr(self, "telemetry", None) is not None:
+                self.send_header("X-Strata-Request-ID", self.telemetry.request_id)
             self._cors()
             self.end_headers()
 
@@ -7418,6 +7693,7 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
+    svc.bind_host = host          # what it listens on: the telemetry's fail-closed rule needs to know
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     httpd.svc = svc
@@ -7912,7 +8188,10 @@ def shutdown(svc: Service, httpd, hub=None) -> None:
     ones the server started with (#37) - and the MCP servers PolyStrata started."""
     engine, vision = svc.engine, svc.vision
     closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
-               hub.close if hub is not None else None]
+               hub.close if hub is not None else None,
+               # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the evidence log's queue is written out and its file closed
+               # on the way down, so the last records are not lost.
+               getattr(getattr(svc, "telemetry_requests", None), "close", None)]
     for close in filter(None, closers):
         try:
             close()

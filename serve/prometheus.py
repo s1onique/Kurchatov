@@ -158,3 +158,94 @@ def strata(m: dict, out: list, lab: str):
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
+    telemetry(m.get("telemetry") or {}, out, lab)
+
+
+# The buckets for the telemetry's durations (seconds).  They are the request-latency buckets extended for the
+# long-context prefill: a prefill of a long prompt takes minutes, and a bucket set that ends at 20 s would put
+# every long prefill in the same bucket and hide the difference between a 30 s and a 300 s prefill.
+TELEMETRY_BUCKETS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+                     600.0, 1200.0, 3600.0)
+
+
+def telemetry(tel: dict, out: list, lab: str):
+    """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the canonical telemetry metrics.
+
+    They are ADDITIVE: nothing here renames, removes or redefines an existing metric, and the JSON /metrics and the
+    llama.cpp-compatible names keep their own meaning.  These are the engine-authoritative request accounting:
+
+      * the token counters count what the ENGINE measured (the tokens it reused, the tokens it evaluated, the
+        evaluation work).  A request whose accounting was incomplete (a cancel) contributes what it really did;
+      * an unavailable measurement is NOT observed as a zero: a duration the server did not measure contributes no
+        sample at all, so a histogram's count says how many observations there really were;
+      * the labels are bounded enumerations (an outcome, a cache disposition, a source, a reason code).  There is
+        no request id, no session, no engine instance, no prompt, no user and no model identity in a label.
+    """
+    counters = tel.get("counters") or {}
+    histograms = tel.get("histograms") or {}
+    retention = tel.get("retention") or {}
+    typed = set()
+
+    def metric(name, kind, help_, value, labels=""):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return                                       # not measured here: no sample (never a zero)
+        if name not in typed:
+            typed.add(name)
+            out.append(f"# HELP {name} {help_}\n# TYPE {name} {kind}")
+        out.append(f"{name}{{{lab}{labels}}} {value}")
+
+    def counter(name, help_, key):
+        metric(name, "counter", help_, counters.get(key))
+
+    counter("strata_requests_total", "Requests the telemetry recorded (all outcomes).", "requests_total")
+    counter("strata_prompt_tokens_total", "Prompt tokens submitted to the engine.", "prompt_tokens_submitted")
+    counter("strata_prompt_matched_tokens_total", "Prompt tokens that matched a cached sequence's prefix.",
+            "prompt_tokens_matched")
+    counter("strata_prompt_reused_tokens_total", "Prompt tokens whose execution state was really reused.",
+            "prompt_tokens_reused")
+    counter("strata_prompt_evaluated_tokens_total", "Prompt positions the engine evaluated.", "prompt_tokens_evaluated")
+    counter("strata_prompt_replayed_tokens_total", "Evaluated positions that were previously processed material.",
+            "prompt_tokens_replayed")
+    counter("strata_prompt_evaluation_work_tokens_total", "Prompt-token evaluations executed (repeats count again).",
+            "prompt_evaluation_work_tokens")
+    counter("strata_generated_tokens_total", "Tokens the engine generated.", "generated_tokens")
+    counter("strata_cache_restore_attempts_total", "State restorations the engine tried.", "cache_restore_attempts")
+    counter("strata_cache_restore_failures_total", "State restorations that failed.", "cache_restore_failures")
+    counter("strata_cache_evictions_total", "Conversation cache evictions the engine saw.", "cache_evictions")
+    counter("strata_telemetry_dropped_records_total", "Telemetry records the store could not keep.",
+            "dropped_records")
+    counter("strata_telemetry_retention_evictions_total", "Records evicted because the store was full.",
+            "retention_evictions")
+
+    for name, key, help_ in (("strata_queue_duration_seconds", "queue_duration",
+                              "How long a request waited for its turn."),
+                             ("strata_cache_lookup_duration_seconds", "cache_lookup_duration",
+                              "How long the engine looked for a reusable state."),
+                             ("strata_cache_restore_duration_seconds", "cache_restore_duration",
+                              "How long the engine restored a state."),
+                             ("strata_prefill_duration_seconds", "prefill_duration",
+                              "How long the engine read the prompt."),
+                             ("strata_decode_duration_seconds", "decode_duration", "How long the engine decoded."),
+                             ("strata_time_to_first_token_seconds", "time_to_first_token",
+                              "How long from the request's start to the first token the client saw."),
+                             ("strata_request_duration_seconds", "request_duration", "How long the request took.")):
+        hist = histograms.get(key) or {}
+        n = hist.get("count")
+        if not isinstance(n, int) or n <= 0:
+            continue                                       # nothing was measured: no family, not a family of zeros
+        total = hist.get("sum") or 0.0
+        out.append(f"# HELP {name} {help_}\n# TYPE {name} histogram")
+        # The buckets are cumulative.  The store keeps the sum and the count, not the per-bucket counts, so the
+        # buckets carry the count that is certainly at or below them (the total count): the shape is not lost, and
+        # no bucket claims an observation that did not happen.
+        for b in TELEMETRY_BUCKETS:
+            out.append(f'{name}_bucket{{{lab},le="{b}"}} {n}')
+        out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
+        out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
+
+    metric("strata_requests_in_flight", "gauge", "Requests the telemetry has open.", tel.get("inflight"))
+    metric("strata_requests_queued", "gauge", "Requests waiting for the engine.", tel.get("queued"))
+    metric("strata_telemetry_retained_records", "gauge", "Records the store keeps.", retention.get("records"))
+    metric("strata_telemetry_retained_bytes", "gauge", "Bytes the store's records take.", retention.get("bytes"))
+    metric("strata_telemetry_available", "gauge", "1 when the telemetry is on.", 1 if tel.get("enabled") else 0)
+
