@@ -2,7 +2,7 @@
 
 | What | Command | Result |
 |---|---|---|
-| the server's whole suite, with the repository's REAL dependencies | `/tmp/stratavenv/bin/python -m unittest discover -s serve -p 'test_*.py'` | see `03-test-evidence.md` |
+| the server's whole suite, with the repository's REAL dependencies | `/tmp/stratavenv/bin/python -m unittest discover -s serve -p 'test_*.py'` | see `test-evidence.md` |
 | the telemetry's own suites | `/tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry serve.test_telemetry_integrity serve.test_telemetry_amendment02` | 121 + 34 tests, OK |
 | the schema (the file and the code are the same contract) | `/tmp/stratavenv/bin/python tools/test_reqtelemetry_schema.py` | all checks passed |
 | the non-vacuity witnesses | `/tmp/stratavenv/bin/python tools/test_telemetry_mutations.py` | 12 witnesses, OK |
@@ -23,5 +23,5 @@
 
 ## The native corrections, in full
 
-The native diff is `04-native-production.diff`: 39 lines, two measurement sites, no change to the cache policy,
+The native diff is `01-native-production.diff`: 39 lines, two measurement sites, no change to the cache policy,
 the checkpoint policy, the scheduler, the sampling or the model's execution.

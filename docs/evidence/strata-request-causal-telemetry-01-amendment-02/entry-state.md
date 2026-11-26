@@ -26,10 +26,10 @@ LIVE_GPU_QUALIFICATION_AUTHORIZED: false
 | the JavaScript | `osascript -l JavaScript` (macOS); no `node` |
 
 The predecessor's full-suite gate was `BLOCKED_ENVIRONMENT` because the `regex` wheel was missing.  It is
-installed now, so the full suite ran with the repository's real dependencies (see `03-test-evidence.md`).
+installed now, so the full suite ran with the repository's real dependencies (see `test-evidence.md`).
 
 ## What this amendment does NOT touch
 
 `.kurchatov-acts/`, the deployment repository, the running production instance, the cache policy, the sampling,
 the model's execution and the context handling.  The engine's cache selection, checkpoint policy and scheduler
-are unchanged: the native diff is two measurement sites (see `04-native-production.diff`).
+are unchanged: the native diff is two measurement sites (see `01-native-production.diff`).

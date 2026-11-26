@@ -4,14 +4,14 @@ The payload is source-only, complete and separately reviewable:
 
 | File | What it holds |
 |---|---|
-| `04-native-production.diff` | the whole native production diff (`src/program/generate.cpp`, the telemetry header) |
-| `05-http-production.diff` | the whole HTTP production diff (`serve/server.py`, `serve/prometheus.py`, the web assets) |
-| `06-telemetry-core-production.diff` | the whole telemetry core diff (`serve/reqtelemetry/`, the JSON Schema) |
-| `07-test-witnesses.diff` | the whole test diff (`serve/test_*.py`, `tools/test_telemetry_mutations.py`, `tools/test_telemetry_web_accounting.py`) |
-| `01-defects-reproduced.md` | what each defect was, and the witness that guards it |
-| `02-corrections.md` | where each correction is, file by file and symbol by symbol |
-| `03-test-evidence.md` | the commands, the exit codes and the results |
-| `11-exit-report.md` | the exit contract |
+| `01-native-production.diff` | the whole native production diff (`src/program/generate.cpp`, the telemetry header) |
+| `02-http-production.diff` | the whole HTTP production diff (`serve/server.py`, `serve/prometheus.py`, the web assets) |
+| `03-telemetry-core-production.diff` | the whole telemetry core diff (`serve/reqtelemetry/`, the JSON Schema) |
+| `04-test-witnesses.diff` | the whole test diff (`serve/test_*.py`, `tools/test_telemetry_mutations.py`, `tools/test_telemetry_web_accounting.py`) |
+| `defects-reproduced.md` | what each defect was, and the witness that guards it |
+| `corrections.md` | where each correction is, file by file and symbol by symbol |
+| `test-evidence.md` | the commands, the exit codes and the results |
+| `exit-report.md` | the exit contract |
 
 The diffs are generated from the repository itself (`git diff 579f5cef..HEAD -- <paths>`), so they cannot be
 edited by hand and cannot drift from the tree they describe.  The historical evidence of the predecessor

@@ -16,7 +16,7 @@ G2_NATIVE_INVOCATION_IDENTITY: CORRECTED - a new hexadecimal invocation id per d
   dispatch and checked before ANY native number is applied; a foreign, stale, duplicate or missing id never
   enters the record's authoritative fields.  Six witnesses, including the recovery witness (A -> B, C).
 G3_NATIVE_ACCOUNTING: CORRECTED IN SOURCE, NOT EXECUTED - the cumulative work is no longer aliased to the
-  distinct count on the re-read path (it stays "not measured" there); the native diff is 04-native-production.diff.
+  distinct count on the re-read path (it stays "not measured" there); the native diff is 01-native-production.diff.
   No CUDA toolchain on this host: NOT_EXECUTED.
 G4_NATIVE_ERROR_EVIDENCE: CORRECTED IN SOURCE, NOT EXECUTED - the terminal ERR line carries the telemetry the
   engine did measure, and the server reads it (parse_error_figures).  NOT_EXECUTED (no CUDA build here).
@@ -28,8 +28,8 @@ G6_CURSOR_CONTRACT: CORRECTED - a cursor without an owner, with a sequence below
 G7_EXECUTABLE_WITNESSES: DONE - 34 new witnesses in the production paths (the store, the correlation, the
   writer, the HTTP handlers, the exporter) and 12 non-vacuity witnesses; the whole suite ran with the
   repository's real dependencies: 1126 tests, OK (20 skipped), exit 0.
-G8_REVIEW_COMPLETENESS: DONE - 04-native-production.diff, 05-http-production.diff,
-  06-telemetry-core-production.diff, 07-test-witnesses.diff, 05-evidence-summary.md and SHA256SUMS, all
+G8_REVIEW_COMPLETENESS: DONE - 01-native-production.diff, 02-http-production.diff,
+  03-telemetry-core-production.diff, 04-test-witnesses.diff, 05-evidence-summary.md and SHA256SUMS, all
   generated from the repository itself.
 
 REAL_DEPENDENCY_FULL_SUITE: 1126 tests, OK (skipped=20), exit code 0 - /tmp/stratavenv has the repository's
@@ -84,10 +84,10 @@ REAL_DEPENDENCY_FULL_SUITE: 1126 tests, OK (skipped=20), exit 0
 
 ## What a reviewer should read first
 
-1. `01-defects-reproduced.md` - what each defect was, and the witness that guards it;
-2. `02-corrections.md` - where each correction is;
-3. `04-native-production.diff` - the whole native change (39 lines, two measurement sites);
-4. `03-test-evidence.md` - the commands and the results.
+1. `defects-reproduced.md` - what each defect was, and the witness that guards it;
+2. `corrections.md` - where each correction is;
+3. `01-native-production.diff` - the whole native change (39 lines, two measurement sites);
+4. `test-evidence.md` - the commands and the results.
 
 ## The honest limits
 
