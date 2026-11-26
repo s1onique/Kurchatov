@@ -41,6 +41,8 @@ CONCURRENCY_CONTROLS         PARTIAL  (the design is proven - the id is a thread
                                          native parallel case is NOT_EXECUTED)
 NON_VACUITY_WITNESSES        DONE  (five mutations, each applied to a copy and reverted; each one fails its
                                    witness - see 04-test-evidence.md)
+T19_WITNESS                  DONE  (the engine's own writer program gates its DONE line the way the engine
+                                   does, and the roundtrip test drives it with the switch off)
 PROTOCOL_PARITY              DONE  (the streaming path is unchanged; the whole existing suite passes)
 PERFORMANCE_PARITY           NOT_EXECUTED  (no GPU on this host)
 

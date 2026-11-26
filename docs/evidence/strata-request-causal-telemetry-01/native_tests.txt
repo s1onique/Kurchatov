@@ -7,12 +7,13 @@ test_the_client_id_is_validated_before_it_is_kept (__main__.Roundtrip.test_the_c
 test_the_client_id_the_server_sends_is_one_the_engine_accepts (__main__.Roundtrip.test_the_client_id_the_server_sends_is_one_the_engine_accepts)
 test_the_field_names_are_the_same_on_both_sides (__main__.Roundtrip.test_the_field_names_are_the_same_on_both_sides)
 test_the_server_reads_what_the_engine_writes (__main__.Roundtrip.test_the_server_reads_what_the_engine_writes) ... ok
-Ran 5 tests in 0.005s
+test_with_the_switch_off_the_done_line_carries_no_telemetry (__main__.Roundtrip.test_with_the_switch_off_the_done_line_carries_no_telemetry)
+Ran 6 tests in 0.008s
 OK
 
 $ /tmp/stratavenv/bin/python tools/test_reqtelemetry_schema.py
 test_reqtelemetry_schema: all checks passed
 
 $ /tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry -v
-Ran 49 tests in 10.332s
+Ran 49 tests in 10.753s
 OK

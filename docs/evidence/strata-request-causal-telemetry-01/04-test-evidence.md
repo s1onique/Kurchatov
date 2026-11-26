@@ -8,7 +8,7 @@ Every command below was run on the host described in `00-entry-state.md`. The ex
 |---|---|---|---|
 | 1 | `g++ -std=c++20 -Iinclude -o /tmp/rtcache/reqtelemetry_test src/program/reqtelemetry_test.cpp && /tmp/rtcache/reqtelemetry_test` | 0 | `reqtelemetry_test: all checks passed` |
 | 2 | `g++ -std=c++20 -Iinclude -o /tmp/rtcache/reqtelemetry_roundtrip src/program/reqtelemetry_roundtrip.cpp` | 0 | the engine's writer builds |
-| 3 | `/tmp/stratavenv/bin/python tools/test_reqtelemetry_roundtrip.py -v` | 0 | `Ran 5 tests ... OK` |
+| 3 | `/tmp/stratavenv/bin/python tools/test_reqtelemetry_roundtrip.py -v` | 0 | `Ran 6 tests ... OK` |
 | 4 | `/tmp/stratavenv/bin/python tools/test_reqtelemetry_schema.py` | 0 | `test_reqtelemetry_schema: all checks passed` |
 | 5 | `/tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry -v` | 0 | `Ran 49 tests ... OK` |
 | 6 | `/tmp/stratavenv/bin/python -m unittest serve.test_prometheus serve.test_reqtelemetry` | 0 | `Ran 55 tests ... OK` |
@@ -59,7 +59,7 @@ The honest column is the last one. **A native control that was not executed is N
 | T16 | Prometheus scraping | `06-http-contract-evidence.json`: the exposition is valid, the existing families are there, the telemetry's families are there | **PASS** |
 | T17 | Authentication | `test_a_shared_listener_without_a_key_refuses_the_request_metadata` (403), `test_a_shared_listener_with_a_key_needs_it` (401 then 200), `test_the_loopback_listener_keeps_the_server_own_trust` (200) | **PASS** |
 | T18 | Privacy | `test_the_evidence_carries_no_content` (the record's keys are exactly the schema's), `test_the_telemetry_carries_no_content_at_all`, and the check in `06-http-contract-evidence.json` | **PASS** |
-| T19 | Telemetry disabled | `STRATA_TELEMETRY=0` turns the whole thing off; the engine's DONE line is then byte-identical (the writer's own switch, `reqtelemetry_test`'s `switch_on` checks) | **PASS** (the switch) / **NOT_EXECUTED** (a real engine's byte-identical DONE line) |
+| T19 | Telemetry disabled | `STRATA_TELEMETRY=0` turns the whole thing off. The engine's own writer program gates its DONE line the way the engine does, and `tools/test_reqtelemetry_roundtrip.py`'s `test_with_the_switch_off_the_done_line_carries_no_telemetry` drives it: no telemetry key is on the line and the server's reader finds no telemetry. The server's side is checked too (`Disabled`: nothing is kept, the status says so). | **PASS** (the switch, against the engine's own writer) / **NOT_EXECUTED** (a real engine's DONE line) |
 | T20 | Streaming parity | the streaming path is unchanged: the telemetry only reads the DONE line and writes a record; the response body is untouched | **PASS** (the existing streaming tests pass) |
 | T21 | Missing native telemetry | `test_a_missing_figure_stays_null`, `test_no_figures_at_all_is_an_explicit_state`: the fields are null and the quality says why | **PASS** |
 | T22 | UI contract | the page (`serve/web/telemetry.html`, `serve/web/telemetry.js`) shows the units, the filters and the inspector; the record's fields are the ones it renders | **PASS** (the page and the record agree; the page is NOT rendered in a browser here) |
