@@ -1,0 +1,725 @@
+# The native production diff (G8)
+
+The review of the predecessor could not render the production change in src/program/generate.cpp,
+so it is published here in full: the predecessor's native diff against the ACT's entry commit.
+
+```diff
+diff --git a/include/strata/program/reqtelemetry.hpp b/include/strata/program/reqtelemetry.hpp
+new file mode 100644
+index 00000000..4041127d
+--- /dev/null
++++ b/include/strata/program/reqtelemetry.hpp
+@@ -0,0 +1,233 @@
++// include/strata/program/reqtelemetry.hpp - the native half of the per-request telemetry
++// (ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01).
++//
++// The ENGINE is the authority for the cache state and the model execution: how much of the prompt it reused,
++// how much it actually read, where the reusable state came from, and why it could not reuse more.  The server
++// cannot reconstruct any of that from the outside - it only sees the request's answer.
++//
++// Those numbers travel on the request's OWN DONE line, in key=value pairs.  That matters for two reasons:
++//
++//   * the DONE line is the request's own channel - the server reads it while it holds that request's control
++//     lines, so the numbers belong to that request BY CONSTRUCTION.  No timestamp proximity, no "the most
++//     recently active request", no FIFO assumption;
++//   * the DONE line already has a key=value suffix (chunk=, experts_streamed=), so a new field is an extension
++//     of an existing protocol, not a new one.  An older server ignores the keys it does not know.
++//
++// NOTHING HERE CARRIES USER DATA: no prompt text, no token ids, no image content, no hashes of any of them.
++// The fields are counts, positions and fixed words.
++//
++// The values are filled in the engine's request loop (src/program/generate.cpp).  This header holds the
++// ENCODING only, so a host test can check it without a GPU - the same split the cache diagnostics use
++// (include/strata/program/cache_diag.hpp and src/program/cache_diag_test.cpp).
++#ifndef STRATA_PROGRAM_REQTELEMETRY_HPP
++#define STRATA_PROGRAM_REQTELEMETRY_HPP
++
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++namespace strata {
++namespace program {
++namespace reqtelemetry {
++
++/// The switch's rule, as a pure function of the environment value: only "1" turns it on.  Kept separate from
++/// `enabled()` so a test can check the rule without the process-wide latch below.
++inline bool switch_on(const char* value) { return value != nullptr && value[0] == '1'; }
++
++/// The switch: STRATA_TELEMETRY=1.  Read once, so a run's behaviour cannot change under it.  With it off the
++/// engine does no extra work and the DONE line is byte-identical to the release's.
++inline bool enabled() {
++    static const bool on = switch_on(std::getenv("STRATA_TELEMETRY"));
++    return on;
++}
++
++/// What the engine measured for ONE request.  Every field is a count, a position or a fixed word; a field the
++/// engine did not measure stays at its "not measured" value and is NOT written out at all (the server then
++/// reports it as unavailable, never as zero).
++///
++/// The token accounting keeps two things apart on purpose:
++///   * `matched_prefix` - the contiguous token-prefix match against the best candidate, BEFORE the execution
++///     state is considered.  It says how far the tokens agreed;
++///   * `reused_prefix` - the contiguous prefix whose usable execution state was really retained or restored,
++///     so those positions were not evaluated again.  It says how much work was saved.
++/// A candidate whose tokens match but whose state is unusable moves the first without moving the second.
++struct RequestTelemetry {
++    int64_t matched_prefix = -1;      ///< the token-prefix match; -1: not measured
++    int64_t reused_prefix = -1;       ///< the prefix whose state was really reused; -1: not measured
++    int64_t evaluated = -1;           ///< the distinct prompt positions the engine evaluated; -1: not measured
++    int64_t replayed = -1;            ///< the evaluated positions that were previously processed material; -1
++    int64_t work = -1;               ///< the executed prompt-token evaluations (repeats count again); -1
++    int64_t first_divergent = -2;     ///< the first differing token's position; -1: no mismatch, -2: not measured
++    int64_t slot = -1;               ///< the execution slot this request ran in; -1: the solo path
++    int64_t invalidations = -1;       ///< the cache invalidations this request saw; -1: not measured
++    int64_t evictions = -1;           ///< the cache evictions this request saw; -1: not measured
++    double restore_ms = -1.0;        ///< the time the state restoration took; negative: not measured
++    double lookup_ms = -1.0;         ///< the time the cache LOOKUP took (the candidates examined and the choice);
++                                     ///< negative: not measured
++    bool restore_attempted = false;  ///< whether a restoration was tried
++    bool restore_succeeded = false;  ///< whether it worked
++    std::string source = "unknown";   ///< where the reusable prefix came from
++    std::string reason = "unknown";   ///< why the engine did what it did
++    std::string request_id;           ///< the server's id for this request, echoed back (empty: none was sent)
++};
++
++/// The token accounting, as the engine measured it.  The two prefixes are different things on purpose:
++///
++///   * `matched` is the CONTIGUOUS TOKEN PREFIX MATCH against the candidates the engine examined, before the
++///     execution-state constraints were applied: how far the tokens agreed.  It comes from the cache diagnostics'
++///     own comparison - the ACTUAL common prefix, never a candidate's length.
++///   * `reused` is the contiguous prefix whose usable execution state was really retained or restored, so those
++///     positions were NOT evaluated again.  It is 0 when the state was re-read instead of mounted.
++///
++/// A candidate whose tokens match but whose state is unusable moves the first without moving the second: that is
++/// the difference between a match and a reuse.
++struct TokenAccounting {
++    int64_t submitted = -1;      ///< the prompt tokens admitted to the engine
++    int64_t matched = -1;        ///< the token-prefix match
++    int64_t reused = -1;         ///< the prefix whose state was really reused
++    int64_t evaluated = -1;      ///< the distinct prompt positions evaluated
++    int64_t replayed = -1;       ///< the evaluated positions that were previously processed prompt material
++    int64_t work = -1;           ///< the executed prompt-token evaluations (repeats count again)
++    int64_t non_prefix_reused = -1;   ///< the reused positions OUTSIDE the contiguous prefix: Strata has none
++};
++
++/// The accounting identities that must hold when the domains are equivalent, non-overlapping and complete:
++///
++///     0 <= reused <= matched <= submitted
++///     submitted = reused + non_prefix_reused + evaluated
++///     replayed <= evaluated
++///     work >= evaluated
++///
++/// They are CHECKED, never enforced: a measurement is never adjusted to make an identity come out right.  A broken
++/// identity means the accounting was incomplete (a cancel, a re-read), and the record says so.
++struct AccountingCheck {
++    bool ok = true;
++    const char* problem = "";
++};
++
++inline AccountingCheck check_accounting(const TokenAccounting& a, bool complete) {
++    AccountingCheck c;
++    auto fail = [&](const char* why) { c.ok = false; c.problem = why; };
++    if (a.reused >= 0 && a.matched >= 0 && a.reused > a.matched)
++        fail("the reused prefix is longer than the matched prefix");
++    if (a.matched >= 0 && a.submitted >= 0 && a.matched > a.submitted)
++        fail("the matched prefix is longer than the submitted prompt");
++    if (a.replayed >= 0 && a.evaluated >= 0 && a.replayed > a.evaluated)
++        fail("more replayed positions than evaluated positions");
++    if (a.work >= 0 && a.evaluated >= 0 && a.work < a.evaluated)
++        fail("less executed work than evaluated positions");
++    // The sum identity holds only for a COMPLETE accounting: a cancelled request evaluated part of its prompt,
++    // and the rest was never evaluated at all.
++    if (complete && a.submitted >= 0 && a.reused >= 0 && a.evaluated >= 0 &&
++        a.non_prefix_reused >= 0 && a.reused + a.non_prefix_reused + a.evaluated != a.submitted)
++        fail("the submitted prompt is not the reused prefix plus the evaluated positions");
++    return c;
++}
++
++/// The key names.  They are the wire format; the server reads the same names.  They are written once here so
++/// the two halves cannot drift apart over a renamed field.
++namespace keys {
++constexpr const char* kMatched = "matched";
++constexpr const char* kReused = "reused";
++constexpr const char* kEvaluated = "evaluated";
++constexpr const char* kReplayed = "replayed";
++constexpr const char* kWork = "work";
++constexpr const char* kDivergent = "divergent";
++constexpr const char* kSlot = "slot";
++constexpr const char* kInvalidations = "invalidations";
++constexpr const char* kEvictions = "evictions";
++constexpr const char* kRestoreMs = "restore_ms";
++constexpr const char* kLookupMs = "lookup_ms";
++constexpr const char* kRestore = "restore";
++constexpr const char* kSource = "cache_source";
++constexpr const char* kReason = "cache_reason";
++constexpr const char* kRequestId = "rid";
++}  // namespace keys
++
++/// The restoration's outcome, as one word: what the engine actually did, not what it hoped to do.
++inline const char* restore_state(const RequestTelemetry& t) {
++    if (!t.restore_attempted) return "none";
++    return t.restore_succeeded ? "succeeded" : "failed";
++}
++
++/// The key=value pairs for one request, as a single space-separated string, ready to be appended to the DONE
++/// line.  A field the engine did not measure is left out entirely, so the server sees no key at all and reports
++/// the measurement as unavailable (never as zero).
++///
++/// The order is fixed, so two runs of the same request produce the same bytes.
++inline std::string encode(const RequestTelemetry& t) {
++    std::string out;
++    auto num = [&](const char* key, int64_t v) {
++        if (v < 0) return;                               // -1: not measured, so the key is left out entirely
++        out += ' ';
++        out += key;
++        out += '=';
++        out += std::to_string(v);
++    };
++    if (!t.request_id.empty()) {
++        out += ' ';
++        out += keys::kRequestId;
++        out += '=';
++        out += t.request_id;
++    }
++    num(keys::kMatched, t.matched_prefix);
++    num(keys::kReused, t.reused_prefix);
++    num(keys::kEvaluated, t.evaluated);
++    num(keys::kReplayed, t.replayed);
++    num(keys::kWork, t.work);
++    if (t.first_divergent >= -1) {
++        out += ' ';
++        out += keys::kDivergent;
++        out += '=';
++        out += std::to_string(t.first_divergent);
++    }
++    if (t.slot >= 0) {
++        out += ' ';
++        out += keys::kSlot;
++        out += '=';
++        out += std::to_string(t.slot);
++    }
++    num(keys::kInvalidations, t.invalidations);
++    num(keys::kEvictions, t.evictions);
++    if (t.restore_ms >= 0.0) {
++        out += ' ';
++        out += keys::kRestoreMs;
++        out += '=';
++        char buf[64];
++        std::snprintf(buf, sizeof(buf), "%.1f", t.restore_ms);
++        out += buf;
++    }
++    if (t.lookup_ms >= 0.0) {
++        out += ' ';
++        out += keys::kLookupMs;
++        out += '=';
++        char buf[64];
++        std::snprintf(buf, sizeof(buf), "%.1f", t.lookup_ms);
++        out += buf;
++    }
++    if (t.restore_attempted) {
++        out += ' ';
++        out += keys::kRestore;
++        out += '=';
++        out += restore_state(t);
++    }
++    if (t.source != "unknown") {
++        out += ' ';
++        out += keys::kSource;
++        out += '=';
++        out += t.source;
++    }
++    if (t.reason != "unknown") {
++        out += ' ';
++        out += keys::kReason;
++        out += '=';
++        out += t.reason;
++    }
++    return out;
++}
++
++}  // namespace reqtelemetry
++}  // namespace program
++}  // namespace strata
++
++#endif  // STRATA_PROGRAM_REQTELEMETRY_HPP
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ccc1221e..b58000a2 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -70,6 +70,7 @@
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
+ #include "strata/program/cache_diag.hpp"
++#include "strata/program/reqtelemetry.hpp"
+ #include "strata/program/split_rules.hpp"
+ #include "strata/prefill/share_rules.hpp"
+ #include "strata/platform/host_limits.hpp"
+@@ -8876,7 +8877,13 @@ int main(int argc, char** argv) {
+                 return e;
+             }
+         } cdiag;
+-        cdiag.on = cdiag_on;
++        // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry needs the engine's OWN account of the cache decision
++        // (the candidates it examined, how far their tokens agreed, which one it used and why).  That analysis is
++        // the cache diagnostics' analysis, so the telemetry turns the SAME collector on - it does not write a
++        // second, parallel account of the same decision.  The stderr events stay as they were: the Sink writes
++        // them only with STRATA_CACHE_DIAG=1, whatever turns the collector on.
++        const bool tele_on = strata::program::reqtelemetry::enabled();
++        cdiag.on = cdiag_on || tele_on;
+         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
+         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
+         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
+@@ -11800,6 +11807,10 @@ int main(int argc, char** argv) {
+             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
+             std::vector<uint64_t> req_img_keys;
+             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
++            // rid=<hex>: the server's id for this request.  It is echoed back on the DONE line, so the numbers
++            // the engine measures belong to THAT request and not to whichever one happens to be running.  The
++            // engine never uses it for anything else: it is a label, not a key and not a credential.
++            std::string req_rid;
+             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
+                                      // embedding file path is the first token without an =
+                 for (;;) {
+@@ -11829,6 +11840,15 @@ int main(int argc, char** argv) {
+                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
+                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
++                    else if (key == "rid") {
++                        // the request id, as hex the server sent it.  Bounded and checked: it is echoed back on
++                        // the DONE line, so nothing untrusted goes into the engine's output unchecked.
++                        const std::string v = tok.substr(eq + 1);
++                        bool hex_ok = !v.empty() && v.size() <= 64;
++                        for (const char c : v)
++                            if (!std::isxdigit(static_cast<unsigned char>(c))) { hex_ok = false; break; }
++                        if (hex_ok) req_rid = v;
++                    }
+                     else if (key == "img_keys") {
+                         req_img_keys.clear();
+                         const char* q = tok.c_str() + eq + 1;
+@@ -12063,6 +12083,19 @@ int main(int argc, char** argv) {
+             }
+             int64_t resume = 0;
+             bool from_live = false;
++            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: what this request measured about the cache and about its own
++            // work.  It is filled from the engine's OWN decision (the same collector the cache diagnostics use) and
++            // written onto the request's own DONE line, so the numbers belong to THIS request by construction.
++            strata::program::reqtelemetry::RequestTelemetry tele;
++            tele.request_id = req_rid;
++            // the cache lookup: from the candidates being examined to the decision.  It is measured with the
++            // engine's own clock, and it is the LOOKUP only - the restoration is timed where it happens.
++            const auto tele_lookup_t0 = Clock::now();
++            // the state restoration, as the engine measured it: the restore is timed where it happens, and a
++            // restore that failed is reported as a failure (never as a successful reuse).
++            double tele_restore_ms = -1.0;
++            bool tele_restore_attempted = false;
++            bool tele_restore_succeeded = false;
+             // STRATA_CACHE_DIAG: the candidates the engine examines, with the reason each was (not) usable.  The
+             // analysis runs ONLY with the switch on; the selection below is the engine's own code, untouched.
+             auto cdiag_consider = [&](strata::program::cache_diag::Source source, const std::vector<int32_t>& pre,
+@@ -12409,6 +12442,10 @@ int main(int argc, char** argv) {
+                 resume = parked.tokens;
+                 from_live = false;
+                 conversations.count_borrow();
++                // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the borrow mounted the donor's prefix: a restore happened.
++                tele_restore_attempted = true;
++                tele_restore_succeeded = true;
++                tele_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                 parked_used = true;   // STRATA_CACHE_DIAG: the donor's prefix is mounted
+                 parked_borrowed = true;
+                 parked_taken_live = false;   // a borrow mounts a CHECKPOINT of the donor, not its live state
+@@ -12467,6 +12504,10 @@ int main(int argc, char** argv) {
+                 from_live = parked.live;
+                 parked_used = true;   // STRATA_CACHE_DIAG: the parked conversation is mounted
+                 parked_taken_live = parked.live;
++                // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the restore happened, and how long it took.
++                tele_restore_attempted = true;
++                tele_restore_succeeded = true;
++                tele_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
+                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
+@@ -12526,6 +12567,11 @@ int main(int argc, char** argv) {
+                 }
+                 strata::program::cache_diag::Sink::instance().record(cdiag.event(conversations));
+             }
++            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the LOOKUP is over: the candidates have been examined and
++            // the source chosen.  This is where the lookup time ends - the restoration (timed where it happens)
++            // and the prompt read (timed by the engine) come after it.
++            if (tele_on)
++                tele.lookup_ms = std::chrono::duration<double, std::milli>(Clock::now() - tele_lookup_t0).count();
+             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
+             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+@@ -12603,16 +12649,31 @@ int main(int argc, char** argv) {
+                     reread_to = resume;
+                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
+                                          "restoring\n", (long long) resume);
+-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+-                           [&] {
+-                               for (size_t i = 0; i < stages.size(); ++i) {
+-                                   const strata::core::OnDevice on(stages[i]->dev);
+-                                   if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
+-                               }
+-                               return false;
+-                           }()) {
+-                    std::printf("ERR restoring a conversation checkpoint failed\n");
+-                    return 1;
++                } else {
++                    // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the restore is measured HERE, where it happens.
++                    // A restore that was tried and failed is reported as a failure - never as a successful reuse -
++                    // and the two are told apart from "there was no checkpoint to restore at all".
++                    const bool had_ckpt = c != nullptr;
++                    tele_restore_attempted = had_ckpt;
++                    const auto tr0 = Clock::now();
++                    // the same checks, in the same order, as before: the main checkpoint, then its stage parts.
++                    bool restored = had_ckpt && checkpoint_restore(*c, ss, g) && c->stage_parts.size() == stages.size();
++                    if (restored) {
++                        for (size_t i = 0; i < stages.size(); ++i) {
++                            const strata::core::OnDevice on(stages[i]->dev);
++                            if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) {
++                                restored = false;
++                                break;
++                            }
++                        }
++                    }
++                    if (tele_on)
++                        tele_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - tr0).count();
++                    tele_restore_succeeded = restored;
++                    if (!restored) {
++                        std::printf("ERR restoring a conversation checkpoint failed\n");
++                        return 1;
++                    }
+                 }
+                 if (lent && lent_slot == admit_slot) {
+                     // the slot this request continues in drops its checkpoints at the admission: this one moves back
+@@ -14893,6 +14954,43 @@ int main(int argc, char** argv) {
+             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
+             const int64_t fresh = n - resume;
+             const int64_t read_n = cancelled ? std::clamp<int64_t>(pp_reached - resume, 0, fresh) : fresh;
++            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry for THIS request, filled from the engine's own
++            // decision and its own counters.  Nothing here is inferred from a duration or a rate.
++            //
++            //  * `matched` is the CONTIGUOUS TOKEN PREFIX MATCH against the selected candidate, BEFORE the
++            //    execution-state constraints: how far the tokens agreed.  It comes from the cache diagnostics'
++            //    own analysis (the ACTUAL common prefix, never a checkpoint's length).
++            //  * `reused` is the prefix whose usable execution state was really retained or restored: `resume`.
++            //    The two are different things, and a candidate whose tokens matched but whose state was unusable
++            //    moves the first without moving the second.
++            //  * `evaluated` is the DISTINCT prompt positions this request evaluated; `work` is the executed
++            //    prompt-token evaluations (repeats count again) and `replayed` the evaluated positions that were
++            //    previously processed prompt material.
++            if (tele_on) {
++                // `matched` is the DEEPEST TOKEN MATCH the engine found among the candidates it examined, before
++                // the execution-state constraints were applied: the cache diagnostics' own comparison, the ACTUAL
++                // common prefix, never a candidate's length.  `reused` is what was really mounted.
++                tele.matched_prefix = cdiag.on ? cdiag.best_lcp : -1;
++                // A state that was RE-READ instead of restored was not reused: its positions were evaluated again.
++                const bool reread_state = reread_to > 0;
++                tele.reused_prefix = reread_state ? 0 : resume;
++                // the distinct prompt positions this request evaluated: the ones it read, from where it started
++                // reading to where it got to.
++                const int64_t tele_from = reread_to > 0 ? 0 : resume;
++                tele.evaluated = std::clamp<int64_t>(pp_reached - tele_from, 0, n - tele_from);
++                // the positions that were previously processed prompt material and were evaluated again.
++                tele.replayed = reread_state ? std::min<int64_t>(reread_to, tele.evaluated) : 0;
++                tele.work = tele.evaluated;
++                tele.first_divergent = cdiag.on ? (cdiag.best_mismatch >= 0 ? cdiag.best_mismatch : -1) : -2;
++                tele.slot = admit_slot >= 0 ? admit_slot : -1;
++                tele.evictions = static_cast<int64_t>(conversations.evictions());
++                tele.invalidations = -1;
++                tele.restore_attempted = tele_restore_attempted;
++                tele.restore_succeeded = tele_restore_succeeded;
++                tele.restore_ms = tele_restore_ms;
++                tele.source = cdiag.on ? strata::program::cache_diag::source_name(cdiag.selected) : "unknown";
++                tele.reason = cdiag.on ? strata::program::cache_diag::reason_name(cdiag.reason) : "UNKNOWN";
++            }
+             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
+             //      [RAM blobs] [file blobs] [file MB]   (CS-T tiers; appended, so an older server reads the rest)
+             //      [prompt tokens read]   (#471: fewer than <prompt> - <reused> when a cancel stopped the read)
+@@ -14903,20 +15001,32 @@ int main(int argc, char** argv) {
+             //      chunk=<tokens> experts_streamed=<blobs>   (key=value, last: the first chunk of the request's longest
+             //      batched segment, 0 when it read none; the expert blobs its prompt read copied host -> device on
+             //      every stage - not the CPU share's, the stage helper's or a --peer-device peer's)
++            //      rid=<id> matched=<n> reused=<n> evaluated=<n> replayed=<n> work=<n> divergent=<n> slot=<n>
++            //      restore=<none|succeeded|failed> restore_ms=<f> lookup_ms=<f> cache_source=<word>
++            //      cache_reason=<word>   (ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the request's own telemetry.
++            //      The request's id comes back so the numbers belong to THIS request; the token accounting keeps
++            //      the MATCHED prefix (how far the tokens agreed) apart from the REUSED one (what was really
++            //      reused); a field the engine did not measure is left out entirely, so the server reports it as
++            //      unavailable rather than as a zero.  Absent with STRATA_TELEMETRY unset: the line is then
++            //      byte-identical to the release's.)
+             char chain_txt[128] = "";
+             if (o.lookup_chain > 0)
+                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
+                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
++            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry rides on THIS request's own DONE line, as
++            // key=value pairs after the ones the line already had.  A server that does not know them ignores them;
++            // a server that does know them reads them for THIS request - no timestamp matching, no "the newest".
++            const std::string tele_txt = tele_on ? strata::program::reqtelemetry::encode(tele) : std::string();
+             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
+-                        "experts_streamed=%lld\n",
++                        "experts_streamed=%lld%s\n",
+                         (long long) produced_n,
+                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
+                         (long long) resume, (long long) req_hits, (long long) req_look,
+                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
+                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
+                         (long long) req_offload, chain_txt, (long long) req_chunk,
+-                        (long long) (sp.chain_experts_streamed() - streamed0));
++                        (long long) (sp.chain_experts_streamed() - streamed0), tele_txt.c_str());
+             std::fflush(stdout);
+             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
+                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+diff --git a/src/program/reqtelemetry_roundtrip.cpp b/src/program/reqtelemetry_roundtrip.cpp
+new file mode 100644
+index 00000000..ddd417b3
+--- /dev/null
++++ b/src/program/reqtelemetry_roundtrip.cpp
+@@ -0,0 +1,38 @@
++// src/program/reqtelemetry_roundtrip.cpp - the engine's telemetry writer, on its own: what the engine puts on a
++// request's DONE line (ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01).
++//
++// The server reads those key=value pairs (serve/server.py's _parse_done).  This program writes one DONE line
++// with the repository's own writer (include/strata/program/reqtelemetry.hpp), so the reader and the writer are
++// checked against each other and cannot drift apart.
++//
++// With the switch off it writes the DONE line WITHOUT the telemetry (the default path: byte-identical to the
++// release's); with STRATA_TELEMETRY=1 it writes the telemetry too.
++#include "strata/program/reqtelemetry.hpp"
++
++#include <cstdio>
++#include <string>
++
++int main() {
++    using namespace strata::program::reqtelemetry;
++    RequestTelemetry t;
++    t.request_id = "abc123";
++    t.matched_prefix = 60;
++    t.reused_prefix = 60;
++    t.evaluated = 40;
++    t.replayed = 0;
++    t.work = 40;
++    t.first_divergent = -1;
++    t.slot = 2;
++    t.restore_attempted = true;
++    t.restore_succeeded = true;
++    t.restore_ms = 3.5;
++    t.lookup_ms = 1.25;
++    t.source = "live";
++    t.reason = "EXACT_MATCH";
++    // The engine's own gate: with the switch off the DONE line carries NO telemetry, and it is then
++    // byte-identical to the release's.  This program mirrors that, so the reader is checked against both forms.
++    const std::string tele = enabled() ? encode(t) : std::string();
++    std::printf("enabled=%d\n", enabled() ? 1 : 0);
++    std::printf("DONE 7 100 41.5 210.0 stop 24 31 60 9 10 1 2 1.5 40 0 chunk=0 experts_streamed=0%s\n", tele.c_str());
++    return 0;
++}
+diff --git a/src/program/reqtelemetry_test.cpp b/src/program/reqtelemetry_test.cpp
+new file mode 100644
+index 00000000..f088d8cc
+--- /dev/null
++++ b/src/program/reqtelemetry_test.cpp
+@@ -0,0 +1,193 @@
++// src/program/reqtelemetry_test.cpp - the native half of the per-request telemetry
++// (ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01), without a GPU.
++//
++// The engine is the authority for the cache state and the model execution.  What it measures travels on the
++// request's own DONE line, in key=value pairs, so the server reads it from the request's own channel - never by
++// matching timestamps and never by guessing which request is the newest.
++//
++// This test drives the ENCODING (include/strata/program/reqtelemetry.hpp) and checks the properties the server
++// relies on:
++//
++//   1. a field the engine did not measure is LEFT OUT, so the server sees no key at all and reports the
++//      measurement as unavailable - never as zero;
++//   2. a measured zero IS written out (0 is a measured zero; null is "not measured");
++//   3. the first divergent token index distinguishes "no mismatch" (-1) from "not measured" (-2);
++//   4. the restoration's outcome is reported as what happened: attempted-and-failed is NOT "succeeded";
++//   5. the request id is echoed back when there is one, and omitted when there is not;
++//   6. the encoding carries no user data: no token ids, no prompt text, no hashes.
++//
++// The engine's own wiring (the DONE line in src/program/generate.cpp) is not exercised here - that needs the
++// engine - but the SERVER's reader is checked against this writer in tools/test_reqtelemetry.py.
++#include "strata/program/reqtelemetry.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++using strata::program::reqtelemetry::RequestTelemetry;
++
++static int failures = 0;
++
++static void check(bool ok, const char* what) {
++    if (!ok) {
++        std::printf("FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++static bool has(const std::string& text, const std::string& key) {
++    return text.find(" " + key + "=") != std::string::npos;
++}
++
++static std::string value_of(const std::string& text, const std::string& key) {
++    const size_t at = text.find(" " + key + "=");
++    if (at == std::string::npos) return "";
++    const size_t start = at + key.size() + 2;
++    const size_t end = text.find(' ', start);
++    return end == std::string::npos ? text.substr(start) : text.substr(start, end - start);
++}
++
++int main() {
++    using namespace strata::program::reqtelemetry;
++
++    {   // 1. a field the engine did not measure is left out entirely
++        RequestTelemetry t;
++        t.matched_prefix = 40;
++        t.reused_prefix = -1;              // not measured
++        t.evaluated = 60;
++        const std::string s = encode(t);
++        check(has(s, "matched"), "a measured field is written");
++        check(!has(s, "reused"), "an unmeasured field is left out");
++        check(!has(s, "evaluated=0"), "nothing is written as a zero by accident");
++        check(value_of(s, "matched") == "40", "the value is the number");
++    }
++
++    {   // 2. a measured zero IS written out: 0 is a measured zero, not "not measured"
++        RequestTelemetry t;
++        t.reused_prefix = 0;               // measured: nothing was reused
++        t.evaluated = 0;
++        const std::string s = encode(t);
++        check(has(s, "reused"), "a measured zero is written out");
++        check(value_of(s, "reused") == "0", "the measured zero is 0");
++        check(value_of(s, "evaluated") == "0", "the measured zero is 0");
++    }
++
++    {   // 3. "no mismatch" and "not measured" are different
++        RequestTelemetry none;
++        none.first_divergent = -1;         // the sequences agree throughout
++        none.matched_prefix = 10;
++        const std::string s_none = encode(none);
++        check(has(s_none, "divergent"), "a divergence index of -1 is written out");
++        check(value_of(s_none, "divergent") == "-1", "-1 means no mismatch");
++
++        RequestTelemetry unknown;
++        unknown.first_divergent = -2;      // not measured
++        unknown.matched_prefix = 10;
++        const std::string s_unknown = encode(unknown);
++        check(!has(s_unknown, "divergent"), "an unmeasured divergence index is left out");
++    }
++
++    {   // 4. the restoration's outcome is what happened
++        RequestTelemetry failed;
++        failed.restore_attempted = true;
++        failed.restore_succeeded = false;
++        failed.restore_ms = 3.5;
++        const std::string s = encode(failed);
++        check(value_of(s, "restore") == "failed", "a failed restore says failed");
++        check(value_of(s, "restore_ms") == "3.5", "the restore's time is written");
++
++        RequestTelemetry ok;
++        ok.restore_attempted = true;
++        ok.restore_succeeded = true;
++        check(value_of(encode(ok), "restore") == "succeeded", "a good restore says succeeded");
++
++        RequestTelemetry none;
++        check(!has(encode(none), "restore"), "no restore attempted says nothing about a restore");
++    }
++
++    {   // 5. the request id is echoed back when there is one
++        RequestTelemetry t;
++        t.request_id = "abc123";
++        check(value_of(encode(t), "rid") == "abc123", "the request id is echoed back");
++        RequestTelemetry none;
++        check(!has(encode(none), "rid"), "no request id means no rid key");
++    }
++
++    {   // 6. the encoding carries no user data
++        RequestTelemetry t;
++        t.request_id = "abc123";
++        t.matched_prefix = 40;
++        t.reused_prefix = 40;
++        t.evaluated = 60;
++        t.replayed = 10;
++        t.work = 70;
++        t.first_divergent = 12;
++        t.slot = 3;
++        t.source = "conversation_cache";
++        t.reason = "exact_match";
++        const std::string s = encode(t);
++        for (const char* forbidden : {"token", "prompt_text", "hash", "ids", "content"}) {
++            check(s.find(forbidden) == std::string::npos, "the encoding carries no user data");
++        }
++        check(value_of(s, "cache_source") == "conversation_cache", "the source is a fixed word");
++        check(value_of(s, "cache_reason") == "exact_match", "the reason is a fixed word");
++        check(value_of(s, "slot") == "3", "the slot is a number");
++    }
++
++    {   // the switch: only "1" turns it on.  The latch itself (enabled()) is read once per process, so the
++        // RULE is what this checks; the latch's value is checked by the runner, which starts the binary twice.
++        check(!switch_on(nullptr), "an unset switch is off");
++        check(switch_on("1"), "STRATA_TELEMETRY=1 turns the telemetry on");
++        check(!switch_on("0"), "STRATA_TELEMETRY=0 leaves it off");
++        check(!switch_on(""), "an empty switch leaves it off");
++        check(!switch_on("true"), "only the exact value 1 turns it on");
++        check(!switch_on("2"), "only the exact value 1 turns it on");
++    }
++
++    {   // the accounting identities: they are CHECKED, never enforced
++        using namespace strata::program::reqtelemetry;
++        TokenAccounting a;
++        a.submitted = 100; a.matched = 40; a.reused = 40; a.evaluated = 60;
++        a.replayed = 0; a.work = 60; a.non_prefix_reused = 0;
++        AccountingCheck c = check_accounting(a, true);
++        check(c.ok, "a complete accounting closes");
++
++        // the reused prefix longer than the matched prefix: impossible
++        TokenAccounting bad = a;
++        bad.reused = 80; bad.matched = 40;
++        check(!check_accounting(bad, true).ok, "the reused prefix cannot exceed the matched prefix");
++
++        // the matched prefix longer than the submitted prompt: impossible
++        TokenAccounting over = a;
++        over.matched = 200;
++        check(!check_accounting(over, true).ok, "the matched prefix cannot exceed the submitted prompt");
++
++        // more replayed positions than evaluated positions: impossible
++        TokenAccounting rep = a;
++        rep.replayed = 100; rep.evaluated = 60;
++        check(!check_accounting(rep, true).ok, "the replayed positions cannot exceed the evaluated ones");
++
++        // less work than evaluated positions: impossible
++        TokenAccounting work = a;
++        work.work = 10; work.evaluated = 60;
++        check(!check_accounting(work, true).ok, "the work cannot be less than the evaluated positions");
++
++        // the sum identity: it holds only for a COMPLETE accounting
++        TokenAccounting gap = a;
++        gap.evaluated = 50;
++        check(!check_accounting(gap, true).ok, "the submitted prompt must be the reused prefix plus the evaluated");
++        check(check_accounting(gap, false).ok, "an incomplete accounting does not claim a broken identity");
++
++        // a matched prefix deeper than the reused one is ALLOWED (the state was not usable)
++        TokenAccounting mismatch_state = a;
++        mismatch_state.matched = 80; mismatch_state.reused = 40; mismatch_state.evaluated = 60;
++        check(check_accounting(mismatch_state, true).ok, "a match deeper than the reuse is legal");
++    }
++
++    if (failures == 0) {
++        std::printf("reqtelemetry_test: all checks passed\n");
++        return 0;
++    }
++    std::printf("reqtelemetry_test: %d check(s) failed\n", failures);
++    return 1;
++}
+```
+
+## What the amendment changed in the native source: NOTHING.
+
+```
+$ git diff c45ec828..HEAD -- src/program/generate.cpp include/strata/program/reqtelemetry.hpp
+(empty)
+```

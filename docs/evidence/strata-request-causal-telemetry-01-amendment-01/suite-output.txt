@@ -1,0 +1,21 @@
+# The whole server suite on the corrected tree (the tail of the run, and every failure).
+
+```
+ERROR: test_a_special_token_decodes_to_its_text (test_dsv4.PreTokenizer)
+ERROR: test_digits_then_ideographs_then_the_rest (test_dsv4.PreTokenizer)
+ERROR: test_digits_then_ideographs_then_words_cut_where_capitals_end (test_flint.PreTokenizer)
+ERROR: test_a_body_that_comes_in_drops_does_not_hold_the_connection (test_server.AnswerBeforeTheBody)
+ERROR: test_one_request_with_more_than_64_images_keeps_all_its_files (test_server.VisionCacheEviction)
+ERROR: test_plain_encode_still_evicts_the_oldest (test_server.VisionCacheEviction)
+FAIL: test_digits_in_runs_of_three (test_glm.PreTokenizer)
+FAIL: test_pieces_and_whole_tokens (test_lfm2.PreTokenizer)
+FAIL: test_server_close_ends_the_sampler (test_responses.NoLeakedSampler)
+
+Ran 1092 tests in 354.121s
+
+FAILED (failures=3, errors=6, skipped=23)
+EXIT=1
+```
+
+The nine failures are the ones the local regex stand-in causes; the BASELINE (the entry commit) has
+exactly the same nine - see 05-suite-results.md.  There is no new failure.

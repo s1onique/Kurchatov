@@ -1,0 +1,102 @@
+{
+  "act": "ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01",
+  "entry_head": "c45ec82846b2671673ff712009c8a85e1f034e2e",
+  "checks": [
+    {
+      "id": "G7-CURSOR-EXPIRED",
+      "what": "a cursor older than the TTL is refused, not treated as an exhausted collection",
+      "witness": "serve/test_telemetry_integrity.py: HttpContract.test_an_expired_cursor_is_refused",
+      "result": "PASS"
+    },
+    {
+      "id": "G7-CURSOR-OWNER",
+      "what": "a cursor of another server instance is refused",
+      "witness": "serve/test_telemetry_integrity.py: HttpContract.test_a_cursor_of_another_server_is_refused",
+      "result": "PASS"
+    },
+    {
+      "id": "G7-FILTERS",
+      "what": "an unknown lifecycle filter, an unknown disposition filter and a malformed client id are 400s",
+      "witness": "serve/test_telemetry_integrity.py: HttpContract.test_a_filter_that_names_nothing_is_an_error",
+      "result": "PASS"
+    },
+    {
+      "id": "G7-REQUEST-ID",
+      "what": "a request id that is not one of the server's ids is a 400; a well-formed unknown id is a 404",
+      "witness": "serve/test_telemetry_integrity.py: HttpContract.test_a_request_id_that_is_not_one_of_ours_is_an_error",
+      "result": "PASS"
+    },
+    {
+      "id": "G7-PAGE-SIZE",
+      "what": "a page size above the maximum is a 400",
+      "witness": "serve/test_telemetry_integrity.py: HttpContract.test_the_page_size_is_capped",
+      "result": "PASS"
+    },
+    {
+      "id": "G5-ONE-RECEIPT",
+      "what": "three accepted requests produce three receipts and nothing in flight",
+      "witness": "serve/test_telemetry_integrity.py: LifecycleOwnership.test_every_accepted_request_produces_exactly_one_receipt",
+      "result": "PASS"
+    },
+    {
+      "id": "G5-REFUSED",
+      "what": "a request the server refuses still gets one receipt, in the state 'rejected'",
+      "witness": "serve/test_telemetry_integrity.py: LifecycleOwnership.test_a_refused_request_still_gets_a_receipt",
+      "result": "PASS"
+    },
+    {
+      "id": "G4-REQUESTED-EFFECTIVE",
+      "what": "the requested output budget and the effective one are different numbers",
+      "witness": "serve/test_telemetry_integrity.py: ProductionWiring.test_the_requested_and_the_effective_budget_are_different_numbers",
+      "result": "PASS"
+    },
+    {
+      "id": "G4-RENDERED-SUBMITTED",
+      "what": "the rendered prompt and the submitted one are different numbers when the prompt is truncated",
+      "witness": "serve/test_telemetry_integrity.py: ProductionWiring.test_the_rendered_prompt_and_the_submitted_one_are_different_numbers",
+      "result": "PASS"
+    },
+    {
+      "id": "G4-GENERATED-EMITTED",
+      "what": "the engine's generated tokens and the client's emitted tokens are different numbers",
+      "witness": "serve/test_telemetry_integrity.py: ProductionWiring.test_the_generated_and_the_emitted_tokens_are_different_numbers",
+      "result": "PASS"
+    },
+    {
+      "id": "G4-MONOTONIC",
+      "what": "the durations are measured on a request-local monotonic clock",
+      "witness": "serve/test_telemetry_integrity.py: ProductionWiring.test_the_durations_come_from_a_monotonic_clock",
+      "result": "PASS"
+    },
+    {
+      "id": "G2-FOREIGN",
+      "what": "a native receipt of another request is not attached and does not reach the aggregates",
+      "witness": "serve/test_telemetry_integrity.py: Correlation.test_a_foreign_id_is_not_applied, ..._a_foreign_receipt_does_not_contaminate_the_aggregates",
+      "result": "PASS"
+    },
+    {
+      "id": "G2-MISSING",
+      "what": "a receipt without an id leaves the correlation explicitly unavailable",
+      "witness": "serve/test_telemetry_integrity.py: Correlation.test_a_missing_id_leaves_the_correlation_unavailable",
+      "result": "PASS"
+    },
+    {
+      "id": "G6-OFF",
+      "what": "with the telemetry off nothing is allocated and the engine's commands are not extended",
+      "witness": "serve/test_telemetry_integrity.py: Correlation.test_the_telemetry_off_allocates_nothing",
+      "result": "PASS"
+    },
+    {
+      "id": "T17-AUTH",
+      "what": "the request-level endpoints fail closed without a key on a shared listener",
+      "witness": "serve/test_reqtelemetry.py (the predecessor's access-control tests)",
+      "result": "PASS"
+    },
+    {
+      "id": "T18-PRIVACY",
+      "what": "no secret reaches the telemetry; the record's key list is checked",
+      "witness": "serve/test_reqtelemetry.py: Evidence.test_the_evidence_carries_no_content",
+      "result": "PASS"
+    }
+  ]
+}
