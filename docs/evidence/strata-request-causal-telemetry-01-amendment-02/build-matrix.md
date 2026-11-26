@@ -31,6 +31,20 @@ The roundtrip drives the SERVER's reader with a DONE line the ENGINE's own write
 cannot drift apart; it also checks the switch-off case (T19: with `STRATA_TELEMETRY=0` the DONE line carries no
 telemetry key at all).
 
+## The native edits, checked without a CUDA compiler
+
+The two native corrections live in `src/program/generate.cpp`, which cannot be compiled here (it needs the CUDA
+headers).  What CAN be checked here is that every name they use is in scope at the place they use it: the brace
+depth of the file (comments and string literals stripped) is compared at the declaration and at the use.
+
+| Name | Declared at | Scope open at the use? |
+|---|---|---|
+| `tele` (the request's telemetry) | line 12089 | yes (the ERR site is deeper in the same scope) |
+| `tele_on` (the telemetry switch) | line 8885 | yes |
+| `tele_restore_attempted` / `tele_restore_succeeded` | lines 12097 / 12098 | yes |
+
+That is a scope check, not a compile: the CUDA build is still `NOT_EXECUTED`.
+
 ## What this host cannot do
 
 * it has no CUDA toolkit and no GPU: the two native corrections (the cumulative work on the re-read path and the

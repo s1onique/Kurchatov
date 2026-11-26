@@ -95,7 +95,10 @@ REAL_DEPENDENCY_FULL_SUITE: 1129 tests, OK (skipped=20), exit 0
 
 ## The honest limits
 
-* The native corrections are **not compiled** here: this host has no CUDA toolkit and no GPU.  They are marked
+* The native corrections are **not compiled** here: this host has no CUDA toolkit and no GPU.  What was checked
+  is that every name they use is in scope where they use it (the brace depth of `src/program/generate.cpp` at the
+  declaration and at the use), and that the two standalone native programs - the encoder's own test and the
+  writer/reader roundtrip - compile and pass on this host.  They are marked
   `NOT_EXECUTED` everywhere, and a macOS build that excludes the CUDA code would not be proof anyway.
 * The live cache controls (the predecessor's T01-T07) and the performance parity need the engine and a GPU:
   `NOT_EXECUTED`.
