@@ -22,7 +22,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse(text):
-    """{(name, labels): value} for every sample line; checks each family has HELP and TYPE first."""
+    """{(name, labels): value} for every sample line; checks each family has HELP and TYPE first.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A8): a sample without a label set is valid exposition
+    (`name value`), and the canonical telemetry metrics are process-scoped: they carry no model_name label.
+    """
     out, typed = {}, set()
     for line in text.splitlines():
         if line.startswith("# TYPE "):
@@ -32,8 +36,10 @@ def parse(text):
         if line.startswith("#") or not line:
             continue
         m = re.fullmatch(r'([a-z0-9_:]+)\{([^}]*)\} (\S+)', line)
+        if not m:
+            m = re.fullmatch(r'([a-z0-9_:]+) (\S+)', line)      # a sample without a label set
         assert m, f"not a sample line: {line!r}"
-        name, labels, value = m.groups()
+        name, labels, value = m.group(1), (m.group(2) if m.lastindex == 3 else ""), m.groups()[-1]
         family = re.sub(r"_(bucket|sum|count)$", "", name)
         assert name in typed or family in typed, f"{name} has no # TYPE"
         out[(name, labels)] = float(value)
