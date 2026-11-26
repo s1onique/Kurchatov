@@ -307,6 +307,34 @@ REQTELEMETRY_FLOAT_KEYS = ("restore_ms", "lookup_ms")
 REQTELEMETRY_TEXT_KEYS = ("cache_source", "cache_reason", "restore", "rid")
 
 
+def parse_error_figures(line: str) -> dict:
+    """The telemetry key=value pairs an ERR line carries (ACT-...-AMENDMENT-02, G4).
+
+    The engine can fail BEFORE it writes its DONE line - a checkpoint restoration that failed is the case the
+    amendment names.  The evidence it did measure is then on the ERR line, and it is read here, so the failed
+    request's record can carry the correlated partial evidence instead of nothing at all.  A line without the
+    fields yields an empty dict: no evidence, not a zero.
+    """
+    figures = {}
+    for token in (line or "").split():
+        key, eq, value = token.partition("=")
+        if not eq:
+            continue
+        if key in REQTELEMETRY_INT_KEYS:
+            try:
+                figures[key] = int(value)
+            except ValueError:
+                pass
+        elif key in REQTELEMETRY_FLOAT_KEYS:
+            try:
+                figures[key] = float(value)
+            except ValueError:
+                pass
+        elif key in REQTELEMETRY_TEXT_KEYS:
+            figures[key] = value
+    return figures
+
+
 class Engine(Protocol):
     max_context: int
     def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
@@ -1392,6 +1420,15 @@ class StrataEngine:
         local = getattr(self, "_req_local", None)
         return getattr(local, "request_id", None) if local is not None else None
 
+    def error_figures(self) -> dict:
+        """The telemetry the engine put on its LAST ERR line for THIS request (AMENDMENT-02, G4).
+
+        It is the evidence the engine measured before it failed - a restoration that failed, a lookup it made.
+        An empty dict means the engine's error carried no evidence: not a zero, no measurement.
+        """
+        local = getattr(self, "_req_local", None)
+        return dict(getattr(local, "error_figures", None) or {}) if local is not None else {}
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -1582,10 +1619,17 @@ class StrataEngine:
         return None
 
     def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A9): a slot's BDONE is the END of that slot's leg.
+        The native accounting that came with the slot's ADMISSION (its DONE line) describes that segment only -
+        it is not the whole invocation.  The figures are marked as such, so the record says so instead of
+        publishing a segment's numbers as the request's.
+        """
         if len(f) >= 5 and isinstance(self.last, dict):
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated"),
+                         "native_segment_only": True}
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -2273,6 +2317,12 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
+                    # AMENDMENT-02 (G4): the ERR line can carry the telemetry the engine DID measure (the restore
+                    # that failed, the lookup it made).  They are kept with THIS request - in the thread's own
+                    # place - so the failed request's record can carry the correlated partial evidence.
+                    local = getattr(self, "_req_local", None)
+                    if local is not None:
+                        local.error_figures = parse_error_figures(line)
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -4644,32 +4694,58 @@ class Service:
         from serve import reqtelemetry as rt
         try:
             engine_figures = (last or {}).get("telemetry") or {}
-            rt.apply_engine(tele, engine_figures)
+            # AMENDMENT-02 (G2/A2): the receipt is bound to the native INVOCATION.  When it does not match the
+            # invocation this request dispatched, NOT ONE of its numbers is applied - not even the positional DONE
+            # fields outside the telemetry suffix - and the request says it had an instrumentation error.
+            verdict = rt.apply_engine(tele, engine_figures, expected_invocation_id=tele.engine_invocation_id)
+            admitted = bool(verdict.get("admitted"))
+            # AMENDMENT-02 (A9): a batch slot's BDONE ends the slot's leg: the native figures that came with its
+            # ADMISSION describe that segment only.  They stay in the record as diagnostics, but they are not
+            # published as the whole invocation's accounting and they do not enter the authoritative totals.
+            if admitted and (last or {}).get("native_segment_only"):
+                tele.native_partial = True
+                tele.mark_unavailable("cache",
+                                      "the engine's batch slot reported only its admission segment: the native "
+                                      "accounting is not the whole invocation")
             # the engine's own clock: the prefill and the decode it measured
-            if last and last.get("prompt_ms") is not None:
+            if admitted and last and last.get("prompt_ms") is not None:
                 tele.set_timing("prefill_wall", float(last["prompt_ms"]), "native_engine")
-            if last and last.get("decode_ms") is not None:
+            if admitted and last and last.get("decode_ms") is not None:
                 tele.set_timing("decode_wall", float(last["decode_ms"]), "native_engine")
             # the prompt: what the engine was given.  The RENDERED count was measured where the template was
             # rendered (Service.prepare) - it is a different number and it is not copied from this one.
             if submitted is not None:
                 tele.set_prompt_tokens(submitted=submitted)
             # the generation: the engine's own count and what the client actually received - two different numbers
-            engine_generated = last.get("generated") if last else None
+            engine_generated = last.get("generated") if (last and admitted) else None
             tele.set_generation(generated=engine_generated,
-                                emitted=generated if emitted is None else emitted,
-                                draft_tokens=last.get("drafts_offered") if last else None,
-                                accepted_tokens=last.get("drafts_accepted") if last else None,
+                                draft_tokens=last.get("drafts_offered") if (last and admitted) else None,
+                                accepted_tokens=last.get("drafts_accepted") if (last and admitted) else None,
                                 finish_reason=finish)
+            # AMENDMENT-02 (A3): the EMITTED tokens are not the generated ones.  The generation loop counts the
+            # tokens the engine produced; the response is transformed (the reasoning, the tool calls and the stop
+            # handling all change it), so the number of tokens written to the client cannot be attributed here.
+            # It stays null and says why - it is not a measured zero.
+            tele.mark_unavailable("generation.emitted_tokens",
+                                  "the tokens written to the client are not attributable after the response "
+                                  "transformation: the generation loop's count is the engine's, not the client's")
             # the lifecycle: the queue wait and the time to the first token, both from a request-local MONOTONIC
             # clock (a wall-clock timestamp is for reporting, never for a duration)
-            if queue_s is not None:
+            # AMENDMENT-02 (A1): the queue wait was measured WHERE it happened - when the request took its turn.
+            # It is NOT overwritten here with the time the request spent running: a request that waited 1 s and then
+            # generated for 9 s waited 1 s, not 10 s.
+            if queue_s is not None and "queue" not in tele.timing:
                 tele.set_timing("queue", float(queue_s) * 1000.0, "http_server")
             if first_token_s is not None:
-                tele.set_timing("http_first_token", float(first_token_s) * 1000.0, "http_server")
-            # the identity of the native invocation: the request's own id and the invocation's ordinal
-            if tele.engine_invocation_id:
-                tele.engine_invocation_id = f"{tele.engine_invocation_id}#{int(invocations)}"
+                # AMENDMENT-02 (A3): this is the SERVICE's observation of the first generated token.  It is not
+                # the client's first byte: the HTTP first-content time is measured at the response-write boundary,
+                # in the HTTP handler (Service._first_content).
+                tele.set_timing("engine_first_token", float(first_token_s) * 1000.0, "http_server_observation")
+            # AMENDMENT-02 (A2): the invocation's id is the id the server generated for the dispatch, and its
+            # ordinal says which attempt of this request it was.  The id is NOT changed here: the engine echoes it
+            # verbatim and the correlation compares it verbatim.
+            if tele.engine_invocation_id is None and invocations:
+                tele.engine_invocation_ordinal = int(invocations)
             # a request that never reached the engine, or that was cut short, says so
             if not engine_figures and finish not in (None, "completed", "stop", "length"):
                 tele.mark_unavailable("cache", "the engine reported no measurements for this request")
@@ -5423,6 +5499,8 @@ class Service:
         # clock.  `first_token_s` is the time to the first TOKEN the client sees (a header, a keep-alive and a
         # prompt-progress event are not tokens).
         first_token_s = None
+        # AMENDMENT-02 (A2): which native invocation of this request we are on (the first is 1)
+        dispatch_ordinal = 1
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
@@ -5454,6 +5532,10 @@ class Service:
                 if not got:                              # cancelled while queued
                     with self.status_lock:
                         self.status["queued"] -= 1
+                    if tele is not None:
+                        # AMENDMENT-02 (A1): the queue wait of a request that never ran: the time it waited for
+                        # its turn, measured on the request's own monotonic clock.
+                        tele.set_timing("queue", (time.perf_counter() - waiting) * 1000.0, "http_server")
                     yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
@@ -5504,10 +5586,21 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        # AMENDMENT-02 (G2/A2): the invocation id of THIS dispatch, generated right before it.
+                        invocation_id = None
+                        if tele is not None:
+                            from serve import reqtelemetry as rt
+                            invocation_id = rt.new_invocation_id()
+                            tele.engine_invocation_id = invocation_id
+                            tele.engine_invocation_ordinal = dispatch_ordinal
+                            dispatch_ordinal += 1
                         if hasattr(self.engine, "set_request_id"):
                             # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G6): with the telemetry off the
                             # engine's commands are NOT extended: no id is sent, so the DONE line stays as it was.
-                            self.engine.set_request_id(tele.request_id if tele is not None else None)
+                            # AMENDMENT-02 (G2/A2): the id is the INVOCATION's id - a new one for every dispatch,
+                            # generated immediately before it - and not the request's own id.  The engine echoes it
+                            # verbatim, so a receipt can be tied to THIS attempt and not to the request in general.
+                            self.engine.set_request_id(invocation_id)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
@@ -5599,6 +5692,15 @@ class Service:
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
+                            # AMENDMENT-02 (G4): the evidence the engine put on its ERR line (the restore that
+                            # failed, the lookup it made) belongs to THIS request and is applied to its record.
+                            # The request still fails exactly as before - the telemetry never decides anything.
+                            if tele is not None and hasattr(self.engine, "error_figures"):
+                                figures = self.engine.error_figures()
+                                if figures:
+                                    from serve import reqtelemetry as rt
+                                    rt.apply_engine(tele, figures,
+                                                    expected_invocation_id=tele.engine_invocation_id)
                             print(f"[strata] the engine reported an error: {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
@@ -5746,8 +5848,10 @@ class Service:
                             # own figures (the cache state, the tokens it evaluated) come from its DONE line; the
                             # lifecycle figures (the queue wait, the render, the tokenization, the model load, the
                             # time to the first byte the client sees) are the server's own.
+                            # AMENDMENT-02 (A1): the queue wait is NOT passed here.  It was measured when the
+                            # request took its turn; the time the request spent running is not queue time, and
+                            # passing it here would overwrite the real measurement with the whole request time.
                             self._finish_telemetry(tele, last, seen, len(ids), n, finish, started,
-                                                   emitted=n, queue_s=round(time.perf_counter() - waiting, 6),
                                                    first_token_s=first_token_s, invocations=len(segments))
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -7206,6 +7310,65 @@ def make_handler(svc: Service):
             self._cors()
             self.end_headers()
 
+        def _first_content(self):
+            """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A3): the first MEANINGFUL content written
+            to the client.
+
+            The clock starts HERE - at the response-write boundary - on the request's own monotonic clock.  The
+            headers, the SSE keep-alives, the role-only events and the prompt-progress events are not content and
+            do not start it.  The REASONING output does count as content, and the record says so
+            (first_token_includes_reasoning).
+
+            The server cannot know when the CLIENT received the bytes: a successful write is not a receipt, and
+            this measurement never claims one.
+            """
+            tele = getattr(self, "telemetry", None)
+            if tele is None or getattr(tele, "clock", None) is None:
+                return
+            if "http_first_token" in tele.timing:
+                return                              # the first content was already timed
+            tele.set_timing("http_first_token", (time.perf_counter() - tele.clock) * 1000.0, "http_server_write")
+            if tele.first_token_includes_reasoning is None:
+                tele.first_token_includes_reasoning = True
+
+        @staticmethod
+        def _chunk_is_content(chunk) -> bool:
+            """Whether a streamed chunk carries MEANINGFUL content (AMENDMENT-02, A3).
+
+            A chunk that only opens the stream (the role, the model's name) or that reports the usage is not
+            content: the client has nothing to read yet.
+            """
+            if not isinstance(chunk, dict):
+                return False
+            for choice in chunk.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or choice.get("message") or {}
+                if not isinstance(delta, dict):
+                    continue
+                if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+                    return True
+            return False
+
+        @staticmethod
+        def _event_is_content(name, event) -> bool:
+            """Whether a streamed EVENT carries meaningful content (AMENDMENT-02, A3).
+
+            The event names are the API's own: an Anthropic content delta, a Responses text delta, a reasoning
+            delta or a tool-call delta.  The events that only open the stream, report the progress or carry the
+            usage are not content.
+            """
+            if not isinstance(event, dict):
+                return False
+            kind = event.get("type") or ""
+            if kind in ("content_block_delta", "response.output_text.delta",
+                        "response.reasoning_summary_text.delta", "response.function_call_arguments.delta"):
+                delta = event.get("delta") or {}
+                if isinstance(delta, dict):
+                    return bool(delta.get("text") or delta.get("thinking") or delta.get("partial_json"))
+                return bool(delta)
+            return False
+
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
             are when the monitor is off)."""
@@ -7283,7 +7446,11 @@ def make_handler(svc: Service):
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                body = openai_collect(chunks)
+                self._json(200, body)
+                # AMENDMENT-02 (A3): the whole answer was written at once: the first content went out with it.
+                self._first_content()
+                return None
             self._sse()
             try:
                 for c in chunks:
@@ -7292,6 +7459,10 @@ def make_handler(svc: Service):
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
+                    # AMENDMENT-02 (A3): the first MEANINGFUL content, at the write boundary.  A keep-alive and a
+                    # role-only chunk are not content and do not start the clock.
+                    if c is not None and self._chunk_is_content(c):
+                        self._first_content()
                 self.wfile.write(b"data: [DONE]\n\n")
             except OSError:
                 self._note(outcome="disconnected")
@@ -7377,10 +7548,11 @@ def make_handler(svc: Service):
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
-                return self._json(200, result)
+                self._json(200, result)
+                self._first_content()          # AMENDMENT-02 (A3): the whole answer went out at once
+                return None
             self._sse()
             last = time.monotonic()
-
             def send(e):
                 self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
                                  json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
@@ -7399,6 +7571,9 @@ def make_handler(svc: Service):
                         send(e)
                         last = time.monotonic()
                     self.wfile.flush()
+                    # AMENDMENT-02 (A3): the first MEANINGFUL content, at the write boundary
+                    if e is not None and self._event_is_content((e or {}).get("type"), e):
+                        self._first_content()
             except OSError:
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
@@ -7507,7 +7682,10 @@ def make_handler(svc: Service):
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, note=self._note)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                body = anthropic_collect(events)
+                self._json(200, body)
+                self._first_content()          # AMENDMENT-02 (A3): the whole answer went out at once
+                return None
             self._sse()
             try:
                 for item in events:
@@ -7518,6 +7696,9 @@ def make_handler(svc: Service):
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
+                    # AMENDMENT-02 (A3): the first MEANINGFUL content, at the write boundary
+                    if item is not None and self._event_is_content(item[0], item[1]):
+                        self._first_content()
             except OSError:
                 self._note(outcome="disconnected")
                 cancel.set()

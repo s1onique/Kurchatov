@@ -35,7 +35,8 @@ SCHEMA = {
         "identity": {
             "type": "object",
             "required": ["request_id", "client_request_id", "engine_instance_id", "server_instance_id",
-                         "engine_invocation_id", "slot_id", "model_id", "build_revision"],
+                         "engine_invocation_id", "engine_invocation_ordinal", "slot_id", "model_id",
+                         "build_revision"],
             "additionalProperties": False,
             "properties": {
                 "request_id": {"type": "string", "minLength": 1},
@@ -43,6 +44,8 @@ SCHEMA = {
                 "engine_instance_id": _str_or_null(),
                 "server_instance_id": _str_or_null(),
                 "engine_invocation_id": _str_or_null(),
+                # AMENDMENT-02 (G2/A2): the invocation's ordinal - which attempt of this request it was
+                "engine_invocation_ordinal": {"type": ["integer", "null"], "minimum": 1},
                 "slot_id": {"type": ["integer", "null"], "minimum": 0},
                 "model_id": _str_or_null(),
                 "build_revision": _str_or_null(),
@@ -120,6 +123,7 @@ SCHEMA = {
         "measurement_quality": {
             "type": "object",
             "required": ["state", "unavailable_fields", "timing_authority", "first_token_includes_reasoning",
+                         "native_correlation", "native_partial", "measurement_valid", "aggregate_eligible",
                          "accounting"],
             "additionalProperties": False,
             "properties": {
@@ -127,6 +131,13 @@ SCHEMA = {
                 "unavailable_fields": {"type": "object", "additionalProperties": {"type": "string"}},
                 "timing_authority": {"type": "object", "additionalProperties": {"type": "string"}},
                 "first_token_includes_reasoning": {"type": ["boolean", "null"]},
+                # AMENDMENT-02 (G1): how the engine's receipt was tied to this request, whether the numbers are
+                # measurements at all, and whether the record may enter the authoritative aggregates
+                "native_correlation": {"enum": ["verified", "unavailable", "rejected", "not_applicable"]},
+                # AMENDMENT-02 (A9): the native figures cover one segment of the invocation only
+                "native_partial": {"type": "boolean"},
+                "measurement_valid": {"type": "boolean"},
+                "aggregate_eligible": {"type": "boolean"},
                 "accounting": {
                     "type": "object",
                     "required": ["state", "valid", "problems"],

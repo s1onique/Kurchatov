@@ -269,7 +269,9 @@ class Store(unittest.TestCase):
         store = TelemetryStore(max_records=5, max_bytes=1 << 20)
         for i in range(20):
             r = RequestRecord(f"r{i}")
-            r.set_native_cache(matched_prefix=1, reused_prefix=1, evaluated=1, non_prefix_reused=0)
+            # AMENDMENT-02 (G1): the engine's figures arrive through the PRODUCTION path (apply_engine), so the
+            # measurements are correlated to the request and enter the authoritative totals.
+            apply_engine(r, {"rid": r.request_id, "matched": 1, "reused": 1, "evaluated": 1})
             r.seal("completed", 200)
             store.add(r)
         summary = store.summary()
@@ -415,11 +417,13 @@ class Evidence(unittest.TestCase):
                        "first_divergent_token_index", "source", "disposition", "reason_code", "restore_attempted",
                        "restore_succeeded", "restore_ms", "recurrent_state", "attention_state", "checkpoint_state",
                        "invalidations", "evictions", "request_id", "client_request_id", "engine_instance_id",
-                       "server_instance_id", "engine_invocation_id", "slot_id", "model_id", "build_revision",
+                       "server_instance_id", "engine_invocation_id", "engine_invocation_ordinal", "slot_id",
+                       "model_id", "build_revision",
                        "state", "api", "received_at", "started_at", "finished_at", "http_status", "finish_reason",
                        "detail", "requested_max_output_tokens", "effective_max_output_tokens", "generated_tokens",
                        "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens",
                        "unavailable_fields", "timing_authority", "first_token_includes_reasoning",
+                       "native_correlation", "native_partial", "measurement_valid", "aggregate_eligible",
                        "accounting", "schema_version", "seq"}
             for section in record.values():
                 if isinstance(section, dict):

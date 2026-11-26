@@ -30,6 +30,7 @@
         "engine_instance_id",
         "server_instance_id",
         "engine_invocation_id",
+        "engine_invocation_ordinal",
         "slot_id",
         "model_id",
         "build_revision"
@@ -64,6 +65,13 @@
             "string",
             "null"
           ]
+        },
+        "engine_invocation_ordinal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
         },
         "slot_id": {
           "type": [
@@ -406,6 +414,10 @@
         "unavailable_fields",
         "timing_authority",
         "first_token_includes_reasoning",
+        "native_correlation",
+        "native_partial",
+        "measurement_valid",
+        "aggregate_eligible",
         "accounting"
       ],
       "additionalProperties": false,
@@ -435,6 +447,23 @@
             "boolean",
             "null"
           ]
+        },
+        "native_correlation": {
+          "enum": [
+            "verified",
+            "unavailable",
+            "rejected",
+            "not_applicable"
+          ]
+        },
+        "native_partial": {
+          "type": "boolean"
+        },
+        "measurement_valid": {
+          "type": "boolean"
+        },
+        "aggregate_eligible": {
+          "type": "boolean"
         },
         "accounting": {
           "type": "object",

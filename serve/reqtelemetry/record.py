@@ -63,8 +63,9 @@ def encode_cursor(seq: int, server_instance_id: str | None = None) -> str:
 def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s: float | None = None) -> int:
     """The sequence number a cursor names.
 
-    Raises ValueError for a cursor this server did not write, for a cursor of another server, and for an expired
-    one.  An expired cursor is NOT treated as an exhausted collection: it is an error the operator sees.
+    Raises ValueError for a cursor this server did not write, for a cursor of another server, for an expired
+    one, for a cursor with no owner, for a sequence number that is not a positive number and for a timestamp in
+    the future.  An invalid cursor is NOT treated as an exhausted collection: it is an error the operator sees.
     """
     if not isinstance(cursor, str) or not cursor:
         raise ValueError("the cursor is empty")
@@ -80,13 +81,21 @@ def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s:
         seq = int(parts[1])
     except ValueError:
         raise ValueError("the cursor is not a cursor this server wrote") from None
+    if seq < 1:
+        raise ValueError("the cursor names no record")
     owner, stamp = parts[2], parts[3]
-    if server_instance_id and owner and owner != server_instance_id:
+    # AMENDMENT-02 (G6): a cursor carries its OWNER.  A cursor without one, or with another server's, is refused:
+    # it points at a collection this server never wrote.
+    if not owner:
+        raise ValueError("the cursor names no server")
+    if server_instance_id and owner != server_instance_id:
         raise ValueError("the cursor belongs to another server instance")
     try:
         issued = int(stamp)
     except ValueError:
         raise ValueError("the cursor is not a cursor this server wrote") from None
+    if issued > int(time.time()) + 60:
+        raise ValueError("the cursor is dated in the future")
     if max_age_s is not None and (time.time() - issued) > max_age_s:
         raise ValueError("the cursor has expired")
     return seq
@@ -115,6 +124,18 @@ class RequestRecord:
         self.server_instance_id = server_instance_id
         self.engine_instance_id = engine_instance_id
         self.engine_invocation_id = None
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G2/A2): the native invocation's id is a SEPARATE
+        # identity from the request's own id, and the ordinal says which attempt of this request it was.  A new id is
+        # generated for every dispatch, so a recovery dispatch inside the same request is its own invocation.
+        self.engine_invocation_ordinal = None
+        # how well the engine's receipt is tied to this request: verified, unavailable or rejected
+        self.native_correlation = "not_applicable"
+        # AMENDMENT-02 (A9): the native figures cover only ONE segment of the invocation (a batch slot's
+        # admission segment): they stay in the record as diagnostics and do not enter the authoritative totals.
+        self.native_partial = False
+        # AMENDMENT-02 (G1): the engine sent a measurement that is not a measurement (a negative count, a
+        # fraction, a bool).  It was refused at the admission boundary and the record says so.
+        self.measurements_invalid = False
         self.slot_id = None
         self.model_id = model_id
         self.build_revision = build_revision
@@ -327,6 +348,7 @@ class RequestRecord:
                 "engine_instance_id": self.engine_instance_id,
                 "server_instance_id": self.server_instance_id,
                 "engine_invocation_id": self.engine_invocation_id,
+                "engine_invocation_ordinal": self.engine_invocation_ordinal,
                 "slot_id": self.slot_id,
                 "model_id": self.model_id,
                 "build_revision": self.build_revision,
@@ -379,8 +401,26 @@ class RequestRecord:
                 "unavailable_fields": dict(sorted(self.unavailable.items())),
                 "timing_authority": dict(sorted(self.timing_authority.items())),
                 "first_token_includes_reasoning": self.first_token_includes_reasoning,
+                # AMENDMENT-02 (G1): the record says whether its numbers may enter the authoritative aggregates,
+                # and why not when they may not.  The three decisions stay apart: the measurements are valid, the
+                # accounting is not violated, and the engine's receipt is correlated to this request.
+                "native_correlation": self.native_correlation,
+                "native_partial": self.native_partial,
+                "measurement_valid": self.measurement_valid(),
+                "aggregate_eligible": self.aggregate_eligible(),
                 "accounting": {"state": self.accounting.get("state", "unevaluated"),
                                "valid": self.accounting.get("valid"),
                                "problems": list(self.accounting.get("problems") or [])},
             },
         }
+
+    # ------------------------------------------------------------------ the admission decisions
+    def measurement_valid(self) -> bool:
+        """Whether the record's own numbers are measurements at all (whole, non-negative counts)."""
+        from serve.reqtelemetry import accounting
+        return accounting.measurement_valid(self)
+
+    def aggregate_eligible(self) -> bool:
+        """Whether this record may contribute to the authoritative aggregates (serve/reqtelemetry/accounting.py)."""
+        from serve.reqtelemetry import accounting
+        return accounting.aggregate_eligible(self)

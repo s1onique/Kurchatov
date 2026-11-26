@@ -158,7 +158,7 @@ def strata(m: dict, out: list, lab: str):
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
-    telemetry(m.get("telemetry") or {}, out, lab)
+    telemetry(m.get("telemetry") or {}, out, "")
 
 
 # The buckets for the telemetry's durations (seconds).  ONE authority for the edges: the store counts the
@@ -193,7 +193,12 @@ def telemetry(tel: dict, out: list, lab: str):
         if name not in typed:
             typed.add(name)
             out.append(f"# HELP {name} {help_}\n# TYPE {name} {kind}")
-        out.append(f"{name}{{{lab}{labels}}} {value}")
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A8): the canonical telemetry metrics are
+        # PROCESS-SCOPED: they carry no model_name label.  A process-lifetime total does not belong to the model
+        # that happens to be selected when the scrape happens - otherwise the work of the model that ran before a
+        # switch is published under the new model's name.
+        label_set = f"{lab}{labels}"
+        out.append(f"{name}{{{label_set}}} {value}" if label_set else f"{name} {value}")
 
     def counter(name, help_, key):
         metric(name, "counter", help_, counters.get(key))
@@ -241,13 +246,17 @@ def telemetry(tel: dict, out: list, lab: str):
         # observations were at or below that edge, never the total count: an observation of 2 s is not in the 30 s
         # bucket's place, and the sum is the seconds the observations really took.
         buckets = hist.get("buckets") or {}
+        label_set = f"{lab}," if lab else ""
         for b in TELEMETRY_BUCKETS:
             count = buckets.get(str(b))
             if not isinstance(count, int):
                 count = 0
-            out.append(f'{name}_bucket{{{lab},le="{b}"}} {count}')
-        out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
-        out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
+            out.append(f'{name}_bucket{{{label_set}le="{b}"}} {count}')
+        out.append(f'{name}_bucket{{{label_set}le="+Inf"}} {n}')
+        if lab:
+            out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
+        else:
+            out.append(f"{name}_sum {round(total, 6)}\n{name}_count {n}")
 
     metric("strata_requests_in_flight", "gauge", "Requests the telemetry has open.", tel.get("inflight"))
     metric("strata_requests_queued", "gauge", "Requests waiting for the engine.", tel.get("queued"))

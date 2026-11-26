@@ -19,7 +19,7 @@ outside has to change with the split.
 from __future__ import annotations
 
 from serve.reqtelemetry import accounting, correlation, evidence, metrics, record, schema, store, vocabulary
-from serve.reqtelemetry.correlation import REASON_CODES, SOURCE_NAMES, apply_engine
+from serve.reqtelemetry.correlation import REASON_CODES, SOURCE_NAMES, apply_engine, new_invocation_id
 from serve.reqtelemetry.evidence import EvidenceLog
 from serve.reqtelemetry.metrics import DURATION_BUCKETS
 from serve.reqtelemetry.record import (RequestRecord, decode_cursor, encode_cursor, new_request_id,
@@ -44,5 +44,5 @@ __all__ = ["CLIENT_ID_ALLOWED", "CLIENT_ID_MAX", "COMPLETE", "DEFAULT_PAGE_SIZE"
            "INSTRUMENTATION_ERROR", "MAXIMUM_PAGE_SIZE", "PARTIAL", "RequestRecord", "SCHEMA", "SCHEMA_VERSION",
            "SOURCES", "SOURCE_CONVERSATION_CACHE", "SOURCE_MULTIPLE", "SOURCE_NONE", "SOURCE_RESIDENT_SLOT",
            "SOURCE_RESTORED_CHECKPOINT", "SOURCE_UNKNOWN", "STATES", "ServerTelemetry", "TelemetryStore",
-           "UNSUPPORTED", "apply_engine", "decode_cursor", "encode_cursor", "new_request_id", "valid_client_request_id",
-           "validate"]
+           "UNSUPPORTED", "apply_engine", "decode_cursor", "encode_cursor", "new_invocation_id", "new_request_id",
+           "valid_client_request_id", "validate"]

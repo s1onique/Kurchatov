@@ -62,12 +62,17 @@ def _scrape(store) -> str:
 
 
 def _bucket(text: str, name: str, edge: str) -> int:
-    """The value of one histogram bucket line of the scrape."""
-    prefix = f"{name}_bucket{{model_name=\"test\",le=\"{edge}\"}}"
-    for line in text.splitlines():
-        if line.startswith(prefix + " "):
-            return int(line.rsplit(" ", 1)[1])
-    raise AssertionError(f"the scrape has no {prefix} line")
+    """The value of one histogram bucket line of the scrape.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A8): the canonical telemetry metrics are PROCESS-SCOPED:
+    they carry no model_name label, because a process-lifetime total does not belong to the model that happens to
+    be selected when the scrape happens.
+    """
+    for prefix in (f"{name}_bucket{{le=\"{edge}\"}}", f"{name}_bucket{{model_name=\"test\",le=\"{edge}\"}}"):
+        for line in text.splitlines():
+            if line.startswith(prefix + " "):
+                return int(line.rsplit(" ", 1)[1])
+    raise AssertionError(f"the scrape has no {name}_bucket for {edge}")
 
 
 class HistogramIntegrity(unittest.TestCase):
@@ -87,8 +92,8 @@ class HistogramIntegrity(unittest.TestCase):
         self.assertEqual(_bucket(text, "strata_request_duration_seconds", "30.0"), 2)
         self.assertEqual(_bucket(text, "strata_request_duration_seconds", "120.0"), 3)
         self.assertEqual(_bucket(text, "strata_request_duration_seconds", "+Inf"), 3)
-        self.assertIn("strata_request_duration_seconds_sum{model_name=\"test\"} 142.0", text)
-        self.assertIn("strata_request_duration_seconds_count{model_name=\"test\"} 3", text)
+        self.assertIn("strata_request_duration_seconds_sum 142.0", text)
+        self.assertIn("strata_request_duration_seconds_count 3", text)
 
     def test_no_bucket_claims_an_observation_that_did_not_happen(self):
         """The old exporter gave every bucket the total count: a long observation appeared in the small buckets too.
@@ -117,7 +122,7 @@ class HistogramIntegrity(unittest.TestCase):
         _record(store, total=0)
         text = _scrape(store)
         self.assertEqual(_bucket(text, "strata_request_duration_seconds", "0.001"), 1)
-        self.assertIn("strata_request_duration_seconds_sum{model_name=\"test\"} 0.0", text)
+        self.assertIn("strata_request_duration_seconds_sum 0.0", text)
 
     def test_a_missing_duration_is_not_observed_at_all(self):
         store = TelemetryStore()
@@ -185,13 +190,18 @@ class HistogramIntegrity(unittest.TestCase):
         self.assertEqual(list(DURATION_BUCKETS), sorted(DURATION_BUCKETS))
 
     def test_the_cache_reuse_ratio_has_both_of_its_numbers(self):
-        """G6: the numerator and the denominator come from the SAME eligible population."""
+        """G6: the numerator and the denominator come from the SAME eligible population.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G1): the records are built through the PRODUCTION
+        path (the engine's receipt, applied by apply_engine), so the reuse is a correlated measurement - an
+        unattributed number would not enter the authoritative totals.
+        """
         store = TelemetryStore()
         for reused, submitted in ((40, 100), (60, 100)):
             record = RequestRecord(f"r{store.seq + 1}")
             record.set_prompt_tokens(rendered=submitted, submitted=submitted)
-            record.set_native_cache(matched_prefix=reused, reused_prefix=reused,
-                                    evaluated=submitted - reused)
+            apply_engine(record, {"rid": record.request_id, "matched": reused, "reused": reused,
+                                  "evaluated": submitted - reused, "work": submitted - reused})
             store.add(record.seal("completed", 200))
         summary = store.summary()
         reuse = summary["cache_reuse"]
@@ -416,12 +426,17 @@ class ProductionWiring(HttpCase):
         self.assertGreater(record["prompt"]["rendered_tokens"], record["prompt"]["submitted_tokens"])
 
     def test_the_generated_and_the_emitted_tokens_are_different_numbers(self):
-        """The engine's count and what the client received are two different numbers."""
+        """The engine's count and what the client received are two different numbers.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A3): the generation loop's count is NOT the emitted
+        count.  The response is transformed (the reasoning, the tool calls, the stop handling), so the number of
+        tokens written to the client cannot be attributed there: it stays null and says why.  A null is not a zero.
+        """
         self.chat()
         record = self.one_record()
         self.assertEqual(record["generation"]["generated_tokens"], 7)     # the engine's own count
-        self.assertNotEqual(record["generation"]["emitted_tokens"], 7)    # what the client actually got
-        self.assertIsNotNone(record["generation"]["emitted_tokens"])
+        self.assertIsNone(record["generation"]["emitted_tokens"])       # not attributable: not a measured zero
+        self.assertIn("generation.emitted_tokens", record["measurement_quality"]["unavailable_fields"])
 
     def test_the_durations_come_from_a_monotonic_clock(self):
         self.chat()

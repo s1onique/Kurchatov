@@ -41,7 +41,11 @@ class ServerTelemetry:
     # ------------------------------------------------------------------ the request's life
     def begin(self, api=None, client_request_id=None, model_id=None, build_revision=None) -> RequestRecord:
         """A new request's record.  Its id is the server's own: unique per physical attempt, never derived from
-        the client's id, so two requests that carry the same client id stay two records."""
+        the client's id, so two requests that carry the same client id stay two records.
+
+        AMENDMENT-02 (A4): the request is counted as ACCEPTED here, at the admission boundary, and this count does
+        not depend on the record: a request whose record can never be sealed is still an accepted request.
+        """
         if not self.enabled:
             # the telemetry is off: NOTHING is allocated, nothing is kept, nothing is written (G6)
             return None
@@ -50,11 +54,17 @@ class ServerTelemetry:
                                build_revision=build_revision, api=api)
         with self.lock:
             self._records[record.request_id] = record
+        self.store.begin_request()
         return record
 
     def finish(self, record: RequestRecord, state=None, http_status=None, finish_reason=None, detail=None):
         """Close a request's record, put it in the store and write the evidence line.  At most once: a record that
-        was already finished is not finished again."""
+        was already finished is not finished again.
+
+        AMENDMENT-02 (A4): the TERMINAL OUTCOME is counted before the record is sealed, so a request whose record
+        cannot be sealed or stored still has exactly one terminal outcome and the lifecycle identity still balances.
+        The receipt's own delivery is counted beside it: the two identities are separate on purpose.
+        """
         if record is None:
             return None
         if not self.enabled:
@@ -63,8 +73,14 @@ class ServerTelemetry:
             if record.request_id not in self._records:
                 return None                 # already finished: a terminal receipt is finalized AT MOST ONCE
             del self._records[record.request_id]
-        record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
-        data = self.store.add(record)
+        # the terminal outcome first: it does not depend on the receipt
+        self.store.end_request(state)
+        try:
+            record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
+            data = self.store.add(record)
+        except Exception:                   # noqa: BLE001 - a receipt that cannot be sealed is a lost receipt, not a
+            self.store.receipt_failed()      # lost request: the terminal outcome above still stands
+            raise
         if self.evidence is not None:
             self.evidence.write(data)
         return data
