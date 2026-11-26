@@ -132,8 +132,27 @@ drafts are GPU weight residency; they are not conversation-cache hits and are no
 **An unavailable measurement is `null`, never `0`.** `0` is a measured zero: "the engine reused no tokens" is a
 measurement; "the engine did not say" is not. A missing measurement is never inferred from a wall-clock duration.
 
-`timing_authority` names who measured each duration (`native_engine` or `http_server`), so the two are never
-confused.
+`timing_authority` names who measured each duration, so the two are never confused:
+
+| Authority | What it means |
+|---|---|
+| `native_engine` | the engine measured it, on its own DONE line |
+| `http_server` | the server measured it, on the request's own monotonic clock |
+| `http_server_write` | the first MEANINGFUL content was written to the client (the write boundary) |
+| `http_server_observation` | the service saw a generated token (not the client's first byte) |
+
+Three more fields say how the record may be used (ACT-...-AMENDMENT-02, G1):
+
+| Field | Meaning |
+|---|---|
+| `native_correlation` | `verified` (the receipt belongs to this invocation), `unavailable` (an older engine did not echo the id), `rejected` (the receipt carried another invocation's id - none of its numbers was applied) or `not_applicable` (the request never reached the engine) |
+| `native_partial` | the native figures cover ONE segment of the invocation (a batch slot's admission segment) |
+| `measurement_valid` / `aggregate_eligible` | whether the record's numbers are measurements at all, and whether the record may enter the authoritative totals |
+
+A record whose accounting is **violated**, whose measurements are **invalid** or whose receipt is **not
+correlated** stays in the collection as a diagnostic receipt and contributes **nothing** to the totals. A
+measurement the server owns (the submitted prompt) stays eligible even when the engine's receipt could not be
+correlated.
 
 ## The HTTP API
 
@@ -228,6 +247,11 @@ strata_telemetry_accounting_coverage
 
 The labels are bounded enumerations only. There is **no** request id, session, engine instance, prompt, user,
 error message or dynamic model identity in a label.
+
+The canonical telemetry metrics above are **process-scoped**: they carry **no** `model_name` label
+(ACT-...-AMENDMENT-02, A8). A process-lifetime total does not belong to the model that happens to be selected when
+the scrape happens - otherwise the work of the model that ran before a switch is published under the new model's
+name. The existing compatibility metrics (`vllm:*`, `strata:*`) keep their labels and their meaning.
 
 A duration that was not measured contributes **no sample**: a histogram's `_count` says how many observations
 there really were. It is never padded with zeros.
@@ -330,6 +354,25 @@ The review of the predecessor found defects in the measurement, not in the archi
 
 With the telemetry **off** (`STRATA_TELEMETRY=0`) nothing is allocated: no receipt, no evidence writer and no
 `rid=` on the engine's commands - the engine's DONE line stays byte-identical to the release's.
+
+## The corrections of ACT-...-AMENDMENT-02
+
+The second review found measurement and attribution defects, not an architecture that needed replacing:
+
+| Where | Before | Now |
+|---|---|---|
+| the aggregates | an invalid, unattributed or out-of-a-broken-accounting measurement was counted | a measurement enters an authoritative total only when it is valid, its accounting holds and its receipt is correlated; the invalid ones stay as diagnostic receipts |
+| the native receipt | it was bound to the request | it is bound to the **invocation**: a new hexadecimal id is generated for every dispatch and the echoed id is checked before ANY native number is applied |
+| the queue wait | it was overwritten with the request's whole time | it is the wait, measured where it happens, and never overwritten |
+| the first token | the generation loop's timestamp, published as the client's | the first **meaningful content written** is timed at the write boundary; the service's own observation is published separately, and the emitted-token count is null with a reason |
+| the lifecycle | the accepted count and the terminal count came from the same insertion | the accepted count is taken at the admission, the terminal outcome before the receipt is sealed, and the receipt's delivery is counted beside them |
+| the evidence writer | the flush returned true while a record was blocked; the bytes were characters | the bytes are the UTF-8 bytes, the bound counts the record being written, the flush means "every accepted record reached a terminal outcome", and the worker owns the handle |
+| the pagination cursor | a cursor without an owner was accepted | a cursor without an owner, with a sequence below one, dated in the future, expired or pointing at an evicted page is refused |
+| the engine's eviction counter | a smaller reading lowered the total | it is a high-water mark per engine instance: the total never falls |
+| the native cumulative work | it repeated the distinct count | on the re-read path it stays **not measured** instead of publishing a smaller number than the work that happened |
+| the native terminal error | a bare `ERR`, the evidence lost | the ERR line carries the telemetry the engine did measure, so the failed request keeps its correlated partial evidence |
+| the browser's bar | the denominator was `reused + evaluated`; an unknown replay became a zero | the denominator is the submitted prompt, the positions nobody accounted for are shown, an unknown replay is not a measured zero, and a broken accounting gets no bar |
+| the batch slot | the admission segment's figures were published as the invocation's | the record says the figures cover one segment, and they stay out of the authoritative totals |
 
 ## See also
 

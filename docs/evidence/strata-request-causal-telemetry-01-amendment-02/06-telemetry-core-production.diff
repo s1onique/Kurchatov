@@ -1,0 +1,676 @@
+diff --git a/docs/telemetry/strata-request-telemetry-1.schema.json b/docs/telemetry/strata-request-telemetry-1.schema.json
+index 81409dce..aad403d2 100644
+--- a/docs/telemetry/strata-request-telemetry-1.schema.json
++++ b/docs/telemetry/strata-request-telemetry-1.schema.json
+@@ -32,0 +33 @@
++        "engine_invocation_ordinal",
+@@ -67,0 +69,7 @@
++        "engine_invocation_ordinal": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 1
++        },
+@@ -408,0 +417,4 @@
++        "native_correlation",
++        "native_partial",
++        "measurement_valid",
++        "aggregate_eligible",
+@@ -438,0 +451,17 @@
++        "native_correlation": {
++          "enum": [
++            "verified",
++            "unavailable",
++            "rejected",
++            "not_applicable"
++          ]
++        },
++        "native_partial": {
++          "type": "boolean"
++        },
++        "measurement_valid": {
++          "type": "boolean"
++        },
++        "aggregate_eligible": {
++          "type": "boolean"
++        },
+diff --git a/serve/reqtelemetry/__init__.py b/serve/reqtelemetry/__init__.py
+index fc2c17d6..f8ac9600 100644
+--- a/serve/reqtelemetry/__init__.py
++++ b/serve/reqtelemetry/__init__.py
+@@ -22 +22 @@ from serve.reqtelemetry import accounting, correlation, evidence, metrics, recor
+-from serve.reqtelemetry.correlation import REASON_CODES, SOURCE_NAMES, apply_engine
++from serve.reqtelemetry.correlation import REASON_CODES, SOURCE_NAMES, apply_engine, new_invocation_id
+@@ -47,2 +47,2 @@ __all__ = ["CLIENT_ID_ALLOWED", "CLIENT_ID_MAX", "COMPLETE", "DEFAULT_PAGE_SIZE"
+-           "UNSUPPORTED", "apply_engine", "decode_cursor", "encode_cursor", "new_request_id", "valid_client_request_id",
+-           "validate"]
++           "UNSUPPORTED", "apply_engine", "decode_cursor", "encode_cursor", "new_invocation_id", "new_request_id",
++           "valid_client_request_id", "validate"]
+diff --git a/serve/reqtelemetry/accounting.py b/serve/reqtelemetry/accounting.py
+index ee1a51ea..60511e16 100644
+--- a/serve/reqtelemetry/accounting.py
++++ b/serve/reqtelemetry/accounting.py
+@@ -44,0 +45,98 @@ def derive_disposition(record):
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G1): the token counts and who owns them.
++#
++# The server owns what it measured itself (the submitted prompt, the budgets, its own durations).  The engine owns
++# the cache attribution and the execution work.  A measurement is admitted to an authoritative aggregate only when it
++# is VALID (a whole, non-negative count), its owner is CORRELATED (the engine's receipt belongs to this request)
++# and the record's ACCOUNTING is not violated.
++TOKEN_FIELDS = ("rendered_tokens", "submitted_tokens", "matched_prefix_tokens", "reused_prefix_tokens",
++                "evaluated_tokens", "replayed_tokens", "non_prefix_reused_tokens", "evaluation_work_tokens")
++
++# the fields the NATIVE ENGINE measures.  They are admitted only when the receipt is correlated to this request.
++NATIVE_TOKEN_FIELDS = ("matched_prefix_tokens", "reused_prefix_tokens", "evaluated_tokens", "replayed_tokens",
++                       "evaluation_work_tokens")
++
++# the correlation states.  "not_applicable" is a request that never reached the engine.
++CORRELATION_VERIFIED = "verified"
++CORRELATION_UNAVAILABLE = "unavailable"
++CORRELATION_REJECTED = "rejected"
++CORRELATION_NOT_APPLICABLE = "not_applicable"
++
++
++def valid_token_count(value) -> bool:
++    """A token count is a WHOLE, non-negative number.  A bool, a fraction, a negative and a string are not counts."""
++    if isinstance(value, bool) or not isinstance(value, int):
++        return False
++    return value >= 0
++
++
++def validate_measurements(record) -> list:
++    """The problems with the record's own numbers, whatever the accounting says.
++
++    A count that is not a whole non-negative number is not a measurement at all: it is refused at the admission
++    boundary, never repaired and never counted.  The ranges that make the accounting IDENTIFY itself (reused <=
++    matched <= submitted) are checked by `conservation` - they are a broken identity, not a broken number.
++    """
++    problems = []
++    if getattr(record, "measurements_invalid", False):
++        # a measurement the engine sent was refused at the admission boundary: the record's numbers are not
++        # measurements, so it does not enter the authoritative aggregates
++        problems.append("the engine reported a measurement that is not a whole, non-negative token count")
++    for name in TOKEN_FIELDS:
++        value = getattr(record, name, None)
++        if value is None:
++            continue
++        if isinstance(value, bool) or not isinstance(value, int):
++            problems.append(f"{name} is not a whole token count")
++        elif value < 0:
++            problems.append(f"{name} is negative")
++    return problems
++
++
++def measurement_valid(record) -> bool:
++    """Whether the record's own numbers are measurements at all."""
++    return not validate_measurements(record)
++
++
++def correlation_state(record) -> str:
++    """How well the engine's receipt is tied to this request: verified, unavailable or rejected."""
++    return getattr(record, "native_correlation", CORRELATION_NOT_APPLICABLE)
++
++
++def aggregate_eligible(record) -> bool:
++    """Whether this record may contribute to the AUTHORITATIVE aggregates at all.
++
++    Three separate things decide it, and they are kept apart on purpose:
++
++      * the MEASUREMENTS must be valid (whole, non-negative counts);
++      * the ACCOUNTING must not be violated (a broken identity is not published as a total);
++      * the native measurements must be CORRELATED (a receipt that could not be tied to this request says nothing
++        about it - an older engine leaves the correlation unavailable, never an asserted join).
++    """
++    if not measurement_valid(record):
++        return False
++    if record.accounting_state()["state"] == "violated":
++        return False
++    if correlation_state(record) not in (CORRELATION_VERIFIED, CORRELATION_NOT_APPLICABLE):
++        return False
++    if getattr(record, "native_partial", False):
++        return False        # the native figures cover one segment of the invocation only (A9)
++    return True
++
++
++def field_eligible(record, name: str) -> bool:
++    """Whether ONE measurement of this record may enter an authoritative aggregate.
++
++    A measurement the SERVER owns stays eligible even when the engine's receipt could not be correlated: the
++    request's own numbers are still the request's own numbers.
++    """
++    value = getattr(record, name, None)
++    if value is None:
++        return False
++    if not valid_token_count(value):
++        return False
++    if name in NATIVE_TOKEN_FIELDS:
++        return aggregate_eligible(record)
++    # a server-owned measurement: it needs valid numbers, and the record's accounting must not be violated
++    return measurement_valid(record) and record.accounting_state()["state"] != "violated"
++
++
+@@ -57,0 +156,10 @@ def conservation(record) -> list:
++    replayed, work = record.replayed_tokens, record.evaluation_work_tokens
++    non_prefix = record.non_prefix_reused_tokens
++    # AMENDMENT-02 (G1): a number that is not a whole count is not compared at all - it is refused at the
++    # admission boundary (validate_measurements), so the identities below only ever compare real measurements.
++    def count(value):
++        return value if valid_token_count(value) else None
++
++    matched, reused = count(matched), count(reused)
++    submitted, evaluated = count(submitted), count(evaluated)
++    replayed, work, non_prefix = count(replayed), count(work), count(non_prefix)
+@@ -64 +172 @@ def conservation(record) -> list:
+-    if record.replayed_tokens is not None and evaluated is not None and record.replayed_tokens > evaluated:
++    if replayed is not None and evaluated is not None and replayed > evaluated:
+@@ -66,2 +174 @@ def conservation(record) -> list:
+-    if record.evaluation_work_tokens is not None and evaluated is not None \
+-            and record.evaluation_work_tokens < evaluated:
++    if work is not None and evaluated is not None and work < evaluated:
+@@ -69,2 +176 @@ def conservation(record) -> list:
+-    if record.identity_evaluable() and \
+-            reused + record.non_prefix_reused_tokens + evaluated != submitted:
++    if record.identity_evaluable() and reused + non_prefix + evaluated != submitted:
+@@ -78,2 +184,5 @@ def identity_evaluable(record) -> bool:
+-    return None not in (record.submitted_tokens, record.reused_prefix_tokens, record.evaluated_tokens,
+-                        record.non_prefix_reused_tokens)
++    # AMENDMENT-02 (G1): a term that is not a whole count cannot take part in an identity: the identity is then
++    # UNEVALUATED, never "satisfied" and never "violated" on the strength of a number that is not a measurement.
++    terms = (record.submitted_tokens, record.reused_prefix_tokens, record.evaluated_tokens,
++             record.non_prefix_reused_tokens)
++    return all(valid_token_count(term) for term in terms)
+diff --git a/serve/reqtelemetry/correlation.py b/serve/reqtelemetry/correlation.py
+index 29ea0e55..00e46d40 100644
+--- a/serve/reqtelemetry/correlation.py
++++ b/serve/reqtelemetry/correlation.py
+@@ -9,0 +10,4 @@ from __future__ import annotations
++import uuid
++
++from serve.reqtelemetry.accounting import (CORRELATION_NOT_APPLICABLE, CORRELATION_REJECTED, CORRELATION_UNAVAILABLE,
++                                            CORRELATION_VERIFIED)
+@@ -44 +48,29 @@ REASON_CODES = {
+-def apply_engine(record: RequestRecord, figures: dict | None):
++def new_invocation_id() -> str:
++    """A fresh id for ONE native execution attempt (AMENDMENT-02, G2/A2).
++
++    Three identities are kept apart: the PHYSICAL HTTP REQUEST's id (the record's own), the NATIVE INVOCATION's id
++    (this one - a new one for every dispatch, including a recovery dispatch inside the same request) and the ENGINE
++    INSTANCE's id.  The id is hexadecimal, because that is what the native protocol's `rid=` field accepts.
++    """
++    return uuid.uuid4().hex
++
++
++def _admit(record, name, value):
++    """One native measurement, at the admission boundary (AMENDMENT-02, G1).
++
++    A measurement that is not a whole, non-negative number is REFUSED: it is not written into the record, the field
++    stays null and the record says why.  A refused measurement is never clamped, coerced or counted - and the
++    record is marked as carrying an invalid measurement, so it does not enter the authoritative aggregates.
++    """
++    if value is None:
++        return None
++    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++        record.measurements_invalid = True
++        record.mark_unavailable(f"prompt.{name}",
++                                f"the engine reported a {name} that is not a whole, non-negative token count",
++                                INSTRUMENTATION_ERROR)
++        return None
++    return value
++
++
++def apply_engine(record: RequestRecord, figures: dict | None, expected_invocation_id: str | None = None):
+@@ -49,0 +82,10 @@ def apply_engine(record: RequestRecord, figures: dict | None):
++
++    AMENDMENT-02 (G2/A2): the receipt is bound to the NATIVE INVOCATION, not to the request.  The server knows which
++    invocation it dispatched (it generated the id itself, immediately before the dispatch) and the engine echoes
++    that id on its DONE line.  A receipt that carries ANOTHER invocation's id is FOREIGN: none of its numbers are
++    attached to this request - not even the positional DONE fields outside the telemetry suffix - its aggregates stay
++    clean, and the request says it had an instrumentation error.  A receipt with no id at all (an older engine)
++    leaves the correlation explicitly unavailable - never an asserted join.
++
++    The return value is the VERDICT: {"correlation": ..., "admitted": bool}.  The caller uses it to decide whether
++    the receipt's other fields (the timings, the generated count) may be applied at all.
+@@ -54 +96,2 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-        return record
++        record.native_correlation = CORRELATION_UNAVAILABLE
++        return {"correlation": CORRELATION_UNAVAILABLE, "admitted": False}
+@@ -60 +103,7 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-    expected = record.request_id
++    # the expectation: the invocation this request dispatched.  A record that never dispatched one falls back to
++    # the request's own id (the predecessor's rule), so an older caller still gets the same protection.
++    expected = expected_invocation_id
++    if expected is None:
++        expected = record.engine_invocation_id
++    if expected is None:
++        expected = record.request_id
+@@ -63 +112 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-                                "the engine's receipt carried another request's id: its measurements were not "
++                                "the engine's receipt carried another invocation's id: its measurements were not "
+@@ -64,0 +114,2 @@ def apply_engine(record: RequestRecord, figures: dict | None):
++        record.native_correlation = CORRELATION_REJECTED
++        # the foreign id is NOT recorded as this request's invocation: the receipt belongs to somebody else
+@@ -66,2 +117,3 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-        return record
+-    if rid:
++        return {"correlation": CORRELATION_REJECTED, "admitted": False}
++    if rid and expected is not None:
++        record.native_correlation = CORRELATION_VERIFIED
+@@ -69 +121,8 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-    elif expected is not None:
++    elif rid:
++        # an id the server cannot check against an invocation it dispatched: the correlation stays unavailable
++        record.native_correlation = CORRELATION_UNAVAILABLE
++        record.engine_invocation_id = rid
++        record.mark_unavailable("identity.engine_invocation_id",
++                                "the engine's receipt carried an id, but this request did not dispatch that "
++                                "invocation: the native measurements cannot be tied to it by id")
++    else:
+@@ -70,0 +130 @@ def apply_engine(record: RequestRecord, figures: dict | None):
++        record.native_correlation = CORRELATION_UNAVAILABLE
+@@ -72,2 +132,8 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-                                "the engine did not echo the request's id (an older engine): the native invocation "
+-                                "cannot be tied to this request by id")
++                                "the engine did not echo the invocation's id (an older engine): the native "
++                                "invocation cannot be tied to this request by id")
++
++    matched = _admit(record, "matched_prefix_tokens", figures.get("matched"))
++    reused = _admit(record, "reused_prefix_tokens", figures.get("reused"))
++    evaluated = _admit(record, "evaluated_tokens", figures.get("evaluated"))
++    replayed = _admit(record, "replayed_tokens", figures.get("replayed"))
++    work = _admit(record, "evaluation_work_tokens", figures.get("work"))
+@@ -75,3 +140,0 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-    matched = figures.get("matched")
+-    reused = figures.get("reused")
+-    evaluated = figures.get("evaluated")
+@@ -93 +156 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-        replayed=figures.get("replayed"), evaluation_work=figures.get("work"),
++        replayed=replayed, evaluation_work=work,
+@@ -108 +171 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-        record.slot_id = int(slot) if isinstance(slot, int) and slot >= 0 else None
++        record.slot_id = int(slot) if isinstance(slot, int) and not isinstance(slot, bool) and slot >= 0 else None
+@@ -115 +178,3 @@ def apply_engine(record: RequestRecord, figures: dict | None):
+-    return record
++    # AMENDMENT-02 (G1): the receipt's measurements are in the record, but they are only AUTHORITATIVE when the
++    # correlation was verified.  An unavailable correlation (an older engine) keeps the numbers as diagnostics.
++    return {"correlation": record.native_correlation, "admitted": record.native_correlation == CORRELATION_VERIFIED}
+diff --git a/serve/reqtelemetry/evidence.py b/serve/reqtelemetry/evidence.py
+index dbf53256..c8c24bdf 100644
+--- a/serve/reqtelemetry/evidence.py
++++ b/serve/reqtelemetry/evidence.py
+@@ -17,0 +18,14 @@ class EvidenceLog:
++
++    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A5): the writer's counters are exact:
++
++      * accepted_records  - the records the writer took responsibility for;
++      * written_records   - the records the worker actually wrote;
++      * failed_records    - the records the worker could not write (a write error, or a handle that was gone);
++      * dropped_records   - the records the writer refused (the queue was full);
++      * outstanding_records / outstanding_bytes - what the writer still holds (queued AND being written);
++      * incomplete_flushes - the flushes that did not finish in time.
++
++    The BYTES are the serialized UTF-8 bytes of the line, framing included - a character count is not a byte
++    count, and a record with multi-byte characters would slip past a byte budget that counted characters.
++    A successful flush means every record accepted before it reached a terminal writer outcome; a flush that times
++    out says so instead of pretending the evidence is on the disk.
+@@ -27,0 +42,2 @@ class EvidenceLog:
++        self.writing = 0                  # the records the worker took out of the queue and is writing now
++        self.accepted = 0
+@@ -28,0 +45 @@ class EvidenceLog:
++        self.failed = 0
+@@ -30 +47,3 @@ class EvidenceLog:
+-        self.errors = 0
++        self.errors = 0                   # the same as `failed`: kept for the older name
++        self.outstanding_records = 0
++        self.outstanding_bytes = 0
+@@ -39 +58,2 @@ class EvidenceLog:
+-            self._handle = open(self.path, "a", encoding="utf-8")
++            # BINARY: the writer accounts the UTF-8 bytes of the line, and it writes exactly those bytes
++            self._handle = open(self.path, "ab")
+@@ -43,0 +64 @@ class EvidenceLog:
++                self.failed += 1
+@@ -49 +70 @@ class EvidenceLog:
+-        """Queue a terminal record.  True when it was queued, False when it was dropped."""
++        """Queue a terminal record.  True when it was queued, False when it was dropped or refused."""
+@@ -50,0 +72,4 @@ class EvidenceLog:
++            # no handle: the record is REFUSED, and it is counted as such (AMENDMENT-02, A5)
++            with self.lock:
++                self.failed += 1
++                self.errors += 1
+@@ -53 +78 @@ class EvidenceLog:
+-            line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
++            line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+@@ -56,0 +82 @@ class EvidenceLog:
++                self.failed += 1
+@@ -59 +85,3 @@ class EvidenceLog:
+-            if len(self.queue) >= self.queue_size or self.queue_size_bytes + len(line) > self.queue_bytes:
++            # the bound counts what the writer HOLDS: the queued records AND the one being written right now
++            if len(self.queue) + self.writing >= self.queue_size \
++                    or self.outstanding_bytes + len(line) > self.queue_bytes:
+@@ -63,0 +92,3 @@ class EvidenceLog:
++            self.outstanding_records += 1
++            self.outstanding_bytes += len(line)
++            self.accepted += 1
+@@ -67 +98 @@ class EvidenceLog:
+-        while not self._stop.is_set() or self.queue:
++        while True:
+@@ -70,0 +102,5 @@ class EvidenceLog:
++            if not pending:
++                if self._stop.is_set():
++                    return                       # the queue is empty and the writer was told to stop
++                self._stop.wait(0.05)
++                continue
+@@ -71,0 +108,2 @@ class EvidenceLog:
++                with self.lock:
++                    self.writing += 1
+@@ -73 +111 @@ class EvidenceLog:
+-                    self._handle.write(line + "\n")
++                    self._handle.write(line)
+@@ -78,0 +117 @@ class EvidenceLog:
++                        self.failed += 1
+@@ -80,2 +119,5 @@ class EvidenceLog:
+-            if not pending:
+-                self._stop.wait(0.2)
++                finally:
++                    with self.lock:
++                        self.writing -= 1
++                        self.outstanding_records -= 1
++                        self.outstanding_bytes -= len(line)
+@@ -84,4 +126,7 @@ class EvidenceLog:
+-        """Wait for the queue to be written (the shutdown path).  False when the queue was not written in time -
+-        the count of the incomplete shutdown flushes is published (G6)."""
+-        deadline = time.time() + timeout
+-        while time.time() < deadline:
++        """Wait for the writer to be done with every record it accepted (the shutdown path).
++
++        False when the records were not written in time - the count of the incomplete shutdown flushes is published
++        (G6) and the evidence is NOT reported as durable.  The clock is MONOTONIC.
++        """
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
+@@ -89 +134 @@ class EvidenceLog:
+-                if not self.queue:
++                if self.outstanding_records == 0:
+@@ -91 +136 @@ class EvidenceLog:
+-            time.sleep(0.02)
++            time.sleep(0.01)
+@@ -97 +142,5 @@ class EvidenceLog:
+-        """Stop the thread after the queue is written, and close the file."""
++        """Stop the thread after the queue is written, and close the file.
++
++        The worker owns the file handle until it has stopped using it: the handle is closed only after the thread
++        has ended, so a worker that is still writing never writes to a closed handle.
++        """
+@@ -98,0 +148 @@ class EvidenceLog:
++        stopped = True
+@@ -100 +150,6 @@ class EvidenceLog:
+-            self._thread.join(timeout=2.0)
++            self._thread.join(timeout=5.0)
++            stopped = not self._thread.is_alive()
++        if not stopped:
++            with self.lock:
++                self.flush_incomplete += 1       # the writer did not stop: the evidence is incomplete
++            return
+@@ -115 +170,7 @@ class EvidenceLog:
+-                    "flush_incomplete": self.flush_incomplete}
++                    "flush_incomplete": self.flush_incomplete,
++                    # AMENDMENT-02 (A5): the exact domains
++                    "accepted_records": self.accepted, "written_records": self.written,
++                    "failed_records": self.failed, "dropped_records": self.dropped,
++                    "outstanding_records": self.outstanding_records,
++                    "outstanding_bytes": self.outstanding_bytes,
++                    "incomplete_flushes": self.flush_incomplete}
+diff --git a/serve/reqtelemetry/record.py b/serve/reqtelemetry/record.py
+index 29c1368f..1356ff0e 100644
+--- a/serve/reqtelemetry/record.py
++++ b/serve/reqtelemetry/record.py
+@@ -66,2 +66,3 @@ def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s:
+-    Raises ValueError for a cursor this server did not write, for a cursor of another server, and for an expired
+-    one.  An expired cursor is NOT treated as an exhausted collection: it is an error the operator sees.
++    Raises ValueError for a cursor this server did not write, for a cursor of another server, for an expired
++    one, for a cursor with no owner, for a sequence number that is not a positive number and for a timestamp in
++    the future.  An invalid cursor is NOT treated as an exhausted collection: it is an error the operator sees.
+@@ -82,0 +84,2 @@ def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s:
++    if seq < 1:
++        raise ValueError("the cursor names no record")
+@@ -84 +87,5 @@ def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s:
+-    if server_instance_id and owner and owner != server_instance_id:
++    # AMENDMENT-02 (G6): a cursor carries its OWNER.  A cursor without one, or with another server's, is refused:
++    # it points at a collection this server never wrote.
++    if not owner:
++        raise ValueError("the cursor names no server")
++    if server_instance_id and owner != server_instance_id:
+@@ -89,0 +97,2 @@ def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s:
++    if issued > int(time.time()) + 60:
++        raise ValueError("the cursor is dated in the future")
+@@ -117,0 +127,12 @@ class RequestRecord:
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G2/A2): the native invocation's id is a SEPARATE
++        # identity from the request's own id, and the ordinal says which attempt of this request it was.  A new id is
++        # generated for every dispatch, so a recovery dispatch inside the same request is its own invocation.
++        self.engine_invocation_ordinal = None
++        # how well the engine's receipt is tied to this request: verified, unavailable or rejected
++        self.native_correlation = "not_applicable"
++        # AMENDMENT-02 (A9): the native figures cover only ONE segment of the invocation (a batch slot's
++        # admission segment): they stay in the record as diagnostics and do not enter the authoritative totals.
++        self.native_partial = False
++        # AMENDMENT-02 (G1): the engine sent a measurement that is not a measurement (a negative count, a
++        # fraction, a bool).  It was refused at the admission boundary and the record says so.
++        self.measurements_invalid = False
+@@ -329,0 +351 @@ class RequestRecord:
++                "engine_invocation_ordinal": self.engine_invocation_ordinal,
+@@ -381,0 +404,7 @@ class RequestRecord:
++                # AMENDMENT-02 (G1): the record says whether its numbers may enter the authoritative aggregates,
++                # and why not when they may not.  The three decisions stay apart: the measurements are valid, the
++                # accounting is not violated, and the engine's receipt is correlated to this request.
++                "native_correlation": self.native_correlation,
++                "native_partial": self.native_partial,
++                "measurement_valid": self.measurement_valid(),
++                "aggregate_eligible": self.aggregate_eligible(),
+@@ -386,0 +416,11 @@ class RequestRecord:
++
++    # ------------------------------------------------------------------ the admission decisions
++    def measurement_valid(self) -> bool:
++        """Whether the record's own numbers are measurements at all (whole, non-negative counts)."""
++        from serve.reqtelemetry import accounting
++        return accounting.measurement_valid(self)
++
++    def aggregate_eligible(self) -> bool:
++        """Whether this record may contribute to the authoritative aggregates (serve/reqtelemetry/accounting.py)."""
++        from serve.reqtelemetry import accounting
++        return accounting.aggregate_eligible(self)
+diff --git a/serve/reqtelemetry/schema.py b/serve/reqtelemetry/schema.py
+index 732b5a28..d0ec7563 100644
+--- a/serve/reqtelemetry/schema.py
++++ b/serve/reqtelemetry/schema.py
+@@ -38 +38,2 @@ SCHEMA = {
+-                         "engine_invocation_id", "slot_id", "model_id", "build_revision"],
++                         "engine_invocation_id", "engine_invocation_ordinal", "slot_id", "model_id",
++                         "build_revision"],
+@@ -45,0 +47,2 @@ SCHEMA = {
++                # AMENDMENT-02 (G2/A2): the invocation's ordinal - which attempt of this request it was
++                "engine_invocation_ordinal": {"type": ["integer", "null"], "minimum": 1},
+@@ -122,0 +126 @@ SCHEMA = {
++                         "native_correlation", "native_partial", "measurement_valid", "aggregate_eligible",
+@@ -129,0 +134,7 @@ SCHEMA = {
++                # AMENDMENT-02 (G1): how the engine's receipt was tied to this request, whether the numbers are
++                # measurements at all, and whether the record may enter the authoritative aggregates
++                "native_correlation": {"enum": ["verified", "unavailable", "rejected", "not_applicable"]},
++                # AMENDMENT-02 (A9): the native figures cover one segment of the invocation only
++                "native_partial": {"type": "boolean"},
++                "measurement_valid": {"type": "boolean"},
++                "aggregate_eligible": {"type": "boolean"},
+diff --git a/serve/reqtelemetry/server.py b/serve/reqtelemetry/server.py
+index 96e663fd..7c1bf8ba 100644
+--- a/serve/reqtelemetry/server.py
++++ b/serve/reqtelemetry/server.py
+@@ -44 +44,5 @@ class ServerTelemetry:
+-        the client's id, so two requests that carry the same client id stay two records."""
++        the client's id, so two requests that carry the same client id stay two records.
++
++        AMENDMENT-02 (A4): the request is counted as ACCEPTED here, at the admission boundary, and this count does
++        not depend on the record: a request whose record can never be sealed is still an accepted request.
++        """
+@@ -52,0 +57 @@ class ServerTelemetry:
++        self.store.begin_request()
+@@ -57 +62,6 @@ class ServerTelemetry:
+-        was already finished is not finished again."""
++        was already finished is not finished again.
++
++        AMENDMENT-02 (A4): the TERMINAL OUTCOME is counted before the record is sealed, so a request whose record
++        cannot be sealed or stored still has exactly one terminal outcome and the lifecycle identity still balances.
++        The receipt's own delivery is counted beside it: the two identities are separate on purpose.
++        """
+@@ -66,2 +76,8 @@ class ServerTelemetry:
+-        record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
+-        data = self.store.add(record)
++        # the terminal outcome first: it does not depend on the receipt
++        self.store.end_request(state)
++        try:
++            record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
++            data = self.store.add(record)
++        except Exception:                   # noqa: BLE001 - a receipt that cannot be sealed is a lost receipt, not a
++            self.store.receipt_failed()      # lost request: the terminal outcome above still stands
++            raise
+diff --git a/serve/reqtelemetry/store.py b/serve/reqtelemetry/store.py
+index 7ee7bbe4..7f6121ca 100644
+--- a/serve/reqtelemetry/store.py
++++ b/serve/reqtelemetry/store.py
+@@ -47,0 +48,8 @@ class TelemetryStore:
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A4): the LIFECYCLE accounting is independent of
++            # the record's own insertion: a request is counted as accepted when it is admitted, and it gets exactly
++            # one terminal outcome - whether or not its telemetry record could be sealed, stored or written.  The
++            # receipt counters beside them say how many records were actually delivered.
++            "requests_accepted": 0, "requests_terminal_completed": 0, "requests_terminal_cancelled": 0,
++            "requests_terminal_failed": 0, "requests_terminal_rejected": 0,
++            "receipts_created": 0, "receipt_delivery_failures": 0,
++            "records_aggregate_eligible": 0, "records_aggregate_excluded": 0,
+@@ -57,0 +66,23 @@ class TelemetryStore:
++    def begin_request(self):
++        """Count an ACCEPTED request, at the admission boundary (AMENDMENT-02, A4).
++
++        This counter does not depend on the telemetry record: a request whose record can never be sealed is still an
++        accepted request, and the terminal accounting must balance against it.
++        """
++        with self.lock:
++            self.counters["requests_accepted"] += 1
++
++    def end_request(self, state):
++        """Count ONE terminal outcome for an accepted request (AMENDMENT-02, A4)."""
++        key = {"completed": "requests_terminal_completed", "cancelled": "requests_terminal_cancelled",
++               "failed": "requests_terminal_failed", "rejected": "requests_terminal_rejected"}.get(state)
++        if key is None:
++            return
++        with self.lock:
++            self.counters[key] += 1
++
++    def receipt_failed(self):
++        """A terminal receipt that could not be delivered (sealing, storing or writing it failed)."""
++        with self.lock:
++            self.counters["receipt_delivery_failures"] += 1
++
+@@ -68,0 +100 @@ class TelemetryStore:
++            self.counters["receipts_created"] += 1
+@@ -81 +113,8 @@ class TelemetryStore:
+-        measurement is not counted as zero."""
++        measurement is not counted as zero.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G1): a measurement enters an authoritative aggregate
++        only when it is VALID, its ACCOUNTING is not violated and - for the engine's own numbers - its RECEIPT is
++        correlated to this request.  A record that fails any of these stays in the store as a diagnostic receipt and
++        contributes NOTHING to the totals: an invalid or unattributed measurement never distorts them, and a counter
++        never falls because one was admitted.
++        """
+@@ -90,0 +130,7 @@ class TelemetryStore:
++        quality = data["measurement_quality"]
++        # the three decisions, kept apart (AMENDMENT-02, G1): the numbers are valid, the accounting holds, and the
++        # engine's receipt is correlated to this request.
++        valid = bool(quality.get("measurement_valid"))
++        accounting_ok = (quality.get("accounting") or {}).get("state") != "violated"
++        correlated = quality.get("native_correlation") == "verified" and not quality.get("native_partial")
++        eligible = bool(quality.get("aggregate_eligible"))
+@@ -92,6 +138,8 @@ class TelemetryStore:
+-        for key, counter in (("submitted_tokens", "prompt_tokens_submitted"),
+-                             ("matched_prefix_tokens", "prompt_tokens_matched"),
+-                             ("reused_prefix_tokens", "prompt_tokens_reused"),
+-                             ("evaluated_tokens", "prompt_tokens_evaluated"),
+-                             ("replayed_tokens", "prompt_tokens_replayed"),
+-                             ("evaluation_work_tokens", "prompt_evaluation_work_tokens")):
++        # the tokens the SERVER measured (the submitted prompt) and the tokens the ENGINE measured (the match, the
++        # reuse, the evaluation): the engine's numbers need a correlated receipt, the server's do not.
++        for key, counter, native in (("submitted_tokens", "prompt_tokens_submitted", False),
++                                     ("matched_prefix_tokens", "prompt_tokens_matched", True),
++                                     ("reused_prefix_tokens", "prompt_tokens_reused", True),
++                                     ("evaluated_tokens", "prompt_tokens_evaluated", True),
++                                     ("replayed_tokens", "prompt_tokens_replayed", True),
++                                     ("evaluation_work_tokens", "prompt_evaluation_work_tokens", True)):
+@@ -99,2 +147,8 @@ class TelemetryStore:
+-            if isinstance(value, int):
+-                c[counter] += value
++            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
++                continue                            # not a measurement: it is not counted
++            if native:
++                if not (valid and accounting_ok and correlated):
++                    continue                        # unattributed or invalid: not an authoritative number
++            elif not (valid and accounting_ok):
++                continue                            # the server's own number is valid, or it is not counted
++            c[counter] += value
+@@ -105,3 +159,10 @@ class TelemetryStore:
+-            if isinstance(value, int):
+-                c[counter] += value
+-        if cache.get("restore_attempted") is True:
++            # the engine's own generation counters need a correlated receipt too
++            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
++                continue
++            if key in ("generated_tokens", "speculative_draft_tokens", "speculative_accepted_tokens") \
++                    and not (valid and accounting_ok and correlated):
++                continue
++            if key == "emitted_tokens" and not (valid and accounting_ok):
++                continue
++            c[counter] += value
++        if cache.get("restore_attempted") is True and valid and accounting_ok and correlated:
+@@ -112 +173 @@ class TelemetryStore:
+-        if isinstance(evictions, int):
++        if isinstance(evictions, int) and not isinstance(evictions, bool) and valid and accounting_ok and correlated:
+@@ -115 +176,4 @@ class TelemetryStore:
+-            if evictions >= previous:              # the engine's own counter only goes up within one instance
++            # AMENDMENT-02 (G5): the engine's own counter is a HIGH-WATER MARK per engine instance: it only goes
++            # up inside one instance, and a smaller reading (a counter that fell, or a receipt that arrived out of
++            # order) never lowers the mark and never lowers the total.
++            if evictions >= previous:
+@@ -117 +181 @@ class TelemetryStore:
+-            self._evictions_by_engine[instance] = evictions
++                self._evictions_by_engine[instance] = evictions
+@@ -120 +184,5 @@ class TelemetryStore:
+-        if isinstance(submitted, int) and isinstance(reused, int):
++        # the ELIGIBLE population of the cache-reuse ratio: the requests whose reuse accounting is complete AND
++        # correlated.  Its numerator and denominator come from this population only, so the ratio stays in [0, 1].
++        if (isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0
++                and isinstance(reused, int) and not isinstance(reused, bool) and 0 <= reused <= submitted
++                and valid and accounting_ok and correlated):
+@@ -125,0 +194,4 @@ class TelemetryStore:
++        if eligible:
++            c["records_aggregate_eligible"] += 1
++        else:
++            c["records_aggregate_excluded"] += 1
+@@ -159,0 +232,9 @@ class TelemetryStore:
++            with self.lock:
++                newest = self.seq
++                oldest = self.records[0][0] if self.records else None
++            # AMENDMENT-02 (G6): a cursor that names a record this store never wrote, or one whose page was already
++            # evicted, is REFUSED.  It is never treated as an exhausted collection: the operator sees an error.
++            if after > newest:
++                raise ValueError("the cursor names a record this server never wrote")
++            if oldest is not None and after < oldest - 1:
++                raise ValueError("the records of this page are no longer retained")
+@@ -191,0 +273,11 @@ class TelemetryStore:
++                # AMENDMENT-02 (A4): the lifecycle accounting, independent of the records' own insertion.  At
++                # quiescence: accepted = completed + cancelled + failed + rejected.
++                "lifecycle": {
++                    "accepted": self.counters["requests_accepted"],
++                    "completed": self.counters["requests_terminal_completed"],
++                    "cancelled": self.counters["requests_terminal_cancelled"],
++                    "failed": self.counters["requests_terminal_failed"],
++                    "rejected": self.counters["requests_terminal_rejected"],
++                    "receipts_created": self.counters["receipts_created"],
++                    "receipt_delivery_failures": self.counters["receipt_delivery_failures"],
++                },

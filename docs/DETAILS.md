@@ -2328,6 +2328,19 @@ whether it closed; the **one** terminal receipt of a request is written by the H
 refused, cancelled or disconnected request is accounted for too; and the cache-reuse ratio is published with the
 population it covers.
 
+They were tightened again after the second review (ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02): a
+measurement enters an authoritative total only when it is **valid**, its accounting **holds** and the engine's
+receipt is **correlated** to this request - an invalid or unattributed number stays a diagnostic receipt and
+counts for nothing; the native receipt is bound to the **invocation** (a new id for every dispatch, checked
+before any native number is applied), not to the request; the **queue wait** is the wait and is never overwritten
+with the request's running time; the first token is timed at the **response-write boundary** (the client's first
+byte is not the generation loop's observation, and the server never claims that the client received anything);
+the lifecycle's accepted count and its terminal outcomes are counted **independently** of the receipt's delivery;
+the evidence writer's byte budget counts UTF-8 **bytes**, its bound counts the record being written and its flush
+means "every accepted record reached a terminal outcome"; a cursor that names nothing is refused; the engine's
+eviction counter is a **high-water mark**; and the canonical Prometheus metrics are **process-scoped** (no model
+label), so a model switch cannot relabel the work that was already done.
+
 ---
 
 ## Troubleshooting

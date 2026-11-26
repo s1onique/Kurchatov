@@ -1,0 +1,394 @@
+diff --git a/serve/prometheus.py b/serve/prometheus.py
+index 99393fd8..b3c5cc46 100644
+--- a/serve/prometheus.py
++++ b/serve/prometheus.py
+@@ -161 +161 @@ def strata(m: dict, out: list, lab: str):
+-    telemetry(m.get("telemetry") or {}, out, lab)
++    telemetry(m.get("telemetry") or {}, out, "")
+@@ -196 +196,6 @@ def telemetry(tel: dict, out: list, lab: str):
+-        out.append(f"{name}{{{lab}{labels}}} {value}")
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A8): the canonical telemetry metrics are
++        # PROCESS-SCOPED: they carry no model_name label.  A process-lifetime total does not belong to the model
++        # that happens to be selected when the scrape happens - otherwise the work of the model that ran before a
++        # switch is published under the new model's name.
++        label_set = f"{lab}{labels}"
++        out.append(f"{name}{{{label_set}}} {value}" if label_set else f"{name} {value}")
+@@ -243,0 +249 @@ def telemetry(tel: dict, out: list, lab: str):
++        label_set = f"{lab}," if lab else ""
+@@ -248,3 +254,6 @@ def telemetry(tel: dict, out: list, lab: str):
+-            out.append(f'{name}_bucket{{{lab},le="{b}"}} {count}')
+-        out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
+-        out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
++            out.append(f'{name}_bucket{{{label_set}le="{b}"}} {count}')
++        out.append(f'{name}_bucket{{{label_set}le="+Inf"}} {n}')
++        if lab:
++            out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
++        else:
++            out.append(f"{name}_sum {round(total, 6)}\n{name}_count {n}")
+diff --git a/serve/server.py b/serve/server.py
+index 6214915e..be350b36 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -309,0 +310,28 @@ REQTELEMETRY_TEXT_KEYS = ("cache_source", "cache_reason", "restore", "rid")
++def parse_error_figures(line: str) -> dict:
++    """The telemetry key=value pairs an ERR line carries (ACT-...-AMENDMENT-02, G4).
++
++    The engine can fail BEFORE it writes its DONE line - a checkpoint restoration that failed is the case the
++    amendment names.  The evidence it did measure is then on the ERR line, and it is read here, so the failed
++    request's record can carry the correlated partial evidence instead of nothing at all.  A line without the
++    fields yields an empty dict: no evidence, not a zero.
++    """
++    figures = {}
++    for token in (line or "").split():
++        key, eq, value = token.partition("=")
++        if not eq:
++            continue
++        if key in REQTELEMETRY_INT_KEYS:
++            try:
++                figures[key] = int(value)
++            except ValueError:
++                pass
++        elif key in REQTELEMETRY_FLOAT_KEYS:
++            try:
++                figures[key] = float(value)
++            except ValueError:
++                pass
++        elif key in REQTELEMETRY_TEXT_KEYS:
++            figures[key] = value
++    return figures
++
++
+@@ -1394,0 +1423,9 @@ class StrataEngine:
++    def error_figures(self) -> dict:
++        """The telemetry the engine put on its LAST ERR line for THIS request (AMENDMENT-02, G4).
++
++        It is the evidence the engine measured before it failed - a restoration that failed, a lookup it made.
++        An empty dict means the engine's error carried no evidence: not a zero, no measurement.
++        """
++        local = getattr(self, "_req_local", None)
++        return dict(getattr(local, "error_figures", None) or {}) if local is not None else {}
++
+@@ -1585 +1622,7 @@ class StrataEngine:
+-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
++        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A9): a slot's BDONE is the END of that slot's leg.
++        The native accounting that came with the slot's ADMISSION (its DONE line) describes that segment only -
++        it is not the whole invocation.  The figures are marked as such, so the record says so instead of
++        publishing a segment's numbers as the request's.
++        """
+@@ -1588 +1631,2 @@ class StrataEngine:
+-                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
++                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated"),
++                         "native_segment_only": True}
+@@ -2275,0 +2320,6 @@ class StrataEngine:
++                    # AMENDMENT-02 (G4): the ERR line can carry the telemetry the engine DID measure (the restore
++                    # that failed, the lookup it made).  They are kept with THIS request - in the thread's own
++                    # place - so the failed request's record can carry the correlated partial evidence.
++                    local = getattr(self, "_req_local", None)
++                    if local is not None:
++                        local.error_figures = parse_error_figures(line)
+@@ -4647 +4697,13 @@ class Service:
+-            rt.apply_engine(tele, engine_figures)
++            # AMENDMENT-02 (G2/A2): the receipt is bound to the native INVOCATION.  When it does not match the
++            # invocation this request dispatched, NOT ONE of its numbers is applied - not even the positional DONE
++            # fields outside the telemetry suffix - and the request says it had an instrumentation error.
++            verdict = rt.apply_engine(tele, engine_figures, expected_invocation_id=tele.engine_invocation_id)
++            admitted = bool(verdict.get("admitted"))
++            # AMENDMENT-02 (A9): a batch slot's BDONE ends the slot's leg: the native figures that came with its
++            # ADMISSION describe that segment only.  They stay in the record as diagnostics, but they are not
++            # published as the whole invocation's accounting and they do not enter the authoritative totals.
++            if admitted and (last or {}).get("native_segment_only"):
++                tele.native_partial = True
++                tele.mark_unavailable("cache",
++                                      "the engine's batch slot reported only its admission segment: the native "
++                                      "accounting is not the whole invocation")
+@@ -4649 +4711 @@ class Service:
+-            if last and last.get("prompt_ms") is not None:
++            if admitted and last and last.get("prompt_ms") is not None:
+@@ -4651 +4713 @@ class Service:
+-            if last and last.get("decode_ms") is not None:
++            if admitted and last and last.get("decode_ms") is not None:
+@@ -4658 +4720 @@ class Service:
+-            engine_generated = last.get("generated") if last else None
++            engine_generated = last.get("generated") if (last and admitted) else None
+@@ -4660,3 +4722,2 @@ class Service:
+-                                emitted=generated if emitted is None else emitted,
+-                                draft_tokens=last.get("drafts_offered") if last else None,
+-                                accepted_tokens=last.get("drafts_accepted") if last else None,
++                                draft_tokens=last.get("drafts_offered") if (last and admitted) else None,
++                                accepted_tokens=last.get("drafts_accepted") if (last and admitted) else None,
+@@ -4663,0 +4725,7 @@ class Service:
++            # AMENDMENT-02 (A3): the EMITTED tokens are not the generated ones.  The generation loop counts the
++            # tokens the engine produced; the response is transformed (the reasoning, the tool calls and the stop
++            # handling all change it), so the number of tokens written to the client cannot be attributed here.
++            # It stays null and says why - it is not a measured zero.
++            tele.mark_unavailable("generation.emitted_tokens",
++                                  "the tokens written to the client are not attributable after the response "
++                                  "transformation: the generation loop's count is the engine's, not the client's")
+@@ -4666 +4734,4 @@ class Service:
+-            if queue_s is not None:
++            # AMENDMENT-02 (A1): the queue wait was measured WHERE it happened - when the request took its turn.
++            # It is NOT overwritten here with the time the request spent running: a request that waited 1 s and then
++            # generated for 9 s waited 1 s, not 10 s.
++            if queue_s is not None and "queue" not in tele.timing:
+@@ -4669,4 +4740,9 @@ class Service:
+-                tele.set_timing("http_first_token", float(first_token_s) * 1000.0, "http_server")
+-            # the identity of the native invocation: the request's own id and the invocation's ordinal
+-            if tele.engine_invocation_id:
+-                tele.engine_invocation_id = f"{tele.engine_invocation_id}#{int(invocations)}"
++                # AMENDMENT-02 (A3): this is the SERVICE's observation of the first generated token.  It is not
++                # the client's first byte: the HTTP first-content time is measured at the response-write boundary,
++                # in the HTTP handler (Service._first_content).
++                tele.set_timing("engine_first_token", float(first_token_s) * 1000.0, "http_server_observation")
++            # AMENDMENT-02 (A2): the invocation's id is the id the server generated for the dispatch, and its
++            # ordinal says which attempt of this request it was.  The id is NOT changed here: the engine echoes it
++            # verbatim and the correlation compares it verbatim.
++            if tele.engine_invocation_id is None and invocations:
++                tele.engine_invocation_ordinal = int(invocations)
+@@ -5425,0 +5502,2 @@ class Service:
++        # AMENDMENT-02 (A2): which native invocation of this request we are on (the first is 1)
++        dispatch_ordinal = 1
+@@ -5456,0 +5535,4 @@ class Service:
++                    if tele is not None:
++                        # AMENDMENT-02 (A1): the queue wait of a request that never ran: the time it waited for
++                        # its turn, measured on the request's own monotonic clock.
++                        tele.set_timing("queue", (time.perf_counter() - waiting) * 1000.0, "http_server")
+@@ -5506,0 +5589,8 @@ class Service:
++                        # AMENDMENT-02 (G2/A2): the invocation id of THIS dispatch, generated right before it.
++                        invocation_id = None
++                        if tele is not None:
++                            from serve import reqtelemetry as rt
++                            invocation_id = rt.new_invocation_id()
++                            tele.engine_invocation_id = invocation_id
++                            tele.engine_invocation_ordinal = dispatch_ordinal
++                            dispatch_ordinal += 1
+@@ -5510 +5600,4 @@ class Service:
+-                            self.engine.set_request_id(tele.request_id if tele is not None else None)
++                            # AMENDMENT-02 (G2/A2): the id is the INVOCATION's id - a new one for every dispatch,
++                            # generated immediately before it - and not the request's own id.  The engine echoes it
++                            # verbatim, so a receipt can be tied to THIS attempt and not to the request in general.
++                            self.engine.set_request_id(invocation_id)
+@@ -5601,0 +5695,9 @@ class Service:
++                            # AMENDMENT-02 (G4): the evidence the engine put on its ERR line (the restore that
++                            # failed, the lookup it made) belongs to THIS request and is applied to its record.
++                            # The request still fails exactly as before - the telemetry never decides anything.
++                            if tele is not None and hasattr(self.engine, "error_figures"):
++                                figures = self.engine.error_figures()
++                                if figures:
++                                    from serve import reqtelemetry as rt
++                                    rt.apply_engine(tele, figures,
++                                                    expected_invocation_id=tele.engine_invocation_id)
+@@ -5748,0 +5851,3 @@ class Service:
++                            # AMENDMENT-02 (A1): the queue wait is NOT passed here.  It was measured when the
++                            # request took its turn; the time the request spent running is not queue time, and
++                            # passing it here would overwrite the real measurement with the whole request time.
+@@ -5750 +5854,0 @@ class Service:
+-                                                   emitted=n, queue_s=round(time.perf_counter() - waiting, 6),
+@@ -7208,0 +7313,59 @@ def make_handler(svc: Service):
++        def _first_content(self):
++            """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A3): the first MEANINGFUL content written
++            to the client.
++
++            The clock starts HERE - at the response-write boundary - on the request's own monotonic clock.  The
++            headers, the SSE keep-alives, the role-only events and the prompt-progress events are not content and
++            do not start it.  The REASONING output does count as content, and the record says so
++            (first_token_includes_reasoning).
++
++            The server cannot know when the CLIENT received the bytes: a successful write is not a receipt, and
++            this measurement never claims one.
++            """
++            tele = getattr(self, "telemetry", None)
++            if tele is None or getattr(tele, "clock", None) is None:
++                return
++            if "http_first_token" in tele.timing:
++                return                              # the first content was already timed
++            tele.set_timing("http_first_token", (time.perf_counter() - tele.clock) * 1000.0, "http_server_write")
++            if tele.first_token_includes_reasoning is None:
++                tele.first_token_includes_reasoning = True
++
++        @staticmethod
++        def _chunk_is_content(chunk) -> bool:
++            """Whether a streamed chunk carries MEANINGFUL content (AMENDMENT-02, A3).
++
++            A chunk that only opens the stream (the role, the model's name) or that reports the usage is not
++            content: the client has nothing to read yet.
++            """
++            if not isinstance(chunk, dict):
++                return False
++            for choice in chunk.get("choices") or []:
++                if not isinstance(choice, dict):
++                    continue
++                delta = choice.get("delta") or choice.get("message") or {}
++                if not isinstance(delta, dict):
++                    continue
++                if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
++                    return True
++            return False
++
++        @staticmethod
++        def _event_is_content(name, event) -> bool:
++            """Whether a streamed EVENT carries meaningful content (AMENDMENT-02, A3).
++
++            The event names are the API's own: an Anthropic content delta, a Responses text delta, a reasoning
++            delta or a tool-call delta.  The events that only open the stream, report the progress or carry the
++            usage are not content.
++            """
++            if not isinstance(event, dict):
++                return False
++            kind = event.get("type") or ""
++            if kind in ("content_block_delta", "response.output_text.delta",
++                        "response.reasoning_summary_text.delta", "response.function_call_arguments.delta"):
++                delta = event.get("delta") or {}
++                if isinstance(delta, dict):
++                    return bool(delta.get("text") or delta.get("thinking") or delta.get("partial_json"))
++                return bool(delta)
++            return False
++
+@@ -7286 +7449,5 @@ def make_handler(svc: Service):
+-                return self._json(200, openai_collect(chunks))
++                body = openai_collect(chunks)
++                self._json(200, body)
++                # AMENDMENT-02 (A3): the whole answer was written at once: the first content went out with it.
++                self._first_content()
++                return None
+@@ -7294,0 +7462,4 @@ def make_handler(svc: Service):
++                    # AMENDMENT-02 (A3): the first MEANINGFUL content, at the write boundary.  A keep-alive and a
++                    # role-only chunk are not content and do not start the clock.
++                    if c is not None and self._chunk_is_content(c):
++                        self._first_content()
+@@ -7380 +7551,3 @@ def make_handler(svc: Service):
+-                return self._json(200, result)
++                self._json(200, result)
++                self._first_content()          # AMENDMENT-02 (A3): the whole answer went out at once
++                return None
+@@ -7383 +7555,0 @@ def make_handler(svc: Service):
+-
+@@ -7401,0 +7574,3 @@ def make_handler(svc: Service):
++                    # AMENDMENT-02 (A3): the first MEANINGFUL content, at the write boundary
++                    if e is not None and self._event_is_content((e or {}).get("type"), e):
++                        self._first_content()
+@@ -7510 +7685,4 @@ def make_handler(svc: Service):
+-                return self._json(200, anthropic_collect(events))
++                body = anthropic_collect(events)
++                self._json(200, body)
++                self._first_content()          # AMENDMENT-02 (A3): the whole answer went out at once
++                return None
+@@ -7520,0 +7699,3 @@ def make_handler(svc: Service):
++                    # AMENDMENT-02 (A3): the first MEANINGFUL content, at the write boundary
++                    if item is not None and self._event_is_content(item[0], item[1]):
++                        self._first_content()
+diff --git a/serve/web/telemetry.html b/serve/web/telemetry.html
+index 035fc2f6..51cce9e8 100644
+--- a/serve/web/telemetry.html
++++ b/serve/web/telemetry.html
+@@ -11 +11 @@ button,input,select{font:inherit}button{cursor:pointer;color:inherit;background:
+-header{height:70px;padding:0 32px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--st-line);background:var(--st-surface)}.brand{font-size:23px;font-weight:700;letter-spacing:-.5px}.brand span{font-size:13px;font-weight:400;margin-left:14px;color:var(--st-ink-muted)}.brand .build{font-family:var(--st-font-mono);font-size:11px}main{max-width:1560px;margin:auto;padding:28px 32px}.top{display:flex;align-items:center;justify-content:space-between;gap:24px}h1{margin:0;font-size:29px;letter-spacing:-.7px}h2{font-size:17px;margin:0}.sub,.muted{color:var(--st-ink-muted)}.sub{margin:4px 0 0}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.primary{background:var(--st-accent);color:var(--st-accent-ink);border-color:transparent}.notice{margin-top:16px;padding:10px 14px;background:var(--st-danger-tint);color:var(--st-danger-text);border-radius:9px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:24px 0}.card{padding:18px 20px;border:1px solid var(--st-line);border-radius:13px;background:var(--st-surface)}.label{font-size:12px;color:var(--st-ink-muted);text-transform:uppercase;letter-spacing:.8px}.value{font-size:26px;font-weight:500;line-height:1.35;margin-top:3px}.sub2{font-size:12px;color:var(--st-ink-muted);margin-top:4px}.panel{border:1px solid var(--st-line);border-radius:14px;background:var(--st-surface);overflow:hidden}.panel-bar{padding:15px 20px;border-bottom:1px solid var(--st-line);display:flex;align-items:center;justify-content:space-between;gap:12px}.filters{display:flex;gap:8px;flex-wrap:wrap}input,select{color:inherit;border:1px solid var(--st-line);background:var(--st-bg);padding:7px 10px;border-radius:8px}.workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(340px,38%);min-height:460px}.table-wrap{overflow:auto;max-height:560px}.st-table{width:100%;border-collapse:collapse;font-size:13px}.st-table th{text-align:left;padding:9px 12px;border-bottom:1px solid var(--st-line);color:var(--st-ink-muted);font-weight:500;white-space:nowrap;position:sticky;top:0;background:var(--st-surface)}.st-table td{padding:8px 12px;border-bottom:1px solid var(--st-line-soft);white-space:nowrap}.st-table td.num,.st-table th.num{text-align:right;font-variant-numeric:tabular-nums}.st-table tr{cursor:pointer}.st-table tr:hover{background:var(--st-surface-2)}.st-table tr.selected{background:var(--st-accent-tint)}.tag{font-size:11px;border-radius:5px;padding:2px 6px;background:var(--st-surface-2);color:var(--st-ink-muted)}.tag.completed{color:var(--st-accent-text);background:var(--st-accent-tint)}.tag.cancelled{color:var(--st-warn-text);background:var(--st-warn-tint)}.tag.failed{color:var(--st-danger-text);background:var(--st-danger-tint)}.detail{min-width:0;padding:20px;border-left:1px solid var(--st-line)}.empty{padding:70px 24px;text-align:center;color:var(--st-ink-muted)}.empty strong{display:block;color:var(--st-ink);font-size:18px;margin-bottom:6px}.detail-title{font:13px var(--st-font-mono);overflow-wrap:anywhere}.facts{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:16px 0}.fact{background:var(--st-bg);border-radius:8px;padding:9px 11px}.fact span{font-size:11px;color:var(--st-ink-muted);display:block}.fact b{font-weight:500;font-size:15px;overflow-wrap:anywhere}.bar{display:flex;height:22px;border-radius:6px;overflow:hidden;background:var(--st-surface-2);margin:6px 0 4px}.bar div{height:100%}.bar .reused{background:var(--st-accent)}.bar .evaluated{background:var(--st-info)}.bar .replayed{background:var(--st-warn)}.legend{display:flex;gap:14px;font-size:12px;color:var(--st-ink-muted);flex-wrap:wrap}.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}.warn-list{margin:12px 0;padding:0;list-style:none}.warn-list li{padding:8px 11px;border-radius:8px;background:var(--st-warn-tint);color:var(--st-warn-text);font-size:12px;margin-bottom:6px}.warn-list li.bad{background:var(--st-danger-tint);color:var(--st-danger-text)}pre{margin:12px 0 0;padding:14px;background:var(--st-bg);border:1px solid var(--st-line-soft);border-radius:9px;font:12px/1.55 var(--st-font-mono);white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto;min-height:120px}footer{margin-top:14px;font-size:12px;color:var(--st-ink-muted);display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}#auth{margin-top:16px;padding:14px;display:flex;gap:10px;align-items:center}#auth input{flex:1;max-width:400px}
++header{height:70px;padding:0 32px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--st-line);background:var(--st-surface)}.brand{font-size:23px;font-weight:700;letter-spacing:-.5px}.brand span{font-size:13px;font-weight:400;margin-left:14px;color:var(--st-ink-muted)}.brand .build{font-family:var(--st-font-mono);font-size:11px}main{max-width:1560px;margin:auto;padding:28px 32px}.top{display:flex;align-items:center;justify-content:space-between;gap:24px}h1{margin:0;font-size:29px;letter-spacing:-.7px}h2{font-size:17px;margin:0}.sub,.muted{color:var(--st-ink-muted)}.sub{margin:4px 0 0}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.primary{background:var(--st-accent);color:var(--st-accent-ink);border-color:transparent}.notice{margin-top:16px;padding:10px 14px;background:var(--st-danger-tint);color:var(--st-danger-text);border-radius:9px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:24px 0}.card{padding:18px 20px;border:1px solid var(--st-line);border-radius:13px;background:var(--st-surface)}.label{font-size:12px;color:var(--st-ink-muted);text-transform:uppercase;letter-spacing:.8px}.value{font-size:26px;font-weight:500;line-height:1.35;margin-top:3px}.sub2{font-size:12px;color:var(--st-ink-muted);margin-top:4px}.panel{border:1px solid var(--st-line);border-radius:14px;background:var(--st-surface);overflow:hidden}.panel-bar{padding:15px 20px;border-bottom:1px solid var(--st-line);display:flex;align-items:center;justify-content:space-between;gap:12px}.filters{display:flex;gap:8px;flex-wrap:wrap}input,select{color:inherit;border:1px solid var(--st-line);background:var(--st-bg);padding:7px 10px;border-radius:8px}.workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(340px,38%);min-height:460px}.table-wrap{overflow:auto;max-height:560px}.st-table{width:100%;border-collapse:collapse;font-size:13px}.st-table th{text-align:left;padding:9px 12px;border-bottom:1px solid var(--st-line);color:var(--st-ink-muted);font-weight:500;white-space:nowrap;position:sticky;top:0;background:var(--st-surface)}.st-table td{padding:8px 12px;border-bottom:1px solid var(--st-line-soft);white-space:nowrap}.st-table td.num,.st-table th.num{text-align:right;font-variant-numeric:tabular-nums}.st-table tr{cursor:pointer}.st-table tr:hover{background:var(--st-surface-2)}.st-table tr.selected{background:var(--st-accent-tint)}.tag{font-size:11px;border-radius:5px;padding:2px 6px;background:var(--st-surface-2);color:var(--st-ink-muted)}.tag.completed{color:var(--st-accent-text);background:var(--st-accent-tint)}.tag.cancelled{color:var(--st-warn-text);background:var(--st-warn-tint)}.tag.failed{color:var(--st-danger-text);background:var(--st-danger-tint)}.detail{min-width:0;padding:20px;border-left:1px solid var(--st-line)}.empty{padding:70px 24px;text-align:center;color:var(--st-ink-muted)}.empty strong{display:block;color:var(--st-ink);font-size:18px;margin-bottom:6px}.detail-title{font:13px var(--st-font-mono);overflow-wrap:anywhere}.facts{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:16px 0}.fact{background:var(--st-bg);border-radius:8px;padding:9px 11px}.fact span{font-size:11px;color:var(--st-ink-muted);display:block}.fact b{font-weight:500;font-size:15px;overflow-wrap:anywhere}.bar{display:flex;height:22px;border-radius:6px;overflow:hidden;background:var(--st-surface-2);margin:6px 0 4px}.bar div{height:100%}.bar .reused{background:var(--st-accent)}.bar .evaluated{background:var(--st-info)}.bar .replayed{background:var(--st-warn)}.bar .unaccounted{background:var(--st-line)}.legend{display:flex;gap:14px;font-size:12px;color:var(--st-ink-muted);flex-wrap:wrap}.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}.warn-list{margin:12px 0;padding:0;list-style:none}.warn-list li{padding:8px 11px;border-radius:8px;background:var(--st-warn-tint);color:var(--st-warn-text);font-size:12px;margin-bottom:6px}.warn-list li.bad{background:var(--st-danger-tint);color:var(--st-danger-text)}pre{margin:12px 0 0;padding:14px;background:var(--st-bg);border:1px solid var(--st-line-soft);border-radius:9px;font:12px/1.55 var(--st-font-mono);white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto;min-height:120px}footer{margin-top:14px;font-size:12px;color:var(--st-ink-muted);display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}#auth{margin-top:16px;padding:14px;display:flex;gap:10px;align-items:center}#auth input{flex:1;max-width:400px}
+@@ -13,0 +14 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
++<script defer src="/web/telemetry_accounting.js"></script>
+diff --git a/serve/web/telemetry.js b/serve/web/telemetry.js
+index de5955ac..5edf3bbc 100644
+--- a/serve/web/telemetry.js
++++ b/serve/web/telemetry.js
+@@ -223 +223,4 @@ function renderDetail() {
+-  // When the engine did not report the reuse or the evaluation, the bar says so instead of drawing an empty one.
++  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A7): the arithmetic is in ONE pure function
++  // (serve/web/telemetry_accounting.js), so the bar and its test cannot drift apart: the submitted prompt is the
++  // denominator, the positions nobody accounted for are shown, an unknown replay is not a measured zero, and a
++  // violated or unevaluated accounting gets no bar at all.
+@@ -226,15 +229,9 @@ function renderDetail() {
+-  const measured = prompt.reused_prefix_tokens !== null && prompt.reused_prefix_tokens !== undefined
+-    && prompt.evaluated_tokens !== null && prompt.evaluated_tokens !== undefined;
+-  const reused = measured ? prompt.reused_prefix_tokens : 0;
+-  const evaluated = measured ? prompt.evaluated_tokens : 0;
+-  const replayed = prompt.replayed_tokens === null || prompt.replayed_tokens === undefined ? 0 : prompt.replayed_tokens;
+-  const total = Math.max(1, reused + evaluated);
+-  const parts = [["reused", reused, "Reused"], ["evaluated", Math.max(0, evaluated - replayed), "Evaluated"],
+-                 ["replayed", replayed, "Replayed"]];
+-  for (const [className, value, title] of parts) {
+-    if (value <= 0) continue;
+-    const part = document.createElement("div");
+-    part.className = className;
+-    part.style.width = `${(value / total) * 100}%`;
+-    part.title = `${title}: ${value} tokens`;
+-    bar.append(part);
++  const accounting_parts = accountingBarParts(prompt, quality);
++  const total = accounting_parts.total || 1;
++  for (const part of accounting_parts.parts) {
++    if (part.value <= 0) continue;
++    const node = document.createElement("div");
++    node.className = part.className;
++    node.style.width = `${(part.value / total) * 100}%`;
++    node.title = part.title;
++    bar.append(node);
+@@ -242 +239 @@ function renderDetail() {
+-  if (!measured) {
++  for (const text of accounting_parts.notes) {
+@@ -245 +242 @@ function renderDetail() {
+-    note.textContent = "the engine reported no token accounting for this request";
++    note.textContent = text;
+@@ -251 +248,2 @@ function renderDetail() {
+-                                    ["replayed", "Replayed (previously processed)"]]) {
++                                    ["replayed", "Replayed (previously processed)"],
++                                    ["unaccounted", "Not accounted for"]]) {
+diff --git a/serve/web/telemetry_accounting.js b/serve/web/telemetry_accounting.js
+new file mode 100644
+index 00000000..be2577d5
+--- /dev/null
++++ b/serve/web/telemetry_accounting.js
+@@ -0,0 +1,54 @@
++// serve/web/telemetry_accounting.js - the token accounting bar's arithmetic, as a PURE function.
++//
++// ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A7): the bar must not draw a picture the numbers do not
++// support.
++//
++//   * the denominator is the SUBMITTED prompt - the positions that went to the engine - when it is known;
++//   * the positions nobody accounted for are shown as such, not hidden;
++//   * an UNKNOWN replay is not a measured zero: it is left out of the bar and it is said;
++//   * a violated or an unevaluated accounting gets NO normalized bar at all;
++//   * a request the engine never measured gets no bar either - only the words that say so.
++//
++// The function touches no DOM, so a test can run it (tools/test_telemetry_web_accounting.py).  The page uses it
++// through the same file; there is one implementation, not two.
++function accountingBarParts(prompt, quality) {
++  const q = quality || {};
++  const accounting = q.accounting || {};
++  const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
++  const submitted = num(prompt.submitted_tokens);
++  const reused = num(prompt.reused_prefix_tokens);
++  const evaluated = num(prompt.evaluated_tokens);
++  const nonPrefix = num(prompt.non_prefix_reused_tokens);
++  const replayed = num(prompt.replayed_tokens);
++  const state = accounting.state || "unevaluated";
++  const notes = [];
++  const parts = [];
++  if (reused === null || evaluated === null) {
++    notes.push("the engine reported no token accounting for this request");
++    return { parts, notes, complete: false, state };
++  }
++  if (state === "violated" || state === "unevaluated") {
++    notes.push(state === "violated"
++      ? "the token accounting does not close: no bar is drawn"
++      : "the token accounting could not be evaluated: no bar is drawn");
++    return { parts, notes, complete: false, state };
++  }
++  const accounted = reused + (nonPrefix || 0) + evaluated;
++  const total = submitted !== null ? submitted : Math.max(1, accounted);
++  parts.push({ className: "reused", value: reused, title: `Reused: ${reused} tokens` });
++  if (replayed === null) {
++    notes.push("the replayed positions were not measured: they are not drawn as a measured zero");
++    parts.push({ className: "evaluated", value: evaluated, title: `Evaluated: ${evaluated} tokens` });
++  } else {
++    parts.push({ className: "evaluated", value: Math.max(0, evaluated - replayed),
++                 title: `Evaluated: ${Math.max(0, evaluated - replayed)} tokens` });
++    parts.push({ className: "replayed", value: replayed, title: `Replayed: ${replayed} tokens` });
++  }
++  const unaccounted = submitted !== null ? Math.max(0, submitted - accounted) : null;
++  if (unaccounted !== null && unaccounted > 0) {
++    parts.push({ className: "unaccounted", value: unaccounted,
++                 title: `Not accounted for: ${unaccounted} tokens` });
++  }
++  return { parts, notes, complete: true, state, total };
++}
++if (typeof module !== "undefined" && module.exports) module.exports = { accountingBarParts };
