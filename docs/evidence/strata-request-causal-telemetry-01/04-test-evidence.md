@@ -35,6 +35,10 @@ The baseline was checked too, in a temporary worktree at the entry commit (`git 
 widened the window; the fix closes it. The temporary worktree was removed afterwards; the repository's own
 worktrees and the deployment repository were not touched.
 
+The fix is confirmed by **two clean full-suite runs after it** (1052 tests and 1054 tests, both OK with the same
+23 skips), and by the file times: no file under `serve/` is newer than the authoritative run, so that run
+exercised exactly the code that is committed.
+
 ## The qualification matrix
 
 The honest column is the last one. **A native control that was not executed is NOT_EXECUTED, never PASS.**
