@@ -10,7 +10,7 @@ ENTRY_HEAD:     c45ec82846b2671673ff712009c8a85e1f034e2e
 FINAL_HEAD:     646c066d62f9df57382f6d56fc6147bc4967d4e9
 BRANCH:         main
 TRACKED_DIRT:   none (the only untracked path is the pre-existing .kurchatov-acts/, untouched)
-COMMITS_CREATED: 5 (the list is below)
+COMMITS_CREATED: 8 (6 with the change, 2 with the evidence; the list is below)
 ```
 
 ## The gates
@@ -100,6 +100,8 @@ repository's own setup installs it), the predecessor's evidence shows the whole 
 | 4 | `332488bb` the witnesses of the corrections | `serve/test_telemetry_integrity.py`, `tools/test_telemetry_mutations.py`, `serve/test_reqtelemetry.py`, `tools/test_reqtelemetry_roundtrip.py` |
 | 5 | `2b2a9463` the documentation of the corrections | `docs/TELEMETRY.md`, `docs/DETAILS.md` |
 | 6 | `646c066d` the patch hygiene | `serve/reqtelemetry/` (no blank line at the end of a file: `git diff --check` must pass) |
+| 7 | `8e6b92c6` the evidence | `docs/evidence/strata-request-causal-telemetry-01-amendment-01/` |
+| 8 | `418a4e3e` the evidence, bound to the final tree | the exit report's FINAL_HEAD and the checksums |
 
 The evidence package itself is committed on top of them (as the predecessor did).
 
