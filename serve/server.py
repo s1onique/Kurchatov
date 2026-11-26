@@ -4541,6 +4541,8 @@ class Service:
         summary = self.telemetry_requests.store.summary()
         summary["inflight"] = self.telemetry_requests.inflight()
         summary["enabled"] = self.telemetry_requests.enabled
+        evidence = getattr(self.telemetry_requests, "evidence", None)
+        summary["evidence"] = evidence.counters() if evidence is not None else None
         with self.status_lock:
             summary["queued"] = int(self.status.get("queued") or 0)
         return summary
@@ -4586,11 +4588,19 @@ class Service:
             if limit > rt.MAXIMUM_PAGE_SIZE:
                 raise ValueError(f"limit must be at most {rt.MAXIMUM_PAGE_SIZE}")
             cursor = query.get("cursor", [None])[0]
+            # the filters are validated, not guessed: a filter that names nothing is an error, not an empty page
+            state = (query.get("request_status") or [None])[0]
+            if state is not None and state not in rt.STATES:
+                raise ValueError("request_status must be one of: " + ", ".join(rt.STATES))
+            disposition = (query.get("cache_disposition") or [None])[0]
+            if disposition is not None and disposition not in rt.DISPOSITIONS:
+                raise ValueError("cache_disposition must be one of: " + ", ".join(rt.DISPOSITIONS))
+            client_request_id = (query.get("client_request_id") or [None])[0]
+            if client_request_id is not None and not rt.valid_client_request_id(client_request_id):
+                raise ValueError("client_request_id must be printable ASCII (at most 128 characters)")
             try:
-                page = store.list(limit=limit, cursor=cursor,
-                                  client_request_id=(query.get("client_request_id") or [None])[0],
-                                  state=(query.get("request_status") or [None])[0],
-                                  disposition=(query.get("cache_disposition") or [None])[0])
+                page = store.list(limit=limit, cursor=cursor, client_request_id=client_request_id,
+                                  state=state, disposition=disposition)
             except ValueError as e:
                 raise ValueError(str(e)) from None
             return 200, {"records": page["records"], "next_cursor": page["next_cursor"],
@@ -4599,6 +4609,8 @@ class Service:
         request_id = path[len("/v1/telemetry/requests/"):]
         if not request_id or "/" in request_id:
             raise ValueError("the request id is missing")
+        if not all(c in "0123456789abcdefABCDEF" for c in request_id) or not 8 <= len(request_id) <= 64:
+            raise ValueError("the request id is not one of this server's ids")
         record = store.get(request_id)
         if record is None:
             return 404, {"error": {"type": "not_found",
@@ -4613,13 +4625,19 @@ class Service:
             return None
         return f"pid-{proc.pid}-gen-{getattr(self.engine, 'gen', 0)}"
 
-    def _finish_telemetry(self, tele, last, seen, submitted, generated, finish, started):
-        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: close this request's telemetry record.
+    def _finish_telemetry(self, tele, last, seen, submitted, generated, finish, started, emitted=None,
+                          queue_s=None, first_token_s=None, invocations=1):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's MEASUREMENTS.
 
         The engine's own figures (the cache state, the tokens it evaluated, its prefill and decode time) come from
         its DONE line - the engine is the authority for them.  The server's own figures (the queue wait, the time to
-        the first byte the client sees, the total time) are measured here.  A request that failed before the engine
-        answered keeps whatever it has and says the accounting is partial: nothing is invented to look complete.
+        the first token the client sees) are measured here.  A request that failed before the engine answered keeps
+        whatever it has and says the accounting is partial: nothing is invented to look complete.
+
+        AMENDMENT-01 (G4, G5): this does NOT finalize the record.  The physical HTTP request's own boundary does
+        that (Service._seal_telemetry): a request whose response is still being written is never reported as
+        finished, and a request that was refused, cancelled while queued or disconnected still gets exactly ONE
+        terminal receipt.
         """
         if tele is None:
             return None
@@ -4632,32 +4650,70 @@ class Service:
                 tele.set_timing("prefill_wall", float(last["prompt_ms"]), "native_engine")
             if last and last.get("decode_ms") is not None:
                 tele.set_timing("decode_wall", float(last["decode_ms"]), "native_engine")
-            # the prompt: what the server rendered and tokenized, and what the engine was given
-            tele.set_prompt_tokens(rendered=submitted, submitted=submitted, authority="server")
-            # the generation: the engine's count, and what the client actually received
-            tele.set_generation(generated=generated, emitted=generated,
-                                 draft_tokens=last.get("drafts_offered") if last else None,
-                                 accepted_tokens=last.get("drafts_accepted") if last else None,
-                                 finish_reason=finish)
-            # the lifecycle: the queue wait, the time to the first byte the client sees, the total
-            now = time.time()
-            if started:
-                tele.set_timing("total", (now - started) * 1000.0, "http_server")
-            ft0 = self.status.get("first_token") if isinstance(self.status, dict) else None
-            if ft0 and started:
-                tele.set_timing("http_first_token", (ft0 - started) * 1000.0, "http_server")
-            # the outcome: a request that never reached the engine, or that was cut short, says so
-            state = {"completed": "completed", "cancel": "cancelled", "disconnect": "cancelled",
-                     "error": "failed", "length": "completed", "stop": "completed"}.get(finish, "completed")
-            if not engine_figures and finish != "completed":
+            # the prompt: what the engine was given.  The RENDERED count was measured where the template was
+            # rendered (Service.prepare) - it is a different number and it is not copied from this one.
+            if submitted is not None:
+                tele.set_prompt_tokens(submitted=submitted)
+            # the generation: the engine's own count and what the client actually received - two different numbers
+            engine_generated = last.get("generated") if last else None
+            tele.set_generation(generated=engine_generated,
+                                emitted=generated if emitted is None else emitted,
+                                draft_tokens=last.get("drafts_offered") if last else None,
+                                accepted_tokens=last.get("drafts_accepted") if last else None,
+                                finish_reason=finish)
+            # the lifecycle: the queue wait and the time to the first token, both from a request-local MONOTONIC
+            # clock (a wall-clock timestamp is for reporting, never for a duration)
+            if queue_s is not None:
+                tele.set_timing("queue", float(queue_s) * 1000.0, "http_server")
+            if first_token_s is not None:
+                tele.set_timing("http_first_token", float(first_token_s) * 1000.0, "http_server")
+            # the identity of the native invocation: the request's own id and the invocation's ordinal
+            if tele.engine_invocation_id:
+                tele.engine_invocation_id = f"{tele.engine_invocation_id}#{int(invocations)}"
+            # a request that never reached the engine, or that was cut short, says so
+            if not engine_figures and finish not in (None, "completed", "stop", "length"):
                 tele.mark_unavailable("cache", "the engine reported no measurements for this request")
-            self.telemetry_requests.finish(tele, state=state, finish_reason=finish,
-                                           detail=None if finish == "completed" else finish)
+            tele.outcome_detail = finish
         except Exception as e:                       # noqa: BLE001 - the telemetry must never break a request
             print(f"[strata] the telemetry could not finish a request: {type(e).__name__}: {e}", flush=True)
         finally:
             self.telemetry_trace.record = None
         return tele
+
+    def _seal_telemetry(self, tele, record=None, http_status=None):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G5): the ONE terminal finalization of a physical
+        HTTP request.
+
+        The engine's completion does NOT finalize the record: the request may still be writing its response, or may
+        have been refused, cancelled while queued or disconnected.  This boundary runs for every accepted request -
+        whatever happened to it - and produces exactly one receipt.  The invariant at quiescence is:
+
+            accepted = completed + cancelled + failed + rejected,  and  inflight = 0.
+        """
+        if tele is None:
+            return None
+        record = record or {}
+        status = http_status if http_status is not None else record.get("http_status")
+        outcome = record.get("outcome") or ""
+        error = record.get("error")
+        finish = tele.finish_reason
+        if error or finish == "error":
+            state = "failed"
+        elif finish in ("cancel", "disconnect") or outcome == "disconnected":
+            state = "cancelled"
+        elif isinstance(status, int) and status >= 400:
+            state = "rejected"                      # refused before or instead of an answer
+        else:
+            state = "completed"
+        # the total duration: the record's OWN monotonic clock, from its admission to its end
+        if tele.clock is not None:
+            tele.set_timing("total", (time.perf_counter() - tele.clock) * 1000.0, "http_server")
+        try:
+            return self.telemetry_requests.finish(tele, state=state, http_status=status,
+                                                  finish_reason=finish, detail=finish or outcome or None)
+        except Exception as e:                       # noqa: BLE001 - the telemetry must never break a request
+            print(f"[strata] the telemetry could not seal a request: {type(e).__name__}: {e}", flush=True)
+            return None
 
     def request_records(self, request_id=None):
         with self.status_lock:
@@ -4968,7 +5024,29 @@ class Service:
         fetched = self._note_unreadable_tool_images(messages, cancel)
         if self.preserve_thinking and kwargs.get("preserve_thinking") is not False:
             messages = self.restore_reasoning(messages)
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G4): the RENDERED prompt (after the template and the
+        # tokenization, before any admission adjustment) and the output budget the client asked for are measured
+        # HERE, where they happen - not copied from another quantity later.
+        tele = getattr(self.telemetry_trace, "record", None)
+        encode_started = time.perf_counter()
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        encode_ms = (time.perf_counter() - encode_started) * 1000.0
+        if tele is not None:
+            # the identity AFTER the model was selected (a request may name another model): the model, the build and
+            # the engine process are the ones that will really run it
+            tele.model_id = self.model
+            tele.build_revision = build_identity(getattr(self.engine, "info", {}) or {}).get("commit")
+            tele.engine_instance_id = self.engine_instance_id()
+            tele.set_prompt_tokens(rendered=len(encoded_ids))
+            tele.set_timing("tokenization", encode_ms, "http_server")
+            tele.mark_unavailable("timing_ms.template_render",
+                                  "the template render and the tokenization are one pass; the duration of that "
+                                  "pass is published as tokenization")
+            if max_new is not None and max_new > 0:
+                tele.set_generation(requested_max=max_new)
+            else:
+                tele.mark_unavailable("generation.requested_max_output_tokens",
+                                      "the client asked for no limit (the rest of the context)")
         if self.drop_oldest:
             messages, ids = self.drop_oldest_turns(messages, tools, kwargs, ids, max_new)
             encoded_ids = ids
@@ -5060,6 +5138,10 @@ class Service:
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's strata-<model>.json to shorten it to the room left (#545)")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+        if tele is not None:
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G4): the EFFECTIVE budget - what the server
+            # actually allowed after the context's room - is a different number from the requested one.
+            tele.set_generation(effective_max=max_new)
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
@@ -5334,8 +5416,13 @@ class Service:
             tele = self.telemetry_requests.begin(model_id=self.model,
                                                  build_revision=build_identity(
                                                      getattr(self.engine, "info", {}) or {}).get("commit"))
-        tele.started_at = time.time()
+        if tele is not None:                          # with the telemetry off there is no record at all (G6)
+            tele.started_at = time.time()
         waiting = time.perf_counter()
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G4): the durations come from a request-local MONOTONIC
+        # clock.  `first_token_s` is the time to the first TOKEN the client sees (a header, a keep-alive and a
+        # prompt-progress event are not tokens).
+        first_token_s = None
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
@@ -5376,6 +5463,10 @@ class Service:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
+                        if tele is not None:
+                            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G4): the queue wait, measured
+                            # where it happens, on a request-local monotonic clock.
+                            tele.set_timing("queue", (time.perf_counter() - waiting) * 1000.0, "http_server")
                         if not par:
                             self.status["queued"] -= 1
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
@@ -5414,7 +5505,9 @@ class Service:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
                         if hasattr(self.engine, "set_request_id"):
-                            self.engine.set_request_id(tele.request_id)   # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01
+                            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G6): with the telemetry off the
+                            # engine's commands are NOT extended: no id is sent, so the DONE line stays as it was.
+                            self.engine.set_request_id(tele.request_id if tele is not None else None)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
@@ -5434,6 +5527,8 @@ class Service:
                                     yield "ping", None
                                     continue
                                 n += 1
+                                if first_token_s is None:
+                                    first_token_s = time.perf_counter() - waiting
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
@@ -5651,7 +5746,9 @@ class Service:
                             # own figures (the cache state, the tokens it evaluated) come from its DONE line; the
                             # lifecycle figures (the queue wait, the render, the tokenization, the model load, the
                             # time to the first byte the client sees) are the server's own.
-                            self._finish_telemetry(tele, last, seen, len(ids), n, finish, started)
+                            self._finish_telemetry(tele, last, seen, len(ids), n, finish, started,
+                                                   emitted=n, queue_s=round(time.perf_counter() - waiting, 6),
+                                                   first_token_s=first_token_s, invocations=len(segments))
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
@@ -6222,11 +6319,15 @@ def make_handler(svc: Service):
             self.answer_started = False
             self.held = contextlib.ExitStack()
             self.telemetry = None                    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's record
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G4): the status this request ends with.  It is
+            # the handler's own, not the API monitor's: the monitor may be off, and the telemetry does not depend on it.
+            self._http_status = None
             super().handle_one_request()
             self._drain_body()
 
         def send_response(self, code, message=None):
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
+            self._http_status = code
             super().send_response(code, message)
 
         def _chunked(self) -> bool:
@@ -6863,6 +6964,12 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G5): the ONE terminal finalization of this
+                # physical HTTP request.  It runs for every accepted request - answered, refused, cancelled while
+                # queued, disconnected or failed - and it produces exactly one receipt.  The engine's completion
+                # only filled the measurements; it never finalized the record.
+                svc._seal_telemetry(getattr(self, "telemetry", None), record,
+                                    http_status=getattr(self, "_http_status", None))
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
