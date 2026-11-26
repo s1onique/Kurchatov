@@ -32,10 +32,10 @@ index 7e7ac949..e17391c1 100644
 +                       "native_correlation", "native_partial", "measurement_valid", "aggregate_eligible",
 diff --git a/serve/test_telemetry_amendment02.py b/serve/test_telemetry_amendment02.py
 new file mode 100644
-index 00000000..db4b792a
+index 00000000..7e1fbe26
 --- /dev/null
 +++ b/serve/test_telemetry_amendment02.py
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,592 @@
 +#!/usr/bin/env python3
 +"""serve/test_telemetry_amendment02.py - the witnesses of
 +ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (and its FULL_DIFF_REVIEW_01 addendum).
@@ -56,6 +56,7 @@ index 00000000..db4b792a
 +from __future__ import annotations
 +
 +import json
++import socket
 +import sys
 +import threading
 +import time
@@ -548,6 +549,81 @@ index 00000000..db4b792a
 +        self.assertEqual(len(ids), 2)
 +        self.assertTrue(all(ids))
 +        self.assertNotEqual(ids[0], ids[1])
++
++    def test_a_queued_request_that_the_client_abandons_still_gets_one_receipt(self):
++        """G7: a genuinely QUEUED request, cancelled while it waits for its turn.
++
++        The first request holds the turn (the mock engine is slow); the second client sends its request and then
++        goes away.  The server sees the disconnect, the queued request is cancelled, and it still gets exactly one
++        terminal receipt - with no engine work invented for it.
++        """
++        self.engine.delay = 0.02
++        self.engine.script = self.tok.encode("word " * 40, parse_special=True) + [7]
++        holder = threading.Thread(target=lambda: self.chat())
++        holder.start()
++        time.sleep(0.3)                                   # the first request holds the turn
++        sock = socket.create_connection(("127.0.0.1", self.httpd.server_address[1]), timeout=10)
++        body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).encode()
++        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: "
++                     b"application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
++        time.sleep(0.3)                                   # the second request is queued behind the first
++        sock.close()                                      # and the client leaves
++        holder.join(timeout=60)
++        time.sleep(0.5)
++        records = self.records()
++        self.assertEqual(len(records), 2, "every accepted request gets exactly one receipt")
++        cancelled = [r for r in records if r["lifecycle"]["state"] == "cancelled"]
++        self.assertTrue(cancelled, "the abandoned queued request was not cancelled")
++        for record in cancelled:
++            # it did not complete: the finish reason is the cancellation, never a successful stop
++            self.assertNotIn(record["lifecycle"]["finish_reason"], ("stop", "length"))
++        _, summary = self.get("/v1/telemetry/summary")
++        counters = summary["counters"]
++        self.assertEqual(counters["requests_accepted"],
++                         counters["requests_terminal_completed"] + counters["requests_terminal_cancelled"]
++                         + counters["requests_terminal_failed"] + counters["requests_terminal_rejected"])
++        self.assertEqual(summary["inflight"], 0)
++
++    def test_a_client_that_disconnects_mid_stream_gets_one_receipt(self):
++        """G7: an actual TRANSPORT DISCONNECTION, not an engine fixture that says "cancel"."""
++        self.engine.delay = 0.05
++        self.engine.script = self.tok.encode("word " * 60, parse_special=True) + [7]
++        sock = socket.create_connection(("127.0.0.1", self.httpd.server_address[1]), timeout=10)
++        body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True}).encode()
++        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: "
++                     b"application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
++        time.sleep(0.4)                                   # the stream is running
++        sock.close()                                      # the client goes away mid-stream
++        time.sleep(1.0)
++        records = self.records()
++        self.assertEqual(len(records), 1, "the disconnected request got exactly one receipt")
++        self.assertIn(records[0]["lifecycle"]["state"], ("cancelled", "failed"))
++        _, summary = self.get("/v1/telemetry/summary")
++        counters = summary["counters"]
++        self.assertEqual(counters["requests_accepted"],
++                         counters["requests_terminal_completed"] + counters["requests_terminal_cancelled"]
++                         + counters["requests_terminal_failed"] + counters["requests_terminal_rejected"])
++        self.assertEqual(summary["inflight"], 0)
++
++    def test_a_receipt_that_cannot_be_sealed_still_leaves_the_lifecycle_balanced(self):
++        """G7/A4: the fault injection through the HTTP path: the seal fails, the accounting does not."""
++        from serve.reqtelemetry import RequestRecord
++
++        def broken(self, *args, **kwargs):
++            raise RuntimeError("the seal failed")
++
++        real = RequestRecord.seal
++        RequestRecord.seal = broken
++        try:
++            self.chat()
++        finally:
++            RequestRecord.seal = real
++        _, summary = self.get("/v1/telemetry/summary")
++        counters = summary["counters"]
++        self.assertEqual(counters["requests_accepted"], 1)
++        self.assertEqual(counters["requests_terminal_completed"], 1)
++        self.assertEqual(counters["receipt_delivery_failures"], 1)
++        self.assertEqual(summary["inflight"], 0)
 +
 +
 +if __name__ == "__main__":

@@ -4,7 +4,7 @@
 ACT_ID: ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02
 ADDENDUM: FULL_DIFF_REVIEW_01
 ENTRY_HEAD: 579f5cef1b5ead2c38079f9b7e5b867838bf703e
-TESTED_CODE_HEAD: 10c094df1267a60121c826f72988346ee48c266f
+TESTED_CODE_HEAD: 7e449bdec3914578d9793b73097162b1afd7b5e6
 FINAL_HEAD: 7fd2d359cab5ba2bb7e6cd5c02e82f4ddbdc74a3  (the evidence commit; the last commit only records this line)
 CODE_TREE_BINDING: the acceptance suite ran against the working tree of d770e7d8284a6c42c6d4420fa1ddc5f546fff1e6; the evidence commits add
   only docs/evidence/... and change no production file (the diff of the evidence commits is the evidence itself)
