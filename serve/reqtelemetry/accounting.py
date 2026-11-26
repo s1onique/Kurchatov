@@ -99,7 +99,19 @@ def measurement_valid(record) -> bool:
 
 def correlation_state(record) -> str:
     """How well the engine's receipt is tied to this request: verified, unavailable or rejected."""
-    return getattr(record, "native_correlation", CORRELATION_NOT_APPLICABLE)
+    return correlation_of(record)
+
+
+def correlation_of(obj) -> str:
+    """The correlation state of a record or of an invocation receipt (G1).
+
+    The record aggregates the states of its receipts; a receipt carries its OWN.  One place reads both, so the
+    two cannot drift apart.
+    """
+    state = getattr(obj, "correlation", None)
+    if state is not None:
+        return state
+    return getattr(obj, "native_correlation", CORRELATION_NOT_APPLICABLE)
 
 
 def aggregate_eligible(record) -> bool:
@@ -205,3 +217,94 @@ def accounting_state(record) -> dict:
                if value is None]
     return {"state": "unevaluated", "valid": None, "problems": [],
             "missing": missing + ([] if record.state == "completed" else ["the request did not complete"])}
+
+
+# ---------------------------------------------------------------------------------------------
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G2): the admission is METRIC-SPECIFIC.
+#
+# The predecessor used ONE global predicate (the record is valid, the accounting is not violated, the receipt is
+# correlated) for every measurement.  That made three wrong admissions possible:
+#
+#   * an UNEVALUATED accounting (the complete prompt accounting was not available) was admitted to the COMPLETE
+#     cache-reuse ratio - a ratio whose denominator is "the prompts whose accounting closes" must not count a
+#     prompt whose accounting did not close;
+#   * a NATIVE DURATION was observed in a histogram without the correlation and the segment-completeness checks -
+#     an uncorrelated duration is somebody else's measurement;
+#   * a valid PARTIAL work counter was excluded just because the complete-prompt accounting was unavailable.
+#
+# Each measurement class has its OWN rule now, and the rules are here - one place, so they cannot drift.
+METRIC_HTTP = "http"
+METRIC_NATIVE_PROMPT_POSITION = "native_prompt_position"
+METRIC_NATIVE_EXECUTION_WORK = "native_execution_work"
+METRIC_NATIVE_DURATION = "native_duration"
+METRIC_CACHE_RESTORE = "cache_restore"
+METRIC_COMPLETE_CACHE_RATIO = "complete_cache_ratio"
+METRIC_PARTIAL_DIAGNOSTIC = "partial_diagnostic"
+# the engine's own generation counters: they need a correlated receipt and valid numbers, like the restoration's
+# outcome - they are not part of the prompt's accounting.
+METRIC_NATIVE_GENERATION = "native_generation"
+
+METRICS = (METRIC_HTTP, METRIC_NATIVE_PROMPT_POSITION, METRIC_NATIVE_EXECUTION_WORK, METRIC_NATIVE_DURATION,
+           METRIC_CACHE_RESTORE, METRIC_COMPLETE_CACHE_RATIO, METRIC_PARTIAL_DIAGNOSTIC, METRIC_NATIVE_GENERATION)
+
+
+def invocation_admission(inv, metric: str) -> bool:
+    """Whether a MEASUREMENT CLASS of this invocation may enter an authoritative aggregate (G2).
+
+    `inv` is an invocation receipt (serve/reqtelemetry/invocation.py) or the record itself.  The rules:
+
+      * HTTP            - the server's own numbers.  They stand on their own: a NATIVE measurement that was
+                          refused at the admission boundary does not make the server's own number a guess.
+      * PROMPT_POSITION - the engine's prompt positions (matched, reused, evaluated).  They need a CORRELATED
+                          receipt, valid numbers and an accounting that is not violated.
+      * EXECUTION_WORK  - the work counters (replayed, evaluation work).  They keep their OWN authority: an
+                          UNEVALUATED accounting (the complete prompt accounting was not available) does not
+                          exclude a measured work counter - a VIOLATED identity does.
+      * DURATION        - a native duration.  It is independently trustworthy when the receipt is CORRELATED to
+                          this invocation and the invocation is WHOLE (a batch slot's admission segment is not
+                          the whole invocation).  It does NOT depend on the token accounting: a broken token
+                          count does not turn a measured duration into a guess.
+      * CACHE_RESTORE   - the restoration's outcome: a correlated receipt and valid numbers.
+      * COMPLETE_RATIO  - the complete cache-reuse ratio: a correlated receipt, valid numbers and an account-
+                          ing that SATISFIED - not merely one that is not violated.
+      * PARTIAL         - the diagnostic evidence of a partial segment.  It is published as a diagnostic and
+                          never as the whole invocation.
+    """
+    if metric == METRIC_PARTIAL_DIAGNOSTIC:
+        return True
+    verified = correlation_of(inv) == CORRELATION_VERIFIED
+    valid = measurement_valid(inv)
+    partial = bool(getattr(inv, "native_partial", False))
+    state = inv.accounting_state()["state"]
+    if metric == METRIC_HTTP:
+        return True
+    if metric == METRIC_NATIVE_PROMPT_POSITION:
+        return verified and valid and not partial and state != "violated"
+    if metric == METRIC_NATIVE_EXECUTION_WORK:
+        return verified and valid and not partial and state != "violated"
+    if metric == METRIC_NATIVE_DURATION:
+        return verified and not partial
+    if metric == METRIC_CACHE_RESTORE:
+        return verified and valid and not partial
+    if metric == METRIC_NATIVE_GENERATION:
+        return verified and valid and not partial
+    if metric == METRIC_COMPLETE_CACHE_RATIO:
+        return verified and valid and not partial and state == "satisfied"
+    return False
+
+
+def field_admission(record, name: str, metric: str, inv=None) -> bool:
+    """Whether ONE measurement may enter an authoritative aggregate, for ONE metric class (G2).
+
+    The measurement itself must be a measurement (a whole, non-negative count); then the class rule decides.
+    """
+    target = inv if inv is not None else record
+    value = getattr(target, name, None)
+    if value is None:
+        return False
+    if name in TOKEN_FIELDS and not valid_token_count(value):
+        return False
+    if metric == METRIC_HTTP:
+        # the server's own number: it is a measurement of the request, whatever the engine's receipt says
+        return True
+    return invocation_admission(target, metric)

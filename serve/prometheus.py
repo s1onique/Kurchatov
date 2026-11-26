@@ -268,13 +268,24 @@ def telemetry(tel: dict, out: list, lab: str):
     # reuse accounting is complete), and the coverage says how much of the traffic that population is.
     reuse = tel.get("cache_reuse") or {}
     metric("strata_cache_reuse_ratio", "gauge",
-           "Reused prompt tokens over submitted prompt tokens, over the requests whose accounting is complete.",
-           reuse.get("ratio"))
+           "Reused prompt tokens over submitted prompt tokens, over the native invocations whose accounting is "
+           "complete.", reuse.get("ratio"))
     metric("strata_telemetry_accounting_coverage", "gauge",
-           "The share of the requests whose cache-reuse accounting is complete.", reuse.get("coverage"))
+           "The share of the NATIVE INVOCATIONS whose cache-reuse accounting is complete.",
+           reuse.get("coverage"))
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G2c): the eligible and the missing populations, and
+    # the physical HTTP request's own coverage beside the invocation's: the two describe different populations
+    # and are published separately.
+    metric("strata_telemetry_accounted_invocations", "gauge",
+           "The native invocations whose cache-reuse accounting is complete.", reuse.get("eligible_invocations"))
+    metric("strata_telemetry_missing_invocations", "gauge",
+           "The native invocations whose cache-reuse accounting is not complete (a lost receipt lowers the "
+           "coverage).", reuse.get("missing_invocations"))
+    metric("strata_telemetry_request_coverage", "gauge",
+           "The share of the PHYSICAL HTTP REQUESTS with at least one complete native accounting.",
+           reuse.get("request_coverage"))
     evidence = tel.get("evidence") or {}
     metric("strata_telemetry_evidence_dropped_total", "counter",
            "Terminal records the evidence writer could not queue.", evidence.get("dropped"))
     metric("strata_telemetry_evidence_failures_total", "counter",
            "Terminal records the evidence writer could not write.", evidence.get("errors"))
-

@@ -23,14 +23,27 @@ import json
 import time
 import uuid
 
+from serve.reqtelemetry.accounting import (CORRELATION_REJECTED, CORRELATION_UNAVAILABLE, CORRELATION_VERIFIED,
+                                           METRICS as METRIC_CLASSES)
+from serve.reqtelemetry.invocation import InvocationReceipt
 from serve.reqtelemetry.vocabulary import (CLIENT_ID_ALLOWED, CLIENT_ID_MAX, COMPLETE, DEFAULT_PAGE_SIZE,
                                          DEFAULT_RETENTION_BYTES, DEFAULT_RETENTION_RECORDS, DISPOSITIONS,
                                          DISPOSITION_BYPASSED, DISPOSITION_COLD_MISS, DISPOSITION_FULL_HIT,
                                          DISPOSITION_INVALIDATED, DISPOSITION_MATCH_WITHOUT_STATE,
                                          DISPOSITION_PARTIAL_HIT, DISPOSITION_UNKNOWN, INSTRUMENTATION_ERROR,
-                                         MAXIMUM_PAGE_SIZE, PARTIAL, SCHEMA_VERSION, SOURCES, SOURCE_CONVERSATION_CACHE,
+                                         MAXIMUM_PAGE_SIZE, MAX_INVOCATION_BYTES, MAX_INVOCATION_RECORDS, PARTIAL,
+                                         SCHEMA_VERSION, SOURCES, SOURCE_CONVERSATION_CACHE,
                                          SOURCE_MULTIPLE, SOURCE_NONE, SOURCE_RESIDENT_SLOT,
                                          SOURCE_RESTORED_CHECKPOINT, SOURCE_UNKNOWN, STATES, UNSUPPORTED)
+
+
+def _receipt_size(receipt) -> int:
+    """The UTF-8 BYTES of one invocation receipt: the bound of the per-request invocation history is a byte
+    budget, and a character count is not a byte count."""
+    try:
+        return len(json.dumps(receipt.to_dict(), ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return 0
 
 def valid_client_request_id(value) -> bool:
     """True when a client-supplied request id may be kept: printable ASCII, bounded, no whitespace or control
@@ -133,6 +146,15 @@ class RequestRecord:
         # AMENDMENT-02 (A9): the native figures cover only ONE segment of the invocation (a batch slot's
         # admission segment): they stay in the record as diagnostics and do not enter the authoritative totals.
         self.native_partial = False
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the per-invocation measurement receipts.
+        # Every native dispatch owns ONE receipt, and the measurements of one invocation never appear under the
+        # identity of another one.  The bounds are a COUNT and a BYTE budget; a receipt that does not fit is
+        # counted as a loss, never dropped silently.
+        self.invocations = []
+        self.invocations_total = 0            # how many native invocations this request dispatched
+        self.invocations_bytes = 0
+        self.invocations_dropped = 0
+        self.invocations_dropped_bytes = 0
         # AMENDMENT-02 (G1): the engine sent a measurement that is not a measurement (a negative count, a
         # fraction, a bool).  It was refused at the admission boundary and the record says so.
         self.measurements_invalid = False
@@ -284,6 +306,148 @@ class RequestRecord:
         if finish_reason is not None:
             self.finish_reason = finish_reason
 
+    # ------------------------------------------------------------------ the native invocations (G1)
+    def begin_invocation(self, invocation_id, ordinal=None, engine_instance_id=None, model_id=None,
+                         build_revision=None):
+        """The measurement receipt of ONE native dispatch (AMENDMENT-03, G1).
+
+        The receipt is bound to the invocation id, the ordinal, the engine instance, the model and the build
+        identity IMMEDIATELY BEFORE the dispatch, so the terminal evidence can be validated against exactly that
+        identity - and against nothing else.  The receipt is created empty: a measurement that the invocation
+        does not report stays null in it, and it never inherits a value from another invocation.
+        """
+        if invocation_id is None:
+            return None
+        existing = self.invocation_for(invocation_id)
+        if existing is not None:
+            return existing
+        receipt = InvocationReceipt(invocation_id,
+                                    int(ordinal) if ordinal else len(self.invocations) + 1,
+                                    engine_instance_id=engine_instance_id if engine_instance_id is not None
+                                    else self.engine_instance_id,
+                                    model_id=model_id if model_id is not None else self.model_id,
+                                    build_revision=build_revision if build_revision is not None
+                                    else self.build_revision)
+        self.invocations_total += 1
+        self._add_receipt(receipt)
+        return receipt
+
+    def invocation_for(self, invocation_id):
+        """The receipt of one invocation id, or None."""
+        if invocation_id is None:
+            return None
+        for receipt in self.invocations:
+            if receipt.invocation_id == invocation_id:
+                return receipt
+        return None
+
+    def _add_receipt(self, receipt):
+        """Keep the receipt inside the documented bounds; a receipt that does not fit is COUNTED as a loss."""
+        size = _receipt_size(receipt)
+        receipt._size = size
+        while self.invocations and (len(self.invocations) >= MAX_INVOCATION_RECORDS
+                                    or self.invocations_bytes + size > MAX_INVOCATION_BYTES):
+            dropped = self.invocations.pop(0)
+            dropped_size = getattr(dropped, "_size", 0)
+            self.invocations_bytes -= dropped_size
+            self.invocations_dropped += 1
+            self.invocations_dropped_bytes += dropped_size
+        self.invocations.append(receipt)
+        self.invocations_bytes += size
+        self._sync_parent()
+        self._merge_unavailable()
+        if self.invocations_dropped:
+            self.mark_unavailable("invocations",
+                                  f"{self.invocations_dropped} native invocation receipt(s) did not fit in the "
+                                  f"record's bounds ({MAX_INVOCATION_RECORDS} receipts, {MAX_INVOCATION_BYTES} bytes) "
+                                  f"and were dropped: the record does not show them")
+
+    def _sync_parent(self):
+        """The parent's native scalars describe ONE invocation - and only when that is unambiguous (G1).
+
+        With one native invocation the parent's fields are that invocation's fields (the predecessor's contract).
+        With more than one they would be a summary of several prompts, which is ambiguous: they are null, the
+        record says so, and the per-invocation receipts carry the numbers.
+        """
+        if self.invocations_total <= 1:
+            if len(self.invocations) == 1:
+                self._mirror_receipt(self.invocations[0])
+            self._merge_unavailable()
+            return
+        self._clear_native_fields()
+        self._merge_unavailable()
+
+    def _merge_unavailable(self):
+        """The receipts' own "why this is missing" reasons reach the record too: the operator reads the record."""
+        for receipt in self.invocations:
+            for field, reason in receipt.unavailable.items():
+                self.unavailable.setdefault(field, reason)
+
+    def _mirror_receipt(self, receipt):
+        """Copy one receipt's native measurements into the parent's fields (the unambiguous single-invocation
+        case).  A REJECTED receipt is never mirrored: its numbers belong to somebody else."""
+        if receipt.correlation == CORRELATION_REJECTED:
+            return
+        self.matched_prefix_tokens = receipt.matched_prefix_tokens
+        self.reused_prefix_tokens = receipt.reused_prefix_tokens
+        self.evaluated_tokens = receipt.evaluated_tokens
+        self.replayed_tokens = receipt.replayed_tokens
+        self.non_prefix_reused_tokens = receipt.non_prefix_reused_tokens
+        self.evaluation_work_tokens = receipt.evaluation_work_tokens
+        self.first_divergent_token_index = receipt.first_divergent_token_index
+        self.cache_source = receipt.cache_source
+        self.cache_disposition = receipt.cache_disposition
+        self.cache_reason_code = receipt.cache_reason_code
+        self.cache_restore_attempted = receipt.cache_restore_attempted
+        self.cache_restore_succeeded = receipt.cache_restore_succeeded
+        self.cache_restore_ms = receipt.cache_restore_ms
+        self.cache_recurrent_state = receipt.cache_recurrent_state
+        self.cache_attention_state = receipt.cache_attention_state
+        self.cache_checkpoint_state = receipt.cache_checkpoint_state
+        self.cache_invalidations = receipt.cache_invalidations
+        self.cache_evictions = receipt.cache_evictions
+        self.generated_tokens = receipt.generated_tokens
+        self.speculative_draft_tokens = receipt.speculative_draft_tokens
+        self.speculative_accepted_tokens = receipt.speculative_accepted_tokens
+        self.slot_id = receipt.slot_id
+        for name, value in receipt.timing.items():
+            self.set_timing(name, value, receipt.timing_authority.get(name, "native_engine"))
+        self.native_partial = receipt.native_partial
+        self.measurements_invalid = receipt.measurements_invalid
+        self.native_correlation = receipt.correlation
+
+    def _clear_native_fields(self):
+        """The parent's native fields are AMBIGUOUS (more than one invocation): they are null, not a guess."""
+        self.matched_prefix_tokens = None
+        self.reused_prefix_tokens = None
+        self.evaluated_tokens = None
+        self.replayed_tokens = None
+        self.non_prefix_reused_tokens = None
+        self.evaluation_work_tokens = None
+        self.first_divergent_token_index = None
+        self.cache_source = SOURCE_UNKNOWN
+        self.cache_disposition = DISPOSITION_UNKNOWN
+        self.cache_reason_code = None
+        self.cache_restore_attempted = None
+        self.cache_restore_succeeded = None
+        self.cache_restore_ms = None
+        self.cache_recurrent_state = None
+        self.cache_attention_state = None
+        self.cache_checkpoint_state = None
+        self.cache_invalidations = None
+        self.cache_evictions = None
+        self.generated_tokens = None
+        self.speculative_draft_tokens = None
+        self.speculative_accepted_tokens = None
+        self.slot_id = None
+        self.measurements_invalid = any(receipt.measurements_invalid for receipt in self.invocations)
+        for name in ("cache_lookup", "cache_restore", "prefill_wall", "decode_wall"):
+            self.timing.pop(name, None)
+            self.timing_authority.pop(name, None)
+        self.native_partial = any(receipt.native_partial for receipt in self.invocations)
+
+
+
     # ------------------------------------------------------------------ the accounting rules
     def seal(self, state=None, http_status=None, finish_reason=None, detail=None):
         """Close the record: the state it ended in, and the checks that describe how complete it is.
@@ -300,6 +464,11 @@ class RequestRecord:
         if detail is not None:
             self.outcome_detail = detail
         self.finished_at = time.time()
+        # AMENDMENT-03 (G1): every receipt closes with its OWN accounting, and the parent is re-synced: the
+        # parent's native scalars are the single invocation's, or null when the request dispatched more than one.
+        for receipt in self.invocations:
+            receipt.seal()
+        self._sync_parent()
         self.cache_disposition = self.derive_disposition()
         if self.state in ("cancelled", "failed", "rejected") and self.quality == COMPLETE:
             self.quality = PARTIAL
@@ -388,6 +557,10 @@ class RequestRecord:
                 "evictions": self.cache_evictions,
             },
             "timing_ms": {k: self.timing[k] for k in sorted(self.timing)},
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the per-invocation receipts.  Each one
+            # carries its own measurements, its own correlation and its own admission decisions; the parent's
+            # native scalars above are null when the request dispatched more than one invocation.
+            "invocations": [receipt.to_dict() for receipt in self.invocations],
             "generation": {
                 "requested_max_output_tokens": self.requested_max_output_tokens,
                 "effective_max_output_tokens": self.effective_max_output_tokens,
@@ -404,15 +577,54 @@ class RequestRecord:
                 # AMENDMENT-02 (G1): the record says whether its numbers may enter the authoritative aggregates,
                 # and why not when they may not.  The three decisions stay apart: the measurements are valid, the
                 # accounting is not violated, and the engine's receipt is correlated to this request.
-                "native_correlation": self.native_correlation,
+                "native_correlation": self.aggregate_correlation(),
                 "native_partial": self.native_partial,
                 "measurement_valid": self.measurement_valid(),
                 "aggregate_eligible": self.aggregate_eligible(),
                 "accounting": {"state": self.accounting.get("state", "unevaluated"),
                                "valid": self.accounting.get("valid"),
                                "problems": list(self.accounting.get("problems") or [])},
+                # AMENDMENT-03 (G2): the admission decisions are PER METRIC CLASS.  One global predicate for
+                # every measurement is what admitted an uncorrelated duration and an unevaluated accounting to
+                # aggregates they do not belong in.
+                "admission": {metric: self.metric_admission(metric) for metric in METRIC_CLASSES},
+                # AMENDMENT-03 (G1): the invocation history of this request and its bounds
+                "invocation_count": len(self.invocations),
+                "invocations_dispatched": self.invocations_total,
+                "invocations_dropped": self.invocations_dropped,
+                "invocation_bytes": self.invocations_bytes,
             },
         }
+
+    def aggregate_correlation(self) -> str:
+        """The record's correlation state: the receipts' OWN states (G1).
+
+        One receipt: its own state.  Several receipts: VERIFIED only when every one of them is verified; a
+        rejected receipt (a foreign or a stale one) makes the record's state rejected - the record then says
+        that something was wrong with the evidence.  Anything else is unavailable, never an asserted join.
+        """
+        if not self.invocations:
+            return self.native_correlation
+        states = [receipt.correlation for receipt in self.invocations]
+        if any(state == CORRELATION_REJECTED for state in states):
+            return CORRELATION_REJECTED
+        if all(state == CORRELATION_VERIFIED for state in states):
+            return CORRELATION_VERIFIED
+        return CORRELATION_UNAVAILABLE
+
+    def metric_admission(self, metric: str) -> bool:
+        """Whether this RECORD's own measurements of one metric class may enter an authoritative aggregate.
+
+        The record's native fields are the single invocation's - so they are admitted exactly when that
+        invocation is.  With more than one invocation the parent's native fields are null (ambiguous), so the
+        native classes are not admitted at the record level: each receipt decides for itself.
+        """
+        from serve.reqtelemetry import accounting
+        if metric == accounting.METRIC_HTTP:
+            return True
+        if self.invocations_total > 1:
+            return False
+        return accounting.invocation_admission(self, metric)
 
     # ------------------------------------------------------------------ the admission decisions
     def measurement_valid(self) -> bool:

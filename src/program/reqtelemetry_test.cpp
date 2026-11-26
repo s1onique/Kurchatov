@@ -184,6 +184,22 @@ int main() {
         check(check_accounting(mismatch_state, true).ok, "a match deeper than the reuse is legal");
     }
 
+    {   // 7. ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G4): the ERROR evidence carries what was
+        // measured: the invocation's id, the restoration that was tried, its outcome and the time it took.  The
+        // engine's failure is still a failure; the evidence is not a second outcome.
+        RequestTelemetry t;
+        t.request_id = "abc123";
+        t.restore_attempted = true;
+        t.restore_succeeded = false;
+        t.restore_ms = 12.5;
+        t.lookup_ms = 3.0;
+        const std::string s = encode(t);
+        check(value_of(s, "rid") == "abc123", "the error evidence names the invocation");
+        check(value_of(s, "restore") == "failed", "the error evidence says the restoration failed");
+        check(value_of(s, "restore_ms") == "12.5", "the error evidence keeps the measured restoration duration");
+        check(value_of(s, "lookup_ms") == "3.0", "the error evidence keeps the measured lookup duration");
+    }
+
     if (failures == 0) {
         std::printf("reqtelemetry_test: all checks passed\n");
         return 0;

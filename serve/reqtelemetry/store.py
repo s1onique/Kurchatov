@@ -10,10 +10,12 @@ import json
 import threading
 import uuid
 
+from serve.reqtelemetry import accounting as ACCOUNTING
 from serve.reqtelemetry.metrics import DURATION_BUCKETS, DURATION_METRICS, observe_duration
 from serve.reqtelemetry.record import decode_cursor, encode_cursor
 from serve.reqtelemetry.vocabulary import (CURSOR_TTL_S, DEFAULT_PAGE_SIZE, DEFAULT_RETENTION_BYTES,
-                                         DEFAULT_RETENTION_RECORDS, INSTRUMENTATION_ERROR, MAXIMUM_PAGE_SIZE)
+                                         DEFAULT_RETENTION_RECORDS, INSTRUMENTATION_ERROR, MAXIMUM_PAGE_SIZE,
+                                         MAX_ENGINE_INSTANCES)
 
 class TelemetryStore:
     """The bounded store of recent request records, and the process-lifetime counters beside it.
@@ -52,7 +54,22 @@ class TelemetryStore:
             "requests_accepted": 0, "requests_terminal_completed": 0, "requests_terminal_cancelled": 0,
             "requests_terminal_failed": 0, "requests_terminal_rejected": 0,
             "receipts_created": 0, "receipt_delivery_failures": 0,
+            # AMENDMENT-03 (G5): the loss of the EVIDENCE delivery is its own domain: the receipt may be in the
+            # store while the evidence line never reached the disk.  The two are not the same failure.
+            "evidence_delivery_failures": 0,
             "records_aggregate_eligible": 0, "records_aggregate_excluded": 0,
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G2c): the COVERAGE of the accounting, with
+            # the eligible population and the missing population beside it.  The population is the native
+            # INVOCATION: a receipt that never arrived is in the missing population, so a lost receipt lowers the
+            # coverage instead of silently improving it.
+            "native_invocations": 0, "native_invocations_accounted": 0, "native_invocations_missing": 0,
+            "requests_with_complete_accounting": 0,
+            # the positions of the invocations whose prompt domain is NOT the request's own prompt domain (a
+            # recovery dispatch that sent another prompt): they are work, never the request's prompt coverage
+            "native_positions_matched_total": 0, "native_positions_reused_total": 0,
+            "native_positions_evaluated_total": 0,
+            # the evictions of an engine whose identity is unknown: they cannot be attributed to a domain
+            "cache_evictions_unattributed": 0,
         }
         # the engine's own eviction counter, per engine instance: it restarts with the engine, and a counter that
         # falls would be a counter that lies (G6)
@@ -86,6 +103,12 @@ class TelemetryStore:
         with self.lock:
             self.counters["receipt_delivery_failures"] += 1
 
+    def evidence_failed(self):
+        """The evidence line of a receipt was REFUSED by the writer: the receipt is in the store, the evidence
+        line never reached the disk.  It is its own domain (G5)."""
+        with self.lock:
+            self.counters["evidence_delivery_failures"] += 1
+
     def add(self, record: RequestRecord) -> dict:
         """Seal the record, keep it, and count it.  Returns the record's dict (what the API hands out)."""
         with self.lock:
@@ -112,11 +135,13 @@ class TelemetryStore:
         """The process-lifetime counters.  A counter only moves when a measurement exists: an unavailable
         measurement is not counted as zero.
 
-        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G1): a measurement enters an authoritative aggregate
-        only when it is VALID, its ACCOUNTING is not violated and - for the engine's own numbers - its RECEIPT is
-        correlated to this request.  A record that fails any of these stays in the store as a diagnostic receipt and
-        contributes NOTHING to the totals: an invalid or unattributed measurement never distorts them, and a counter
-        never falls because one was admitted.
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1, G2): the counters are fed by the record's own
+        HTTP-owned measurements and by the PER-INVOCATION receipts - never by a summary of several invocations.
+        A native measurement is counted only when ITS OWN metric class admits it (serve/reqtelemetry/accounting.py):
+        the prompt positions need a correlated receipt and an accounting that is not violated, the work counters
+        keep their own authority, the durations need a correlated WHOLE invocation, and the complete cache-reuse
+        ratio needs an accounting that SATISFIED.  The same native work is never counted twice: a measurement that
+        the parent mirrors from its single receipt is counted from the receipt, not from the parent.
         """
         c = self.counters
         c["requests_total"] += 1
@@ -128,74 +153,126 @@ class TelemetryStore:
         elif state in ("failed", "rejected"):
             c["requests_failed"] += 1
         quality = data["measurement_quality"]
-        # the three decisions, kept apart (AMENDMENT-02, G1): the numbers are valid, the accounting holds, and the
-        # engine's receipt is correlated to this request.
-        valid = bool(quality.get("measurement_valid"))
-        accounting_ok = (quality.get("accounting") or {}).get("state") != "violated"
-        correlated = quality.get("native_correlation") == "verified" and not quality.get("native_partial")
-        eligible = bool(quality.get("aggregate_eligible"))
-        prompt, gen, cache = data["prompt"], data["generation"], data["cache"]
-        # the tokens the SERVER measured (the submitted prompt) and the tokens the ENGINE measured (the match, the
-        # reuse, the evaluation): the engine's numbers need a correlated receipt, the server's do not.
-        for key, counter, native in (("submitted_tokens", "prompt_tokens_submitted", False),
-                                     ("matched_prefix_tokens", "prompt_tokens_matched", True),
-                                     ("reused_prefix_tokens", "prompt_tokens_reused", True),
-                                     ("evaluated_tokens", "prompt_tokens_evaluated", True),
-                                     ("replayed_tokens", "prompt_tokens_replayed", True),
-                                     ("evaluation_work_tokens", "prompt_evaluation_work_tokens", True)):
-            value = prompt.get(key)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                continue                            # not a measurement: it is not counted
-            if native:
-                if not (valid and accounting_ok and correlated):
-                    continue                        # unattributed or invalid: not an authoritative number
-            elif not (valid and accounting_ok):
-                continue                            # the server's own number is valid, or it is not counted
-            c[counter] += value
-        for key, counter in (("generated_tokens", "generated_tokens"), ("emitted_tokens", "emitted_tokens"),
-                             ("speculative_draft_tokens", "speculative_draft_tokens"),
-                             ("speculative_accepted_tokens", "speculative_accepted_tokens")):
-            value = gen.get(key)
-            # the engine's own generation counters need a correlated receipt too
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                continue
-            if key in ("generated_tokens", "speculative_draft_tokens", "speculative_accepted_tokens") \
-                    and not (valid and accounting_ok and correlated):
-                continue
-            if key == "emitted_tokens" and not (valid and accounting_ok):
-                continue
-            c[counter] += value
-        if cache.get("restore_attempted") is True and valid and accounting_ok and correlated:
-            c["cache_restore_attempts"] += 1
-            if cache.get("restore_succeeded") is False:
-                c["cache_restore_failures"] += 1
-        evictions = cache.get("evictions")
-        if isinstance(evictions, int) and not isinstance(evictions, bool) and valid and accounting_ok and correlated:
-            instance = data["identity"].get("engine_instance_id") or "unknown"
-            previous = self._evictions_by_engine.get(instance, 0)
-            # AMENDMENT-02 (G5): the engine's own counter is a HIGH-WATER MARK per engine instance: it only goes
-            # up inside one instance, and a smaller reading (a counter that fell, or a receipt that arrived out of
-            # order) never lowers the mark and never lowers the total.
-            if evictions >= previous:
-                c["cache_evictions"] += evictions - previous
-                self._evictions_by_engine[instance] = evictions
-        submitted = prompt.get("submitted_tokens")
-        reused = prompt.get("reused_prefix_tokens")
-        # the ELIGIBLE population of the cache-reuse ratio: the requests whose reuse accounting is complete AND
-        # correlated.  Its numerator and denominator come from this population only, so the ratio stays in [0, 1].
-        if (isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0
-                and isinstance(reused, int) and not isinstance(reused, bool) and 0 <= reused <= submitted
-                and valid and accounting_ok and correlated):
-            c["requests_reuse_accounted"] += 1
-            c["prompt_tokens_reused_eligible"] += reused
-            c["prompt_tokens_submitted_eligible"] += submitted
-        if data["measurement_quality"]["state"] == INSTRUMENTATION_ERROR:
+        prompt, gen = data["prompt"], data["generation"]
+        accounting_state = (quality.get("accounting") or {}).get("state")
+        # the HTTP-owned measurements: the server's own numbers.  They do not depend on the engine's receipt,
+        # but they do depend on the token accounting not being broken (the identity involves the submitted
+        # prompt, which the server measured).
+        if accounting_state != "violated":
+            submitted = prompt.get("submitted_tokens")
+            if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0:
+                c["prompt_tokens_submitted"] += submitted
+            emitted = gen.get("emitted_tokens")
+            if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
+                c["emitted_tokens"] += emitted
+        # the native measurements: every invocation's own receipt decides for itself
+        request_submitted = prompt.get("submitted_tokens")
+        accounted_request = False
+        for invocation in data.get("invocations") or []:
+            if self._count_invocation_locked(c, invocation, request_submitted):
+                accounted_request = True
+        if accounted_request:
+            c["requests_with_complete_accounting"] += 1
+        if quality.get("state") == INSTRUMENTATION_ERROR:
             c["instrumentation_errors"] += 1
-        if eligible:
+        if quality.get("aggregate_eligible"):
             c["records_aggregate_eligible"] += 1
         else:
             c["records_aggregate_excluded"] += 1
         self._observe_locked(data)
+
+    def _count_invocation_locked(self, c, invocation, request_submitted) -> bool:
+        """One native invocation's receipt, counted under its OWN metric classes (G1, G2).
+
+        True when this invocation's accounting SATISFIED - that is, when it belongs to the eligible population of
+        the complete cache-reuse ratio.
+        """
+        iq = invocation.get("measurement_quality") or {}
+        admission = iq.get("admission") or {}
+        iprompt = invocation.get("prompt") or {}
+        icache = invocation.get("cache") or {}
+        igen = invocation.get("generation") or {}
+        c["native_invocations"] += 1
+        # the eligible and the missing populations of the accounting coverage (G2c)
+        eligible = bool(admission.get(ACCOUNTING.METRIC_COMPLETE_CACHE_RATIO))
+        if eligible:
+            c["native_invocations_accounted"] += 1
+        else:
+            c["native_invocations_missing"] += 1
+        # the prompt positions: the REQUEST's own prompt domain only.  An invocation that worked on another
+        # prompt (a recovery dispatch) is work, never this prompt's coverage.  An invocation whose own prompt
+        # length was not measured cannot be a different domain: it stays in the request's domain.
+        same_domain = (request_submitted is None or iprompt.get("submitted_tokens") is None
+                       or iprompt.get("submitted_tokens") == request_submitted)
+        if admission.get(ACCOUNTING.METRIC_NATIVE_PROMPT_POSITION):
+            for key, counter, total in (("matched_prefix_tokens", "prompt_tokens_matched",
+                                         "native_positions_matched_total"),
+                                        ("reused_prefix_tokens", "prompt_tokens_reused",
+                                         "native_positions_reused_total"),
+                                        ("evaluated_tokens", "prompt_tokens_evaluated",
+                                         "native_positions_evaluated_total")):
+                value = iprompt.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    continue
+                c[total] += value
+                if same_domain:
+                    c[counter] += value
+        # the work counters: they keep their own authority - an UNEVALUATED accounting does not exclude them
+        if admission.get(ACCOUNTING.METRIC_NATIVE_EXECUTION_WORK):
+            for key, counter in (("replayed_tokens", "prompt_tokens_replayed"),
+                                 ("evaluation_work_tokens", "prompt_evaluation_work_tokens")):
+                value = iprompt.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    c[counter] += value
+        # the engine's own generation counters
+        if admission.get(ACCOUNTING.METRIC_NATIVE_GENERATION):
+            for key, counter in (("generated_tokens", "generated_tokens"),
+                                 ("speculative_draft_tokens", "speculative_draft_tokens"),
+                                 ("speculative_accepted_tokens", "speculative_accepted_tokens")):
+                value = igen.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    c[counter] += value
+        # the restoration's outcome
+        if admission.get(ACCOUNTING.METRIC_CACHE_RESTORE) and icache.get("restore_attempted") is True:
+            c["cache_restore_attempts"] += 1
+            if icache.get("restore_succeeded") is False:
+                c["cache_restore_failures"] += 1
+        # the engine's own eviction counter: a HIGH-WATER MARK per engine instance (G5)
+        evictions = icache.get("evictions")
+        if isinstance(evictions, int) and not isinstance(evictions, bool) and evictions >= 0 \
+                and admission.get(ACCOUNTING.METRIC_NATIVE_PROMPT_POSITION):
+            self._count_evictions_locked(c, (invocation.get("identity") or {}).get("engine_instance_id"), evictions)
+        # the complete cache-reuse ratio: the numerator and the denominator come from THIS invocation, so the
+        # ratio stays in [0, 1] and the population is the invocations whose accounting closed
+        if eligible:
+            submitted = iprompt.get("submitted_tokens")
+            reused = iprompt.get("reused_prefix_tokens")
+            if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0 \
+                    and isinstance(reused, int) and not isinstance(reused, bool) and 0 <= reused <= submitted:
+                c["requests_reuse_accounted"] += 1
+                c["prompt_tokens_reused_eligible"] += reused
+                c["prompt_tokens_submitted_eligible"] += submitted
+        return eligible
+
+    def _count_evictions_locked(self, c, instance, evictions):
+        """The engine's eviction counter, per engine instance (G5).
+
+        AMENDMENT-03 (G5): an engine whose identity is UNKNOWN is not merged into a domain: its counter cannot be
+        attributed to an engine process, so it is published as unattributed instead of pretending that two
+        different engines are one.  The retired instances' state is BOUNDED: the oldest mark goes when the bound
+        is reached, so a long run does not grow the state without limit.
+        """
+        if not instance:
+            c["cache_evictions_unattributed"] += evictions
+            return
+        previous = self._evictions_by_engine.get(instance, 0)
+        if evictions >= previous:
+            c["cache_evictions"] += evictions - previous
+            self._evictions_by_engine[instance] = evictions
+        while len(self._evictions_by_engine) > MAX_ENGINE_INSTANCES:
+            oldest = next(iter(self._evictions_by_engine))
+            del self._evictions_by_engine[oldest]
+
 
     def _observe_locked(self, data):
         """The duration histograms: what the Prometheus exporter reads.
@@ -204,10 +281,29 @@ class TelemetryStore:
         timings are milliseconds; the conversion to seconds happens ONCE, in serve/reqtelemetry/metrics.py, and the
         histogram keeps the real cumulative bucket counts (a bucket says how many observations were at or below it -
         not the total count).
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G2b): the durations are admitted by their OWN class.
+        The HTTP-owned durations (the queue wait, the total, the time to the first byte) are the server's own
+        measurements and are always observed.  A NATIVE duration is observed only from the invocation receipt that
+        measured it, and only when that receipt is CORRELATED to its invocation and covers the WHOLE invocation:
+        an uncorrelated duration is somebody else's measurement, and a batch slot's admission segment is not the
+        whole invocation.  The parent's copy of a native duration is not observed again - it is the receipt's
+        measurement, and it is observed once, there.
         """
         timing = data["timing_ms"]
+        authority = (data["measurement_quality"] or {}).get("timing_authority") or {}
         for name, metric in DURATION_METRICS:
+            if authority.get(name) == "native_engine":
+                continue                        # the receipt's own duration: it is observed there, once
             observe_duration(self.histograms, metric, timing.get(name))
+        for invocation in data.get("invocations") or []:
+            iq = invocation.get("measurement_quality") or {}
+            admission = iq.get("admission") or {}
+            if not admission.get(ACCOUNTING.METRIC_NATIVE_DURATION):
+                continue                        # not correlated, or only a segment of the invocation
+            itiming = invocation.get("timing_ms") or {}
+            for name, metric in DURATION_METRICS:
+                observe_duration(self.histograms, metric, itiming.get(name))
 
     # ------------------------------------------------------------------ reading
     def get(self, request_id):
@@ -226,19 +322,20 @@ class TelemetryStore:
         simply is not in the next page - the cursor never skips back to a newer record.
         """
         limit = max(1, min(int(limit), MAXIMUM_PAGE_SIZE))
-        after = None
-        if cursor:
-            after = decode_cursor(cursor, self.server_instance_id, CURSOR_TTL_S)
-            with self.lock:
-                newest = self.seq
-                oldest = self.records[0][0] if self.records else None
+        # AMENDMENT-03 (G5): the cursor's validation and the page come from ONE snapshot of the store.  The
+        # validation used to read the retention bounds, release the lock and only then read the rows: a record
+        # evicted in between made the validation and the page disagree about the same collection.
+        after = decode_cursor(cursor, self.server_instance_id, CURSOR_TTL_S) if cursor else None
+        with self.lock:
+            newest = self.seq
+            oldest = self.records[0][0] if self.records else None
             # AMENDMENT-02 (G6): a cursor that names a record this store never wrote, or one whose page was already
             # evicted, is REFUSED.  It is never treated as an exhausted collection: the operator sees an error.
-            if after > newest:
-                raise ValueError("the cursor names a record this server never wrote")
-            if oldest is not None and after < oldest - 1:
-                raise ValueError("the records of this page are no longer retained")
-        with self.lock:
+            if after is not None:
+                if after > newest:
+                    raise ValueError("the cursor names a record this server never wrote")
+                if oldest is not None and after < oldest - 1:
+                    raise ValueError("the records of this page are no longer retained")
             rows = [data for _, data, _ in self.records]
         rows.reverse()                                   # newest first
         out, last = [], None
@@ -281,11 +378,23 @@ class TelemetryStore:
                     "receipts_created": self.counters["receipts_created"],
                     "receipt_delivery_failures": self.counters["receipt_delivery_failures"],
                 },
-                # the cache-reuse ratio, with BOTH of its numbers and the coverage of the population it covers
+                # the cache-reuse ratio, with BOTH of its numbers and the coverage of the population it covers.
+                # AMENDMENT-03 (G2c): the population is the native INVOCATION whose accounting closed; the
+                # missing population is published beside it, so a lost receipt lowers the coverage instead of
+                # silently improving it.  The physical HTTP request's own coverage is published separately.
                 "cache_reuse": {"ratio": round(reused / submitted, 6) if submitted else None,
                                 "reused_tokens": reused, "submitted_tokens": submitted,
                                 "eligible_requests": eligible, "requests": total,
-                                "coverage": round(eligible / total, 6) if total else None},
+                                "eligible_invocations": self.counters["native_invocations_accounted"],
+                                "missing_invocations": self.counters["native_invocations_missing"],
+                                "invocations": self.counters["native_invocations"],
+                                "requests_with_complete_accounting":
+                                    self.counters["requests_with_complete_accounting"],
+                                "coverage": round(self.counters["native_invocations_accounted"]
+                                                  / self.counters["native_invocations"], 6)
+                                if self.counters["native_invocations"] else None,
+                                "request_coverage": round(self.counters["requests_with_complete_accounting"]
+                                                          / total, 6) if total else None},
                 "histograms": {k: {"sum": v["sum"], "count": v["n"],
                                    "buckets": {str(edge): v["buckets"][i]
                                                for i, edge in enumerate(DURATION_BUCKETS)}}

@@ -184,6 +184,10 @@ class Monotonicity(unittest.TestCase):
         seen = []
         for evictions in (10, 8, 11):
             record = RequestRecord(f"r{store.seq + 1}")
+            # AMENDMENT-03 (G5): the engine's eviction counter belongs to an engine INSTANCE.  The mark is kept
+            # per instance; an engine whose identity is unknown is not merged into a domain (it is published as
+            # unattributed instead - see test_telemetry_amendment03).
+            record.engine_instance_id = "engine-a"
             apply_engine(record, {"rid": record.request_id, "evictions": evictions})
             store.add(record.seal("completed", 200))
             seen.append(store.summary()["counters"]["cache_evictions"])
@@ -320,7 +324,13 @@ class EvidenceWriter(unittest.TestCase):
             log = EvidenceLog(path)
             log._handle = None
             self.assertFalse(log.write({"a": 1}))
-            self.assertEqual(log.counters()["failed_records"], 1)
+            # AMENDMENT-03 (G3): a REFUSED write is not an accepted record, so it is not a "failed accepted
+            # record" either: it has its own domain (the initialization failure that caused it).
+            counters = log.counters()
+            self.assertEqual(counters["failed_records"], 0)
+            self.assertEqual(counters["refused_records"], 1)
+            self.assertEqual(counters["initialization_failures"], 1)
+            self.assertEqual(counters["submitted_records"], 1)
             log.close()
 
 

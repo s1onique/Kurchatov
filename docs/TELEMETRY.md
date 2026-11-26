@@ -23,13 +23,14 @@ One record per **physical request attempt**. Two requests that carry the same `X
 
 ```json
 {
-  "schema_version": "strata.request-telemetry/1",
+  "schema_version": "strata.request-telemetry/2",
   "identity": {
     "request_id": "9ca8c311a98448e5a10827dd9cac6b7b",
     "client_request_id": "my-trace-42",
     "engine_instance_id": "pid-8123-gen-2",
     "server_instance_id": "c14ecbc49c694f2fbd08b10cfdbdcd7b",
-    "engine_invocation_id": "9ca8c311a98448e5a10827dd9cac6b7b",
+    "engine_invocation_id": "5d0f7b1c2a9e4f6b8c3d1e0f5a6b7c8d",
+    "engine_invocation_ordinal": 1,
     "slot_id": 0,
     "model_id": "qwen3.8-flash",
     "build_revision": "5b0e549b762d"
@@ -38,21 +39,56 @@ One record per **physical request attempt**. Two requests that carry the same `X
                 "finish_reason": "stop"},
   "prompt": {"rendered_tokens": 246, "submitted_tokens": 246, "matched_prefix_tokens": 200,
              "reused_prefix_tokens": 200, "evaluated_tokens": 46, "replayed_tokens": 0,
-             "non_prefix_reused_tokens": null, "evaluation_work_tokens": 46,
+             "non_prefix_reused_tokens": 0, "evaluation_work_tokens": 46,
              "first_divergent_token_index": null},
   "cache": {"source": "conversation_cache", "disposition": "partial_hit", "reason_code": "exact_match",
             "restore_attempted": true, "restore_succeeded": true, "restore_ms": 3.2},
   "timing_ms": {"prefill_wall": 41.5, "decode_wall": 210.0, "http_first_token": 55.2, "total": 268.0},
   "generation": {"requested_max_output_tokens": 512, "effective_max_output_tokens": 512,
-                 "generated_tokens": 63, "emitted_tokens": 63,
+                 "generated_tokens": 63, "emitted_tokens": null,
                  "speculative_draft_tokens": 31, "speculative_accepted_tokens": 24},
-  "measurement_quality": {"state": "complete", "unavailable_fields": {}, "timing_authority": {...}}
+  "invocations": [
+    {"identity": {"engine_invocation_id": "5d0f7b1c2a9e4f6b8c3d1e0f5a6b7c8d", "ordinal": 1,
+                  "engine_instance_id": "pid-8123-gen-2", "model_id": "qwen3.8-flash",
+                  "build_revision": "5b0e549b762d", "slot_id": 0},
+     "state": "completed",
+     "prompt": {"submitted_tokens": 246, "matched_prefix_tokens": 200, "reused_prefix_tokens": 200,
+                "evaluated_tokens": 46, "evaluation_work_tokens": 46},
+     "timing_ms": {"cache_lookup": 2.1, "cache_restore": 3.2, "prefill_wall": 41.5, "decode_wall": 210.0},
+     "measurement_quality": {"native_correlation": "verified", "native_partial": false,
+                             "measurement_valid": true,
+                             "accounting": {"state": "satisfied", "valid": true, "problems": []},
+                             "admission": {"complete_cache_ratio": true, "native_duration": true, ...}}}
+  ],
+  "measurement_quality": {"state": "partial", "unavailable_fields": {"generation.emitted_tokens": "..."},
+                          "timing_authority": {...}}
 }
 ```
 
-The schema is [`docs/telemetry/strata-request-telemetry-1.schema.json`](telemetry/strata-request-telemetry-1.schema.json)
+The schema is [`docs/telemetry/strata-request-telemetry-2.schema.json`](telemetry/strata-request-telemetry-2.schema.json)
 (JSON Schema draft 2020-12). It is checked by an executable test, so the contract on the wire and the contract in
 the code cannot drift apart.
+
+### The native invocations
+
+One physical HTTP request can dispatch the engine **more than once**: a thinking budget wraps the reasoning up and
+continues, a recovery sends the request again. Every dispatch is its own **invocation**, and every invocation owns
+its own measurements, in the record's `invocations` section (ACT-...-AMENDMENT-03, G1).
+
+* The invocation's id is generated immediately before the dispatch, and the engine echoes it back on its `DONE`
+  line. The id, the ordinal, the engine instance, the model and the build revision are bound to the invocation
+  **before** the dispatch, and the terminal evidence is checked against exactly that identity.
+* A measurement of one invocation is **never** published under the identity of another one. A receipt that carries
+  another invocation's id is refused, and the invocation that was waited for keeps its own numbers - a missing
+  measurement stays `null`.
+* The record's own native fields (`prompt.matched_prefix_tokens`, `cache_lookup`, ...) describe **one** invocation:
+  the request's, when there was only one. With more than one they would be a summary of several prompts, so they
+  are `null` and the per-invocation receipts carry the numbers.
+* The request's prompt domain is the prompt the HTTP request carried. An invocation's prompt domain is the prompt
+  **that dispatch** gave the engine. The positions of two different prompts are never added together and never
+  published as one prompt's coverage.
+* The history is bounded: at most 8 receipts and 32 KiB per request. A receipt that does not fit is **counted as a
+  loss** (`measurement_quality.invocations_dropped`) and the record says so - it is never dropped silently.
 
 ### Identity
 
@@ -154,6 +190,28 @@ correlated** stays in the collection as a diagnostic receipt and contributes **n
 measurement the server owns (the submitted prompt) stays eligible even when the engine's receipt could not be
 correlated.
 
+### The admission is per measurement class
+
+One rule for every measurement is too coarse: an uncorrelated duration and an accounting that did not close are
+different problems, and each class has its own rule (ACT-...-AMENDMENT-03, G2). The record's and every
+invocation's `measurement_quality.admission` says, per class, whether the measurement may enter the authoritative
+totals:
+
+| Class | It needs |
+|---|---|
+| `http` | the measurement itself. The server's own numbers stand on their own. |
+| `native_prompt_position` | a correlated receipt, valid numbers, and an accounting that is not violated. |
+| `native_execution_work` | a correlated receipt and valid numbers. An accounting that could not be **evaluated** does not exclude a measured work counter; a **violated** one does. |
+| `native_duration` | a correlated receipt and a **whole** invocation. A duration is independently trustworthy: a broken token count does not turn it into a guess, and a batch slot's admission segment is not the whole invocation. |
+| `cache_restore` | a correlated receipt and valid numbers. |
+| `complete_cache_ratio` | a correlated receipt, valid numbers, and an accounting that **satisfied**. The ratio's denominator is "the prompts whose accounting closes". |
+| `partial_diagnostic` | nothing: a partial segment's evidence is published as a diagnostic and never as the whole. |
+
+The **coverage** of the accounting is published with both populations: the native invocations whose accounting
+closed (`eligible_invocations`) and the ones whose receipt never arrived (`missing_invocations`). A lost receipt
+lowers the coverage - it never improves it. The physical HTTP request's own coverage is published beside it
+(`request_coverage`): the two describe different populations.
+
 ## The HTTP API
 
 Read-only, metadata-only, and on the existing port. No new service, no database, no extra listener.
@@ -243,7 +301,14 @@ strata_requests_in_flight      strata_telemetry_retained_records
 strata_requests_queued         strata_telemetry_retained_bytes
 strata_telemetry_available     strata_cache_reuse_ratio
 strata_telemetry_accounting_coverage
+strata_telemetry_accounted_invocations
+strata_telemetry_missing_invocations
+strata_telemetry_request_coverage
 ```
+
+`strata_telemetry_accounting_coverage` is the share of the **native invocations** whose cache-reuse accounting is
+complete; `strata_telemetry_request_coverage` is the share of the **physical HTTP requests** with at least one
+complete native accounting. The two describe different populations and are published separately.
 
 The labels are bounded enumerations only. There is **no** request id, session, engine instance, prompt, user,
 error message or dynamic model identity in a label.

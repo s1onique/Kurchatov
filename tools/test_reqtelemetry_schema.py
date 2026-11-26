@@ -31,7 +31,7 @@ def main() -> int:
             failures.append(what)
 
     # 1. the schema on disk IS the schema in the code
-    on_disk = json.loads((ROOT / "docs/telemetry/strata-request-telemetry-1.schema.json").read_text())
+    on_disk = json.loads((ROOT / "docs/telemetry/strata-request-telemetry-2.schema.json").read_text())
     check(on_disk == SCHEMA, "the schema file and the code's schema are the same contract")
 
     # 2. a record the server produces validates

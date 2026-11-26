@@ -424,7 +424,10 @@ class Evidence(unittest.TestCase):
                        "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens",
                        "unavailable_fields", "timing_authority", "first_token_includes_reasoning",
                        "native_correlation", "native_partial", "measurement_valid", "aggregate_eligible",
-                       "accounting", "schema_version", "seq"}
+                       "accounting", "schema_version", "seq",
+                       # AMENDMENT-03 (G1, G2): the per-invocation receipts and the per-metric admission
+                       "invocation_id", "ordinal", "invocations", "admission", "invocation_count",
+                       "invocations_dispatched", "invocations_dropped", "invocation_bytes"}
             for section in record.values():
                 if isinstance(section, dict):
                     for key in section:

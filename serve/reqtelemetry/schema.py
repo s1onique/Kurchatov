@@ -23,11 +23,11 @@ def _str_or_null(max_length=None):
 # executable test, so the contract on the wire and the contract in the code cannot drift apart.
 SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-1.json",
+    "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-2.json",
     "title": "Strata per-request telemetry record",
     "type": "object",
     "required": ["schema_version", "identity", "lifecycle", "prompt", "cache", "timing_ms", "generation",
-                 "measurement_quality"],
+                 "measurement_quality", "invocations"],
     "additionalProperties": False,
     "properties": {
         "schema_version": {"const": SCHEMA_VERSION},
@@ -138,6 +138,13 @@ SCHEMA = {
                 "native_partial": {"type": "boolean"},
                 "measurement_valid": {"type": "boolean"},
                 "aggregate_eligible": {"type": "boolean"},
+                # AMENDMENT-03 (G2): the admission decisions are PER METRIC CLASS, and the invocation history's
+                # own numbers are published beside them
+                "admission": {"type": "object", "additionalProperties": {"type": "boolean"}},
+                "invocation_count": {"type": "integer", "minimum": 0},
+                "invocations_dispatched": {"type": "integer", "minimum": 0},
+                "invocations_dropped": {"type": "integer", "minimum": 0},
+                "invocation_bytes": {"type": "integer", "minimum": 0},
                 "accounting": {
                     "type": "object",
                     "required": ["state", "valid", "problems"],
@@ -147,6 +154,55 @@ SCHEMA = {
                         "valid": {"type": ["boolean", "null"]},
                         "problems": {"type": "array", "items": {"type": "string"}},
                     },
+                },
+            },
+        },
+    },
+}
+
+
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the per-invocation receipts are part of the
+# contract.  They are built from the SAME sub-schemas as the record's own sections, so the two cannot drift.
+SCHEMA["properties"]["invocations"] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "required": ["identity", "state", "prompt", "cache", "timing_ms", "generation", "measurement_quality"],
+        "additionalProperties": False,
+        "properties": {
+            "identity": {
+                "type": "object",
+                "required": ["engine_invocation_id", "ordinal", "engine_instance_id", "model_id", "build_revision",
+                             "slot_id"],
+                "additionalProperties": False,
+                "properties": {
+                    "engine_invocation_id": _str_or_null(),
+                    "ordinal": {"type": ["integer", "null"], "minimum": 1},
+                    "engine_instance_id": _str_or_null(),
+                    "model_id": _str_or_null(),
+                    "build_revision": _str_or_null(),
+                    "slot_id": {"type": ["integer", "null"], "minimum": 0},
+                },
+            },
+            "state": {"enum": ["running", "completed", "cancelled", "failed", "rejected"]},
+            "prompt": SCHEMA["properties"]["prompt"],
+            "cache": SCHEMA["properties"]["cache"],
+            "timing_ms": SCHEMA["properties"]["timing_ms"],
+            "generation": SCHEMA["properties"]["generation"],
+            "measurement_quality": {
+                "type": "object",
+                "required": ["state", "unavailable_fields", "timing_authority", "native_correlation",
+                             "native_partial", "measurement_valid", "accounting", "admission"],
+                "additionalProperties": False,
+                "properties": {
+                    "state": {"enum": [COMPLETE, PARTIAL, UNSUPPORTED, INSTRUMENTATION_ERROR]},
+                    "unavailable_fields": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "timing_authority": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "native_correlation": {"enum": ["verified", "unavailable", "rejected", "not_applicable"]},
+                    "native_partial": {"type": "boolean"},
+                    "measurement_valid": {"type": "boolean"},
+                    "accounting": SCHEMA["properties"]["measurement_quality"]["properties"]["accounting"],
+                    "admission": {"type": "object", "additionalProperties": {"type": "boolean"}},
                 },
             },
         },
@@ -216,10 +272,13 @@ def _validate_builtin(record: dict, schema: dict) -> list:
             errors.append(f"{key}: {value!r} is not {node['const']!r}")
         if isinstance(value, dict) and node.get("properties"):
             errors.extend(_validate_builtin(value, node))
-        if isinstance(value, dict) and node.get("additionalProperties") is False and node.get("properties"):
+        if isinstance(value, dict) and node.get("properties") and node.get("additionalProperties") is False:
             for sub in value:
                 if sub not in node["properties"]:
                     errors.append(f"{key}/{sub}: not in the schema")
+        if isinstance(value, list) and isinstance(node.get("items"), dict):
+            for index, item in enumerate(value):
+                errors.extend(_validate_builtin(item, node["items"]))
         if "maxLength" in node and isinstance(value, str) and len(value) > node["maxLength"]:
             errors.append(f"{key}: longer than {node['maxLength']}")
         if "minimum" in node and isinstance(value, (int, float)) and not isinstance(value, bool) \

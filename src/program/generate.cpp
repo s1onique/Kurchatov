@@ -12678,6 +12678,12 @@ int main(int argc, char** argv) {
                         // still fails exactly as before: the inference outcome does not change.
                         tele.restore_attempted = tele_restore_attempted;
                         tele.restore_succeeded = false;
+                        // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G4): the restoration's DURATION
+                        // was already measured (tele_restore_ms) - it goes out with the evidence, so the server
+                        // knows how long the failed restoration took.  The measurement is not measured twice and
+                        // not discarded: the encode leaves a negative duration out.
+                        if (tele_on)
+                            tele.restore_ms = tele_restore_ms;
                         const std::string tele_err_txt =
                             tele_on ? strata::program::reqtelemetry::encode(tele) : std::string();
                         std::printf("ERR restoring a conversation checkpoint failed%s\n", tele_err_txt.c_str());

@@ -93,13 +93,15 @@ function renderStatus(status, summary) {
   // The token-weighted cache reuse ratio.  ACT-...-AMENDMENT-01 (G7): the numerator and the denominator come
   // from the SAME eligible requests (the ones whose reuse accounting is complete), and the coverage says how much
   // of the traffic that population is.  A ratio over two different populations is not published.
+  // ACT-...-AMENDMENT-03 (G2c): the coverage names the population it covers.  The accounting's population is the
+  // NATIVE INVOCATION whose accounting closed; the physical HTTP request's own coverage is published beside it.
   const reuse = summary.cache_reuse || {};
   const ratio = reuse.ratio;
   $("reuse-ratio").textContent = typeof ratio === "number" ? `${(ratio * 100).toFixed(1)}%` : "—";
   const coverage = typeof reuse.coverage === "number" ? `${(reuse.coverage * 100).toFixed(0)}%` : "—";
   $("reuse-detail").textContent = ratio === null || ratio === undefined
     ? "no request has a complete reuse accounting yet"
-    : `${num(reuse.reused_tokens)} of ${num(reuse.submitted_tokens)} tokens reused · ${num(reuse.eligible_requests)} of ${num(reuse.requests)} requests accounted for (${coverage})`;
+    : `${num(reuse.reused_tokens)} of ${num(reuse.submitted_tokens)} tokens reused · ${num(reuse.eligible_invocations)} of ${num(reuse.invocations)} native invocations accounted for (${coverage}) · ${num(reuse.requests_with_complete_accounting)} of ${num(reuse.requests)} requests`;
 }
 
 function renderTable() {
@@ -131,9 +133,14 @@ function renderTable() {
       num(prompt.evaluated_tokens), num(prompt.replayed_tokens),
       cache.disposition,
       ms(timing.prefill_wall),
-      rate(prompt.submitted_tokens, timing.prefill_wall),
+      // ACT-...-AMENDMENT-03 (G2c): the numerator and the denominator of a rate must describe the SAME
+      // population.  The prefill time is the time the engine spent READING the prompt: the positions it
+      // evaluated are what it read, not the whole submitted prompt (the reused prefix was not read again).
+      // The decode time is the time the engine spent DECODING: the tokens it generated are what it decoded
+      // (the tokens written to the client are not attributable - the response is transformed after them).
+      rate(prompt.evaluated_tokens, timing.prefill_wall),
       ms(timing.http_first_token),
-      rate(r.generation.emitted_tokens, timing.decode_wall),
+      rate(r.generation.generated_tokens, timing.decode_wall),
       r.lifecycle.finish_reason || "—",
     ];
     cells.forEach((value, index) => {

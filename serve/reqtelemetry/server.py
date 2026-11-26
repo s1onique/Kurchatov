@@ -82,7 +82,10 @@ class ServerTelemetry:
             self.store.receipt_failed()      # lost request: the terminal outcome above still stands
             raise
         if self.evidence is not None:
-            self.evidence.write(data)
+            # AMENDMENT-03 (G5): the loss of the evidence delivery is visible on its own: the receipt is in the
+            # store, the line on the disk is missing.
+            if not self.evidence.write(data):
+                self.store.evidence_failed()
         return data
 
     def inflight(self) -> int:
@@ -109,6 +112,9 @@ class ServerTelemetry:
             "retention": summary["retention"],
             "quality": "complete" if self.enabled else "unsupported",
             "counters": summary["counters"],
+            # AMENDMENT-03 (G5): the evidence writer's own counters, so the loss of an evidence delivery is
+            # visible here and not only in the log's file
+            "evidence": self.evidence.counters() if self.evidence is not None else None,
         }
 
     def close(self):

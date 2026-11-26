@@ -5,7 +5,19 @@ exporter all speak these words, so they cannot drift apart.
 """
 from __future__ import annotations
 
-SCHEMA_VERSION = "strata.request-telemetry/1"
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the record contract changed INCOMPATIBLY - the
+# per-invocation receipts are a new section and the parent's native scalars are null when the request dispatched
+# more than one native invocation - so the contract is versioned up.
+SCHEMA_VERSION = "strata.request-telemetry/2"
+
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the bounds of the per-invocation history.  They are
+# a COUNT and a BYTE budget, and a receipt that does not fit is counted as a loss - never dropped silently.
+MAX_INVOCATION_RECORDS = 8
+MAX_INVOCATION_BYTES = 32 << 10            # 32 KiB of receipts per request
+
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G5): how many engine instances' eviction high-water
+# marks the store keeps.  The retired instances' state is bounded: a long run does not grow it without limit.
+MAX_ENGINE_INSTANCES = 64
 
 # The measurement quality of a record as a whole, and of a single field.
 COMPLETE = "complete"
