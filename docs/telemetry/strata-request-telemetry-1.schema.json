@@ -405,7 +405,8 @@
         "state",
         "unavailable_fields",
         "timing_authority",
-        "first_token_includes_reasoning"
+        "first_token_includes_reasoning",
+        "accounting"
       ],
       "additionalProperties": false,
       "properties": {
@@ -434,6 +435,36 @@
             "boolean",
             "null"
           ]
+        },
+        "accounting": {
+          "type": "object",
+          "required": [
+            "state",
+            "valid",
+            "problems"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "satisfied",
+                "violated",
+                "unevaluated"
+              ]
+            },
+            "valid": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "problems": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         }
       }
     }

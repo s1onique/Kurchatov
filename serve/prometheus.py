@@ -161,11 +161,12 @@ def strata(m: dict, out: list, lab: str):
     telemetry(m.get("telemetry") or {}, out, lab)
 
 
-# The buckets for the telemetry's durations (seconds).  They are the request-latency buckets extended for the
-# long-context prefill: a prefill of a long prompt takes minutes, and a bucket set that ends at 20 s would put
-# every long prefill in the same bucket and hide the difference between a 30 s and a 300 s prefill.
-TELEMETRY_BUCKETS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
-                     600.0, 1200.0, 3600.0)
+# The buckets for the telemetry's durations (seconds).  ONE authority for the edges: the store counts the
+# observations into them (serve/reqtelemetry.py) and this exporter prints the same edges, so a bucket line and the
+# store's own accounting cannot drift apart.  They are the request-latency buckets extended for the long-context
+# prefill: a prefill of a long prompt takes minutes, and a bucket set that ends at 20 s would put every long
+# prefill in the same bucket and hide the difference between a 30 s and a 300 s prefill.
+from serve.reqtelemetry import DURATION_BUCKETS as TELEMETRY_BUCKETS
 
 
 def telemetry(tel: dict, out: list, lab: str):
@@ -235,11 +236,16 @@ def telemetry(tel: dict, out: list, lab: str):
             continue                                       # nothing was measured: no family, not a family of zeros
         total = hist.get("sum") or 0.0
         out.append(f"# HELP {name} {help_}\n# TYPE {name} histogram")
-        # The buckets are cumulative.  The store keeps the sum and the count, not the per-bucket counts, so the
-        # buckets carry the count that is certainly at or below them (the total count): the shape is not lost, and
-        # no bucket claims an observation that did not happen.
+        # The buckets are CUMULATIVE and REAL: the store counted every observation into the edges it is at or below
+        # (serve/reqtelemetry.py, in seconds - the one place the milliseconds are converted).  A bucket says how many
+        # observations were at or below that edge, never the total count: an observation of 2 s is not in the 30 s
+        # bucket's place, and the sum is the seconds the observations really took.
+        buckets = hist.get("buckets") or {}
         for b in TELEMETRY_BUCKETS:
-            out.append(f'{name}_bucket{{{lab},le="{b}"}} {n}')
+            count = buckets.get(str(b))
+            if not isinstance(count, int):
+                count = 0
+            out.append(f'{name}_bucket{{{lab},le="{b}"}} {count}')
         out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
         out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
 
@@ -248,4 +254,18 @@ def telemetry(tel: dict, out: list, lab: str):
     metric("strata_telemetry_retained_records", "gauge", "Records the store keeps.", retention.get("records"))
     metric("strata_telemetry_retained_bytes", "gauge", "Bytes the store's records take.", retention.get("bytes"))
     metric("strata_telemetry_available", "gauge", "1 when the telemetry is on.", 1 if tel.get("enabled") else 0)
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G6): the cache-reuse ratio is published with the
+    # population it covers: the numerator and the denominator come from the SAME eligible requests (the ones whose
+    # reuse accounting is complete), and the coverage says how much of the traffic that population is.
+    reuse = tel.get("cache_reuse") or {}
+    metric("strata_cache_reuse_ratio", "gauge",
+           "Reused prompt tokens over submitted prompt tokens, over the requests whose accounting is complete.",
+           reuse.get("ratio"))
+    metric("strata_telemetry_accounting_coverage", "gauge",
+           "The share of the requests whose cache-reuse accounting is complete.", reuse.get("coverage"))
+    evidence = tel.get("evidence") or {}
+    metric("strata_telemetry_evidence_dropped_total", "counter",
+           "Terminal records the evidence writer could not queue.", evidence.get("dropped"))
+    metric("strata_telemetry_evidence_failures_total", "counter",
+           "Terminal records the evidence writer could not write.", evidence.get("errors"))
 
