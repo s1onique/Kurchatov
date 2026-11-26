@@ -1,0 +1,28 @@
+ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 - the recorded heads
+
+the entry head            57fe8dfd15b3b02fba0ce837101b685251ef487c
+the tested code           ed2b10b27f6e8db69b6f654419f99f8510bb268a
+the evidence commit       276d7c09733893352ff9b6ea13c30f922ed5b875
+
+The tests were run against the tested code (ed2b10b2): the whole server suite, the telemetry and Prometheus
+suites, the schema check, both mutation suites, the browser presentation witnesses, the native host test and the
+native writer/reader roundtrip.  The commands and their results are in 05-evidence-summary.md.
+
+The source tree did not change between the tested code and the evidence commit.  The one command that shows it:
+
+    git diff --stat ed2b10b27f6e8db69b6f654419f99f8510bb268a..276d7c09733893352ff9b6ea13c30f922ed5b875
+
+ .gitattributes                                     |    1 +
+ .../01-native-production.diff                      |   17 +
+ .../02-http-production.diff                        |  245 ++
+ .../03-telemetry-core-production.diff              | 3176 ++++++++++++++++++++
+ .../04-test-witnesses.diff                         | 1027 +++++++
+ .../05-evidence-summary.md                         |  120 +
+ .../SHA256SUMS                                     |    5 +
+ 7 files changed, 4591 insertions(+)
+
+Only the evidence directory and the one .gitattributes line that exempts the review diffs from the whitespace
+check differ.  The production sources, the tests and the schema are byte-identical to the tree that was tested.
+
+This file is committed by the commit that follows the evidence commit; the repository's final head is that commit
+(it is recorded in the act's exit contract).
