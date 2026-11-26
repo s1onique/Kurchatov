@@ -12,6 +12,8 @@ The engine's writer is a small C++ program (src/program/reqtelemetry_roundtrip.c
 field names, and says so: the check of the two halves then covers the READER against the field names, and the
 WRITER's own format is covered by src/program/reqtelemetry_test.cpp.
 """
+from __future__ import annotations
+
 import os
 import subprocess
 import sys

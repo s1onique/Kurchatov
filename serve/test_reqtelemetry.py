@@ -420,7 +420,7 @@ class Evidence(unittest.TestCase):
                        "detail", "requested_max_output_tokens", "effective_max_output_tokens", "generated_tokens",
                        "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens",
                        "unavailable_fields", "timing_authority", "first_token_includes_reasoning",
-                       "schema_version", "seq"}
+                       "accounting", "schema_version", "seq"}
             for section in record.values():
                 if isinstance(section, dict):
                     for key in section:
