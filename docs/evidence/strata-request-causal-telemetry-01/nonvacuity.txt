@@ -1,5 +1,12 @@
 # The non-vacuity witnesses: each mutation was applied to a COPY of the file, the suite was run, and the file
 # was restored.  No mutation code is in the tree.
+#
+# The history, for the record: the FIRST attempt at mutations 2 and 3 did NOT fail the suite - the witnesses for
+# those two were too weak (they did not cover the matched field, and the cancellation was only exercised at the
+# record's level, not through the HTTP surface).  The witnesses were therefore STRENGTHENED (the matched field
+# was added to the missing-figure check, and a cancellation through the HTTP surface was added), and the mutations
+# were run again against the strengthened witnesses - which is what the runs below record.  The mutations are
+# therefore proven against witnesses that can actually fail them.
 
 $ # MUTATION 1: the matched prefix substituted for the actual reuse
 $ #   serve/reqtelemetry.py: reused_prefix=matched

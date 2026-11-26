@@ -86,6 +86,14 @@ Each of these is a check that **fails** when the defect it guards against is pre
 **The mutations were not left in the code.** The witnesses are permanent checks on the real behaviour; no
 temporary reversal was committed.
 
+**The witnesses were strengthened once, and that is recorded.** The first attempt at the mutations for "an
+unavailable measurement turned into a zero" and "a cancellation finalized as a successful completion" did **not**
+fail the suite: those two witnesses were too weak (the missing-figure check did not cover the matched field, and
+the cancellation was only exercised at the record's level, not through the HTTP surface). The witnesses were
+extended - the matched field was added to the missing-figure check, and a cancellation through the HTTP surface
+was added - and the mutations were run again against the strengthened witnesses. The runs recorded above are those
+second runs, and they fail as they must. `nonvacuity.txt` carries the same history.
+
 ## What was NOT executed, and why
 
 | Not executed | Why | What would execute it |
