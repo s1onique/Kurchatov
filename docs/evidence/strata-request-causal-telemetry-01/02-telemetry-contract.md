@@ -91,3 +91,8 @@ section keys, bounds the enumerations and the numbers, and forbids an unknown ke
 
 `validate()` uses the `jsonschema` package when it is installed and a built-in checker when it is not, so the
 contract can be checked on a bare Python.
+
+Both were run against the exported schema file and the record the server produces: **VALID** with the real
+`jsonschema` (draft 2020-12) and **VALID** with the built-in checker. `tools/test_reqtelemetry_schema.py` also
+checks that the file on disk and the code's `SCHEMA` are the same contract, and that a record which is NOT valid
+is rejected (a broken field, a missing section, an unknown disposition, an unknown section).
