@@ -90,11 +90,16 @@ function renderStatus(status, summary) {
   $("req-count").textContent = num(counters.requests_total);
   const failed = (counters.requests_cancelled || 0) + (counters.requests_failed || 0);
   $("req-detail").textContent = `${num(failed)} cancelled or failed · ${num(counters.retention_evictions)} evicted`;
-  // The token-weighted cache reuse ratio: reused tokens over submitted tokens, both from the engine's counters.
-  const submitted = counters.prompt_tokens_submitted || 0;
-  const reused = counters.prompt_tokens_reused || 0;
-  $("reuse-ratio").textContent = submitted ? `${((reused / submitted) * 100).toFixed(1)}%` : "—";
-  $("reuse-detail").textContent = `${num(reused)} of ${num(submitted)} tokens reused`;
+  // The token-weighted cache reuse ratio.  ACT-...-AMENDMENT-01 (G7): the numerator and the denominator come
+  // from the SAME eligible requests (the ones whose reuse accounting is complete), and the coverage says how much
+  // of the traffic that population is.  A ratio over two different populations is not published.
+  const reuse = summary.cache_reuse || {};
+  const ratio = reuse.ratio;
+  $("reuse-ratio").textContent = typeof ratio === "number" ? `${(ratio * 100).toFixed(1)}%` : "—";
+  const coverage = typeof reuse.coverage === "number" ? `${(reuse.coverage * 100).toFixed(0)}%` : "—";
+  $("reuse-detail").textContent = ratio === null || ratio === undefined
+    ? "no request has a complete reuse accounting yet"
+    : `${num(reuse.reused_tokens)} of ${num(reuse.submitted_tokens)} tokens reused · ${num(reuse.eligible_requests)} of ${num(reuse.requests)} requests accounted for (${coverage})`;
 }
 
 function renderTable() {
@@ -177,6 +182,14 @@ function renderDetail() {
   if (quality.state && quality.state !== "complete") {
     add(`The measurement is ${quality.state}: ${Object.values(quality.unavailable_fields || {}).join("; ") || "some fields are unavailable"}`);
   }
+  // The accounting's own state: violated (the numbers do not close), unevaluated (they could not be checked),
+  // satisfied (they close).  An unevaluated identity is never presented as a proven one.
+  const accounting = quality.accounting || {};
+  if (accounting.state === "violated") {
+    add(`The token accounting does not close: ${(accounting.problems || []).join("; ")}`, true);
+  } else if (accounting.state === "unevaluated") {
+    add("The token accounting could not be evaluated: the measurements it needs were not taken.");
+  }
   if (!record.identity.engine_instance_id && !record.identity.engine_invocation_id) {
     add("The engine reported no telemetry for this request: the native figures are unavailable.");
   }
@@ -206,11 +219,15 @@ function renderDetail() {
   ]) facts.append(fact(label, value));
 
   // The token accounting bar: the reused prefix, the evaluated positions and the replayed part of them.
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G7): a measurement that was NOT taken is not a zero.
+  // When the engine did not report the reuse or the evaluation, the bar says so instead of drawing an empty one.
   const bar = $("detail-bar");
   bar.replaceChildren();
-  const reused = prompt.reused_prefix_tokens || 0;
-  const evaluated = prompt.evaluated_tokens || 0;
-  const replayed = prompt.replayed_tokens || 0;
+  const measured = prompt.reused_prefix_tokens !== null && prompt.reused_prefix_tokens !== undefined
+    && prompt.evaluated_tokens !== null && prompt.evaluated_tokens !== undefined;
+  const reused = measured ? prompt.reused_prefix_tokens : 0;
+  const evaluated = measured ? prompt.evaluated_tokens : 0;
+  const replayed = prompt.replayed_tokens === null || prompt.replayed_tokens === undefined ? 0 : prompt.replayed_tokens;
   const total = Math.max(1, reused + evaluated);
   const parts = [["reused", reused, "Reused"], ["evaluated", Math.max(0, evaluated - replayed), "Evaluated"],
                  ["replayed", replayed, "Replayed"]];
@@ -221,6 +238,12 @@ function renderDetail() {
     part.style.width = `${(value / total) * 100}%`;
     part.title = `${title}: ${value} tokens`;
     bar.append(part);
+  }
+  if (!measured) {
+    const note = document.createElement("span");
+    note.className = "st-note";
+    note.textContent = "the engine reported no token accounting for this request";
+    bar.append(note);
   }
   const legend = $("detail-legend");
   legend.replaceChildren();
