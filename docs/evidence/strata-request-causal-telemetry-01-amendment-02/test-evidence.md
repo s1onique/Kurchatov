@@ -7,7 +7,7 @@ run.
 | # | Command | Result |
 |---|---|---|
 | 1 | `/tmp/stratavenv/bin/python -m unittest discover -s serve -p 'test_*.py'` | see the table below |
-| 2 | `/tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry serve.test_telemetry_integrity serve.test_telemetry_amendment02` | 155 tests, OK |
+| 2 | `/tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry serve.test_telemetry_integrity serve.test_telemetry_amendment02` | 158 tests, OK |
 | 3 | `/tmp/stratavenv/bin/python tools/test_reqtelemetry_schema.py` | `test_reqtelemetry_schema: all checks passed` |
 | 4 | `/tmp/stratavenv/bin/python tools/test_telemetry_mutations.py` | 12 witnesses, OK |
 | 5 | `/tmp/stratavenv/bin/python tools/test_telemetry_web_accounting.py` | `4 cases checked with osascript` |
@@ -19,11 +19,29 @@ run.
 |---|---|---|
 | the entry head (`579f5cef`), for comparison | 1052 | 1 failure (`test_responses.NoLeakedSampler.test_server_close_ends_the_sampler` - a timing-sensitive sampler test) |
 | the first amendment-02 run | 1126 | 4 failures, all in `serve/test_prometheus.py`: the exporter's own parser did not accept a sample without a label set, which the process-scoped telemetry metrics produce (A8).  The parser was corrected to accept the valid `name value` form; the metrics themselves were not changed. |
-| the final run | 1126 | **OK (20 skipped)**, exit code 0 |
+| the final run | 1129 | **OK (20 skipped)**, exit code 0 |
 
 The final run is the acceptance run: the repository's real dependencies, the committed tree, no stand-in.
 
-The suite's own count grew by the amendment's own witnesses (34) and by the predecessor's delta.
+The suite's own count grew by the amendment's own witnesses (37) and by the predecessor's delta.
+
+## The G7 witnesses that use the real transport
+
+Three of the witnesses drive the actual HTTP transport instead of a fixture:
+
+* **a queued request that the client abandons**: the first request holds the turn (the mock engine is slow), a
+  second client opens a real socket, sends its request and closes it.  The abandoned request ends as `cancelled`,
+  it gets exactly ONE receipt, its finish reason is the cancellation (never a successful stop), and the
+  lifecycle identity still balances with `inflight = 0`;
+* **a transport disconnection mid-stream**: the client opens a real socket, reads nothing and closes it while
+  the stream runs.  The request ends as `cancelled` (or `failed`) with exactly one receipt, and the accounting
+  balances;
+* **the terminalization fault injection through the HTTP path**: `RequestRecord.seal` is made to fail while the
+  request runs.  The request's answer is unaffected, the terminal outcome is still counted, the loss of the
+  receipt is counted as a delivery failure, and the identity balances.
+
+These are the controls the amendment asks for by name ("a genuinely queued request and actual HTTP disconnect
+controls, not merely an engine fixture returning a cancellation finish reason").
 
 ## The witnesses, and what each one protects
 
@@ -31,12 +49,13 @@ The suite's own count grew by the amendment's own witnesses (34) and by the pred
 |---|---|
 | `Admission` (6) | the measurement admission and the aggregate authority (G1) |
 | `InvocationIdentity` (6) | the invocation identity (G2/A2), including the recovery witness |
+| `InvocationIdentity` (6) | the invocation identity (G2/A2), including the recovery witness |
 | `Monotonicity` (2) | the engine's eviction high-water mark (G5) |
 | `Cursors` (7) | the cursor contract (G6) |
 | `EvidenceWriter` (4) | the writer's bytes, its bounds and its flush (A5) |
 | `Lifecycle` (2) | the lifecycle conservation (A4) |
 | `ModelSwitch` (1) | the process-scoped metrics (A8) |
-| `HttpWitnesses` (6) | the queue wait (A1), the first content (A3), the lifecycle over HTTP (A4), the cursor over HTTP (G6) |
+| `HttpWitnesses` (9) | the queue wait (A1), the first content (A3), the lifecycle over HTTP (A4), the cursor over HTTP (G6), a genuinely QUEUED request that the client abandons (G7), an actual TRANSPORT DISCONNECTION mid-stream (G7), and the terminalization FAULT INJECTION through the HTTP path (G7/A4) |
 | `tools/test_telemetry_mutations.py` (12) | the non-vacuity: every correction is reversed in memory and the witness that guards it fails |
 
 ## The non-vacuity witnesses (G10)

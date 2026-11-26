@@ -25,14 +25,16 @@ G5_MONOTONICITY_AND_BOUNDS: CORRECTED - the engine's eviction counter is a high-
   bytes and its flush means "every accepted record reached a terminal outcome".
 G6_CURSOR_CONTRACT: CORRECTED - a cursor without an owner, with a sequence below one, dated in the future,
   expired or pointing at an evicted page is refused; the HTTP endpoint answers 400.
-G7_EXECUTABLE_WITNESSES: DONE - 34 new witnesses in the production paths (the store, the correlation, the
-  writer, the HTTP handlers, the exporter) and 12 non-vacuity witnesses; the whole suite ran with the
-  repository's real dependencies: 1126 tests, OK (20 skipped), exit 0.
+G7_EXECUTABLE_WITNESSES: DONE - 37 new witnesses in the production paths (the store, the correlation, the
+  writer, the HTTP handlers, the exporter) and 12 non-vacuity witnesses; among them the three controls the
+  amendment names by name: a genuinely QUEUED request that the client abandons (a real socket), an actual
+  TRANSPORT DISCONNECTION mid-stream, and the terminalization FAULT INJECTION through the HTTP path.  The whole
+  suite ran with the repository's real dependencies.
 G8_REVIEW_COMPLETENESS: DONE - 01-native-production.diff, 02-http-production.diff,
   03-telemetry-core-production.diff, 04-test-witnesses.diff, 05-evidence-summary.md and SHA256SUMS, all
   generated from the repository itself.
 
-REAL_DEPENDENCY_FULL_SUITE: 1126 tests, OK (skipped=20), exit code 0 - /tmp/stratavenv has the repository's
+REAL_DEPENDENCY_FULL_SUITE: 1129 tests, OK (skipped=20), exit code 0 - /tmp/stratavenv has the repository's
   real jinja2, regex and jsonschema; no stand-in was used.
 HOST_NATIVE_TESTS: NOT_EXECUTED - the native writer/reader roundtrip needs the engine binary, which needs a
   build; this host has no CUDA toolkit.  The telemetry's own host-compilable test (src/program/reqtelemetry_test.cpp)
@@ -79,7 +81,7 @@ LOST_TERMINAL_RECEIPTS: 0 in the witnesses (receipt_delivery_failures counts the
   delivered; the fault-injection witness shows the accounting still balances)
 INFLIGHT_AT_QUIESCENCE: 0
 OUTSTANDING_EVIDENCE_AT_SHUTDOWN: 0 (the writer's counters: outstanding_records, outstanding_bytes)
-REAL_DEPENDENCY_FULL_SUITE: 1126 tests, OK (skipped=20), exit 0
+REAL_DEPENDENCY_FULL_SUITE: 1129 tests, OK (skipped=20), exit 0
 ```
 
 ## What a reviewer should read first
