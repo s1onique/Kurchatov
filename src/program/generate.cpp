@@ -70,6 +70,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/cache_diag.hpp"
+#include "strata/program/reqtelemetry.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -8876,7 +8877,13 @@ int main(int argc, char** argv) {
                 return e;
             }
         } cdiag;
-        cdiag.on = cdiag_on;
+        // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry needs the engine's OWN account of the cache decision
+        // (the candidates it examined, how far their tokens agreed, which one it used and why).  That analysis is
+        // the cache diagnostics' analysis, so the telemetry turns the SAME collector on - it does not write a
+        // second, parallel account of the same decision.  The stderr events stay as they were: the Sink writes
+        // them only with STRATA_CACHE_DIAG=1, whatever turns the collector on.
+        const bool tele_on = strata::program::reqtelemetry::enabled();
+        cdiag.on = cdiag_on || tele_on;
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -11800,6 +11807,10 @@ int main(int argc, char** argv) {
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
+            // rid=<hex>: the server's id for this request.  It is echoed back on the DONE line, so the numbers
+            // the engine measures belong to THAT request and not to whichever one happens to be running.  The
+            // engine never uses it for anything else: it is a label, not a key and not a credential.
+            std::string req_rid;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -11829,6 +11840,15 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "rid") {
+                        // the request id, as hex the server sent it.  Bounded and checked: it is echoed back on
+                        // the DONE line, so nothing untrusted goes into the engine's output unchecked.
+                        const std::string v = tok.substr(eq + 1);
+                        bool hex_ok = !v.empty() && v.size() <= 64;
+                        for (const char c : v)
+                            if (!std::isxdigit(static_cast<unsigned char>(c))) { hex_ok = false; break; }
+                        if (hex_ok) req_rid = v;
+                    }
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -12063,6 +12083,19 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
+            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: what this request measured about the cache and about its own
+            // work.  It is filled from the engine's OWN decision (the same collector the cache diagnostics use) and
+            // written onto the request's own DONE line, so the numbers belong to THIS request by construction.
+            strata::program::reqtelemetry::RequestTelemetry tele;
+            tele.request_id = req_rid;
+            // the cache lookup: from the candidates being examined to the decision.  It is measured with the
+            // engine's own clock, and it is the LOOKUP only - the restoration is timed where it happens.
+            const auto tele_lookup_t0 = Clock::now();
+            // the state restoration, as the engine measured it: the restore is timed where it happens, and a
+            // restore that failed is reported as a failure (never as a successful reuse).
+            double tele_restore_ms = -1.0;
+            bool tele_restore_attempted = false;
+            bool tele_restore_succeeded = false;
             // STRATA_CACHE_DIAG: the candidates the engine examines, with the reason each was (not) usable.  The
             // analysis runs ONLY with the switch on; the selection below is the engine's own code, untouched.
             auto cdiag_consider = [&](strata::program::cache_diag::Source source, const std::vector<int32_t>& pre,
@@ -12409,6 +12442,10 @@ int main(int argc, char** argv) {
                 resume = parked.tokens;
                 from_live = false;
                 conversations.count_borrow();
+                // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the borrow mounted the donor's prefix: a restore happened.
+                tele_restore_attempted = true;
+                tele_restore_succeeded = true;
+                tele_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 parked_used = true;   // STRATA_CACHE_DIAG: the donor's prefix is mounted
                 parked_borrowed = true;
                 parked_taken_live = false;   // a borrow mounts a CHECKPOINT of the donor, not its live state
@@ -12467,6 +12504,10 @@ int main(int argc, char** argv) {
                 from_live = parked.live;
                 parked_used = true;   // STRATA_CACHE_DIAG: the parked conversation is mounted
                 parked_taken_live = parked.live;
+                // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the restore happened, and how long it took.
+                tele_restore_attempted = true;
+                tele_restore_succeeded = true;
+                tele_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
@@ -12526,6 +12567,11 @@ int main(int argc, char** argv) {
                 }
                 strata::program::cache_diag::Sink::instance().record(cdiag.event(conversations));
             }
+            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the LOOKUP is over: the candidates have been examined and
+            // the source chosen.  This is where the lookup time ends - the restoration (timed where it happens)
+            // and the prompt read (timed by the engine) come after it.
+            if (tele_on)
+                tele.lookup_ms = std::chrono::duration<double, std::milli>(Clock::now() - tele_lookup_t0).count();
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
@@ -12603,16 +12649,31 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
-                           [&] {
-                               for (size_t i = 0; i < stages.size(); ++i) {
-                                   const strata::core::OnDevice on(stages[i]->dev);
-                                   if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
-                               }
-                               return false;
-                           }()) {
-                    std::printf("ERR restoring a conversation checkpoint failed\n");
-                    return 1;
+                } else {
+                    // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the restore is measured HERE, where it happens.
+                    // A restore that was tried and failed is reported as a failure - never as a successful reuse -
+                    // and the two are told apart from "there was no checkpoint to restore at all".
+                    const bool had_ckpt = c != nullptr;
+                    tele_restore_attempted = had_ckpt;
+                    const auto tr0 = Clock::now();
+                    // the same checks, in the same order, as before: the main checkpoint, then its stage parts.
+                    bool restored = had_ckpt && checkpoint_restore(*c, ss, g) && c->stage_parts.size() == stages.size();
+                    if (restored) {
+                        for (size_t i = 0; i < stages.size(); ++i) {
+                            const strata::core::OnDevice on(stages[i]->dev);
+                            if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) {
+                                restored = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (tele_on)
+                        tele_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - tr0).count();
+                    tele_restore_succeeded = restored;
+                    if (!restored) {
+                        std::printf("ERR restoring a conversation checkpoint failed\n");
+                        return 1;
+                    }
                 }
                 if (lent && lent_slot == admit_slot) {
                     // the slot this request continues in drops its checkpoints at the admission: this one moves back
@@ -14893,6 +14954,43 @@ int main(int argc, char** argv) {
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
             const int64_t fresh = n - resume;
             const int64_t read_n = cancelled ? std::clamp<int64_t>(pp_reached - resume, 0, fresh) : fresh;
+            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry for THIS request, filled from the engine's own
+            // decision and its own counters.  Nothing here is inferred from a duration or a rate.
+            //
+            //  * `matched` is the CONTIGUOUS TOKEN PREFIX MATCH against the selected candidate, BEFORE the
+            //    execution-state constraints: how far the tokens agreed.  It comes from the cache diagnostics'
+            //    own analysis (the ACTUAL common prefix, never a checkpoint's length).
+            //  * `reused` is the prefix whose usable execution state was really retained or restored: `resume`.
+            //    The two are different things, and a candidate whose tokens matched but whose state was unusable
+            //    moves the first without moving the second.
+            //  * `evaluated` is the DISTINCT prompt positions this request evaluated; `work` is the executed
+            //    prompt-token evaluations (repeats count again) and `replayed` the evaluated positions that were
+            //    previously processed prompt material.
+            if (tele_on) {
+                // `matched` is the DEEPEST TOKEN MATCH the engine found among the candidates it examined, before
+                // the execution-state constraints were applied: the cache diagnostics' own comparison, the ACTUAL
+                // common prefix, never a candidate's length.  `reused` is what was really mounted.
+                tele.matched_prefix = cdiag.on ? cdiag.best_lcp : -1;
+                // A state that was RE-READ instead of restored was not reused: its positions were evaluated again.
+                const bool reread_state = reread_to > 0;
+                tele.reused_prefix = reread_state ? 0 : resume;
+                // the distinct prompt positions this request evaluated: the ones it read, from where it started
+                // reading to where it got to.
+                const int64_t tele_from = reread_to > 0 ? 0 : resume;
+                tele.evaluated = std::clamp<int64_t>(pp_reached - tele_from, 0, n - tele_from);
+                // the positions that were previously processed prompt material and were evaluated again.
+                tele.replayed = reread_state ? std::min<int64_t>(reread_to, tele.evaluated) : 0;
+                tele.work = tele.evaluated;
+                tele.first_divergent = cdiag.on ? (cdiag.best_mismatch >= 0 ? cdiag.best_mismatch : -1) : -2;
+                tele.slot = admit_slot >= 0 ? admit_slot : -1;
+                tele.evictions = static_cast<int64_t>(conversations.evictions());
+                tele.invalidations = -1;
+                tele.restore_attempted = tele_restore_attempted;
+                tele.restore_succeeded = tele_restore_succeeded;
+                tele.restore_ms = tele_restore_ms;
+                tele.source = cdiag.on ? strata::program::cache_diag::source_name(cdiag.selected) : "unknown";
+                tele.reason = cdiag.on ? strata::program::cache_diag::reason_name(cdiag.reason) : "UNKNOWN";
+            }
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
             //      [RAM blobs] [file blobs] [file MB]   (CS-T tiers; appended, so an older server reads the rest)
             //      [prompt tokens read]   (#471: fewer than <prompt> - <reused> when a cancel stopped the read)
@@ -14903,20 +15001,32 @@ int main(int argc, char** argv) {
             //      chunk=<tokens> experts_streamed=<blobs>   (key=value, last: the first chunk of the request's longest
             //      batched segment, 0 when it read none; the expert blobs its prompt read copied host -> device on
             //      every stage - not the CPU share's, the stage helper's or a --peer-device peer's)
+            //      rid=<id> matched=<n> reused=<n> evaluated=<n> replayed=<n> work=<n> divergent=<n> slot=<n>
+            //      restore=<none|succeeded|failed> restore_ms=<f> lookup_ms=<f> cache_source=<word>
+            //      cache_reason=<word>   (ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the request's own telemetry.
+            //      The request's id comes back so the numbers belong to THIS request; the token accounting keeps
+            //      the MATCHED prefix (how far the tokens agreed) apart from the REUSED one (what was really
+            //      reused); a field the engine did not measure is left out entirely, so the server reports it as
+            //      unavailable rather than as a zero.  Absent with STRATA_TELEMETRY unset: the line is then
+            //      byte-identical to the release's.)
             char chain_txt[128] = "";
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+            // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry rides on THIS request's own DONE line, as
+            // key=value pairs after the ones the line already had.  A server that does not know them ignores them;
+            // a server that does know them reads them for THIS request - no timestamp matching, no "the newest".
+            const std::string tele_txt = tele_on ? strata::program::reqtelemetry::encode(tele) : std::string();
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
-                        "experts_streamed=%lld\n",
+                        "experts_streamed=%lld%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt, (long long) req_chunk,
-                        (long long) (sp.chain_experts_streamed() - streamed0));
+                        (long long) (sp.chain_experts_streamed() - streamed0), tele_txt.c_str());
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
