@@ -63,6 +63,8 @@ class Http(unittest.TestCase):
     """The telemetry API over HTTP."""
 
     def setUp(self):
+        import threading
+        self.samplers_before = sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)"))
         self.tok = ByteTokenizer()
         self.engine = TelemetryEngine(self.tok, prompt_tokens=100, prompt_read=60, reused=40, generated=7,
                                       prompt_ms=12.0, decode_ms=30.0, finish="stop",
@@ -74,8 +76,16 @@ class Http(unittest.TestCase):
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
     def tearDown(self):
+        import threading
+        import time
         self.httpd.shutdown()
         self.httpd.server_close()
+        # The hardware sampler stops a moment after the server does (it finishes its sample first).  Waiting for
+        # it here keeps the next test's thread count honest.
+        for _ in range(50):
+            if sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")) <= self.samplers_before:
+                break
+            time.sleep(0.1)
 
     def get(self, path, headers=None):
         req = urllib.request.Request(self.base + path, headers=headers or {})
@@ -562,13 +572,24 @@ class Access(unittest.TestCase):
     """The access control: the request-level endpoints fail closed when there is no key on a shared listener."""
 
     def setUp(self):
+        import threading
+        self.samplers_before = sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)"))
+        self.httpd = None
         self.tok = ByteTokenizer()
         self.svc = Service(MockEngine(self.tok, "ok", max_context=CTX), self.tok,
                            ChatTemplate(ROOT / "serve/chat_template.jinja"))
 
     def tearDown(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        import threading
+        import time
+        if getattr(self, "httpd", None) is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+            for _ in range(50):
+                if sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")) <= getattr(
+                        self, "samplers_before", 0):
+                    break
+                time.sleep(0.1)
 
     def test_a_shared_listener_without_a_key_refuses_the_request_metadata(self):
         self.svc.api_key = ""

@@ -17,6 +17,18 @@ Every command below was run on the host described in `00-entry-state.md`. The ex
 The 23 skips are the repository's own (the GPU, the network and the platform tests). The suite passed **before**
 this ACT's changes too, at the same count of skips.
 
+### A test-isolation note
+
+`serve/test_responses.py`'s `test_server_close_ends_the_sampler` counts the running hardware samplers. A sampler
+stops a moment after its server does (it finishes its sample first), so a sampler from an earlier test can die
+between that test's two counts and make the count come out one short.
+
+This ACT's test file starts a server per test, so it widened that window. The fix is in the new file: its
+tear-down waits for the sampler to be gone, exactly as `test_responses.py` does in its own teardown. The
+repository's own test is **not** changed.
+
+With the fix, `serve.test_reqtelemetry` + `serve.test_responses` + `serve.test_parallel` run together: **OK**.
+
 ## The qualification matrix
 
 The honest column is the last one. **A native control that was not executed is NOT_EXECUTED, never PASS.**
