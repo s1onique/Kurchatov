@@ -113,5 +113,3 @@ def apply_engine(record: RequestRecord, figures: dict | None):
     if evaluated is None:
         record.mark_unavailable("prompt.evaluated_tokens", "the engine did not report the tokens it evaluated")
     return record
-
-

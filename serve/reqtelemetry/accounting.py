@@ -96,4 +96,3 @@ def accounting_state(record) -> dict:
                if value is None]
     return {"state": "unevaluated", "valid": None, "problems": [],
             "missing": missing + ([] if record.state == "completed" else ["the request did not complete"])}
-

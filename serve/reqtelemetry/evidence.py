@@ -113,5 +113,3 @@ class EvidenceLog:
                     "queue_size": self.queue_size, "queue_bytes": self.queue_size_bytes,
                     "max_queue_bytes": self.queue_bytes, "path": self.path,
                     "flush_incomplete": self.flush_incomplete}
-
-

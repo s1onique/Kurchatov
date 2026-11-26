@@ -100,4 +100,3 @@ class ServerTelemetry:
         if self.evidence is not None:
             self.evidence.flush()
             self.evidence.close()
-

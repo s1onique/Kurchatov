@@ -208,5 +208,3 @@ class TelemetryStore:
                     "durable": False,
                 },
             }
-
-

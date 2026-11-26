@@ -384,4 +384,3 @@ class RequestRecord:
                                "problems": list(self.accounting.get("problems") or [])},
             },
         }
-
