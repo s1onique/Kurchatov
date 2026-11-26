@@ -47,11 +47,11 @@ def parse_done(line: str) -> dict:
     return last
 
 
-def engine_done_line() -> str | None:
+def engine_done_line(switch: str = "1") -> str | None:
     """A DONE line from the engine's own writer, when it has been built."""
     for candidate in (ROOT / "build" / "reqtelemetry_roundtrip", Path("/tmp/rtcache/reqtelemetry_roundtrip")):
         if candidate.is_file() and os.access(candidate, os.X_OK):
-            env = dict(os.environ, STRATA_TELEMETRY="1")
+            env = dict(os.environ, STRATA_TELEMETRY=switch)
             out = subprocess.run([str(candidate)], capture_output=True, text=True, env=env, timeout=30)
             for line in out.stdout.splitlines():
                 if line.startswith("DONE "):
@@ -74,6 +74,15 @@ class Roundtrip(unittest.TestCase):
         self.assertEqual(figures.get("rid"), "abc123")
         self.assertAlmostEqual(figures.get("restore_ms"), 3.5, places=3)
         self.assertAlmostEqual(figures.get("lookup_ms"), 1.2, places=3)   # the engine writes one decimal
+
+    def test_with_the_switch_off_the_done_line_carries_no_telemetry(self):
+        """T19: with the telemetry off, the DONE line is byte-identical to the release's: no telemetry keys."""
+        line = engine_done_line("0")
+        if line is None:
+            self.skipTest("the engine's writer is not built (build reqtelemetry_roundtrip)")
+        for key in REQTELEMETRY_INT_KEYS + REQTELEMETRY_FLOAT_KEYS + REQTELEMETRY_TEXT_KEYS:
+            self.assertNotIn(f" {key}=", line, f"the telemetry is off, so {key} must not be on the DONE line")
+        self.assertEqual(parse_done(line).get("telemetry"), None)
 
     def test_the_field_names_are_the_same_on_both_sides(self):
         """The keys the engine writes are the keys the server reads: one list, checked against the header."""

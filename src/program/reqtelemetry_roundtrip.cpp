@@ -29,7 +29,10 @@ int main() {
     t.lookup_ms = 1.25;
     t.source = "live";
     t.reason = "EXACT_MATCH";
+    // The engine's own gate: with the switch off the DONE line carries NO telemetry, and it is then
+    // byte-identical to the release's.  This program mirrors that, so the reader is checked against both forms.
+    const std::string tele = enabled() ? encode(t) : std::string();
     std::printf("enabled=%d\n", enabled() ? 1 : 0);
-    std::printf("DONE 7 100 41.5 210.0 stop 24 31 60 9 10 1 2 1.5 40 0%s\n", encode(t).c_str());
+    std::printf("DONE 7 100 41.5 210.0 stop 24 31 60 9 10 1 2 1.5 40 0 chunk=0 experts_streamed=0%s\n", tele.c_str());
     return 0;
 }
