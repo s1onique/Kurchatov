@@ -1,4 +1,4 @@
-# The whole server suite on the corrected tree (the tail of the run, and every failure).
+# The whole server suite on the final tree
 
 ```
 ERROR: test_a_special_token_decodes_to_its_text (test_dsv4.PreTokenizer)
@@ -11,11 +11,11 @@ FAIL: test_digits_in_runs_of_three (test_glm.PreTokenizer)
 FAIL: test_pieces_and_whole_tokens (test_lfm2.PreTokenizer)
 FAIL: test_server_close_ends_the_sampler (test_responses.NoLeakedSampler)
 
-Ran 1092 tests in 354.121s
 
 FAILED (failures=3, errors=6, skipped=23)
 EXIT=1
 ```
 
-The nine failures are the ones the local regex stand-in causes; the BASELINE (the entry commit) has
-exactly the same nine - see 05-suite-results.md.  There is no new failure.
+The nine failures are the ones the local `regex` stand-in causes (see 00-entry-state.md).  The BASELINE -
+the unmodified entry commit, run in the same environment - has exactly the same nine: see
+05-suite-results.md.  There is no new failure, and the 38 new tests of the amendment pass.

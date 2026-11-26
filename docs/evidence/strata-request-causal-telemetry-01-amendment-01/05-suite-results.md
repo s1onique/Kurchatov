@@ -5,7 +5,8 @@ comparable. The baseline is the entry commit in its own worktree (`/tmp/kurchato
 
 | | Baseline (ENTRY_HEAD `c45ec828`) | The corrected tree |
 |---|---|---|
-| the whole server suite | see the run below | see the run below |
+| the whole server suite | `Ran 1054 tests in 342.476s` - 3 failures, 6 errors, 23 skipped | `Ran 1092 tests in 363.131s` - 3 failures, 6 errors, 23 skipped |
+| the failures | the nine of the `regex` stand-in | **the same nine** - no new failure |
 
 ## The baseline
 
@@ -33,7 +34,8 @@ no failures), so these nine are an artefact of the stand-in and not a property o
 
 ## The corrected tree
 
-The run is in `suite-output.txt` (the tail of the run, with the failures listed).
+The run is in `suite-output.txt` (every failure of the run and its tail).  The 38 extra tests are the amendment's
+own witnesses (`serve/test_telemetry_integrity.py`).
 
 ## What the comparison says
 
