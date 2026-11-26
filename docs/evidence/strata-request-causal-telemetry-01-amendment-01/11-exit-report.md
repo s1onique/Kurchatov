@@ -7,7 +7,7 @@ REPOSITORY:     s1onique/Kurchatov
 TARGET_ENGINE:  strata
 PRIORITY:       P0
 ENTRY_HEAD:     c45ec82846b2671673ff712009c8a85e1f034e2e
-FINAL_HEAD:     2b2a9463a6e43ff909eb20d157e44a7b24727466
+FINAL_HEAD:     646c066d62f9df57382f6d56fc6147bc4967d4e9
 BRANCH:         main
 TRACKED_DIRT:   none (the only untracked path is the pre-existing .kurchatov-acts/, untouched)
 COMMITS_CREATED: 5 (the list is below)
@@ -99,9 +99,9 @@ repository's own setup installs it), the predecessor's evidence shows the whole 
 | 3 | `c903c7f2` the view does not draw a zero | `serve/web/telemetry.js` |
 | 4 | `332488bb` the witnesses of the corrections | `serve/test_telemetry_integrity.py`, `tools/test_telemetry_mutations.py`, `serve/test_reqtelemetry.py`, `tools/test_reqtelemetry_roundtrip.py` |
 | 5 | `2b2a9463` the documentation of the corrections | `docs/TELEMETRY.md`, `docs/DETAILS.md` |
+| 6 | `646c066d` the patch hygiene | `serve/reqtelemetry/` (no blank line at the end of a file: `git diff --check` must pass) |
 
-The evidence package itself is committed on top of them (as the predecessor did): the tree it describes is
-`2b2a9463a6e43ff909eb20d157e44a7b24727466`.
+The evidence package itself is committed on top of them (as the predecessor did).
 
 ## How to check this amendment
 
