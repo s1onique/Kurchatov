@@ -12,7 +12,7 @@ Every command below was run on the host described in `00-entry-state.md`. The ex
 | 4 | `/tmp/stratavenv/bin/python tools/test_reqtelemetry_schema.py` | 0 | `test_reqtelemetry_schema: all checks passed` |
 | 5 | `/tmp/stratavenv/bin/python -m unittest serve.test_reqtelemetry -v` | 0 | `Ran 49 tests ... OK` |
 | 6 | `/tmp/stratavenv/bin/python -m unittest serve.test_prometheus serve.test_reqtelemetry` | 0 | `Ran 55 tests ... OK` |
-| 7 | `/tmp/stratavenv/bin/python -m unittest discover -s serve -p 'test_*.py'` | 0 | `Ran 1054 tests in 348.018s ... OK (skipped=23)` |
+| 7 | `/tmp/stratavenv/bin/python -m unittest discover -s serve -p 'test_*.py'` | 0 | `Ran 1054 tests in 350.039s ... OK (skipped=23)` (the confirmation run, on the exact committed tree) |
 | 8 | the same at the ENTRY commit, in a temporary worktree (`git worktree add --detach /tmp/baseline 5b0e549b`) | 0 | `Ran 1005 tests in 340.202s ... OK (skipped=23)` |
 
 The 23 skips are the repository's own (the GPU, the network and the platform tests). The suite passed **before**
