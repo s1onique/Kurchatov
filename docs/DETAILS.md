@@ -2319,6 +2319,15 @@ JSON object per request to a file.
 
 **[docs/TELEMETRY.md](TELEMETRY.md)** has the record, the API, the metrics and the settings.
 
+The measurements were tightened after the first review (ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01):
+the Prometheus histograms carry **real cumulative buckets** and the durations are converted to seconds **once**;
+a native receipt that carries another request's id is **not** attached to the request that received it; a
+measurement that was not taken is never read as a zero (the cache disposition of an unmeasured reuse is
+`unknown`, not a match without usable state); the token accounting is **checked**, never repaired, and it says
+whether it closed; the **one** terminal receipt of a request is written by the HTTP request's own boundary, so a
+refused, cancelled or disconnected request is accounted for too; and the cache-reuse ratio is published with the
+population it covers.
+
 ---
 
 ## Troubleshooting

@@ -222,7 +222,8 @@ Gauges:
 ```
 strata_requests_in_flight      strata_telemetry_retained_records
 strata_requests_queued         strata_telemetry_retained_bytes
-strata_telemetry_available
+strata_telemetry_available     strata_cache_reuse_ratio
+strata_telemetry_accounting_coverage
 ```
 
 The labels are bounded enumerations only. There is **no** request id, session, engine instance, prompt, user,
@@ -230,6 +231,34 @@ error message or dynamic model identity in a label.
 
 A duration that was not measured contributes **no sample**: a histogram's `_count` says how many observations
 there really were. It is never padded with zeros.
+
+### The histograms are real (ACT-...-AMENDMENT-01, G1)
+
+Every `_bucket` line says how many observations were **at or below** that edge, and nothing else. A 120 s
+observation is in the 120 s bucket and in `+Inf`, and **not** in the 1 s bucket. The `_sum` is the sum of the
+observations **in seconds**: the record keeps its timings in milliseconds (`timing_ms`) and the store converts
+them **once**, in `serve/reqtelemetry/metrics.py`. The exporter and the store share one list of bucket edges
+(`DURATION_BUCKETS`), so a bucket line and the store's own accounting cannot drift apart.
+
+A duration that is negative or not finite is not observed at all - it is not a duration, and it is not a zero
+either.
+
+### The cache-reuse ratio has both of its numbers (G6)
+
+`strata_cache_reuse_ratio` is published together with the population it covers:
+
+| Gauge | What it is |
+|---|---|
+| `strata_cache_reuse_ratio` | reused prompt tokens / submitted prompt tokens, over the requests whose reuse accounting is **complete** |
+| `strata_telemetry_accounting_coverage` | the share of the requests that are in that population |
+
+The numerator and the denominator come from the **same** eligible requests, so a request whose accounting is
+incomplete cannot distort the ratio. The coverage says how much of the traffic the ratio covers. The same numbers
+are in `GET /v1/telemetry/summary` under `cache_reuse`.
+
+`strata_cache_evictions_total` is a counter: the engine's own eviction count restarts with the engine, and the
+server counts the **increase** per engine instance, so the counter never falls and never counts the same
+eviction twice.
 
 ## The structured evidence
 
@@ -279,6 +308,28 @@ and the handful of counters it already keeps.
   key, or listen on the loopback.
 * **The cache disposition says `match_without_usable_state`**: the tokens matched but the state was not usable
   (another steering mode, a different picture, an evicted checkpoint). `cache.reason_code` says which.
+
+## The corrections of ACT-...-AMENDMENT-01
+
+The review of the predecessor found defects in the measurement, not in the architecture. What changed:
+
+| Where | Before | Now |
+|---|---|---|
+| the Prometheus histograms | every bucket carried the total count; the milliseconds were printed as seconds | real cumulative buckets, converted to seconds once, in `serve/reqtelemetry/metrics.py` |
+| the native receipt | the `rid` was sent but never checked | a receipt that carries another request's id is **not** attached; the request reports an instrumentation error; a receipt with no id leaves the correlation explicitly unavailable |
+| the cache disposition | a `null` reuse was read as a zero | a `null` reuse gives the `unknown` disposition; only a **measured** reuse decides |
+| the conservation identity | it was checked, but a broken one and an unevaluated one looked the same | three states: `satisfied`, `violated`, `unevaluated`; an unevaluated identity is never reported as satisfied |
+| the non-prefix reuse | it was left unmeasured | a documented **structural zero** (Strata reuses a contiguous prefix only), so the identity can be evaluated |
+| the record's life | the engine's completion finalized the record | one authoritative finalization at the physical HTTP request's boundary: a refused, cancelled or disconnected request still gets exactly one receipt |
+| the durations | some were wall-clock differences | request-local monotonic clocks; the wall-clock timestamps are for reporting only |
+| the output budget | the requested and the effective budget were the same number | they are measured where they happen: the client's request and the context's room |
+| the rendered prompt | the rendered count was copied from the submitted one | the rendered count is measured at the template render, the submitted count at the engine's admission |
+| the cache-reuse ratio | the numerator and the denominator came from different populations | both come from the same eligible population, and the coverage is published beside it |
+| the pagination cursor | it named only a sequence number | it names the server that wrote it and when: another server's cursor and an expired one are refused, never silently treated as an exhausted collection |
+| the module layout | `serve/reqtelemetry.py` held everything | `serve/reqtelemetry/` holds it, one responsibility per module; `serve.reqtelemetry` still imports the same names |
+
+With the telemetry **off** (`STRATA_TELEMETRY=0`) nothing is allocated: no receipt, no evidence writer and no
+`rid=` on the engine's commands - the engine's DONE line stays byte-identical to the release's.
 
 ## See also
 
