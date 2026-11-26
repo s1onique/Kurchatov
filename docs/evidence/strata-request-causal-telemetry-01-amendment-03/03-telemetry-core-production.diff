@@ -1,0 +1,3176 @@
+diff --git a/docs/TELEMETRY.md b/docs/TELEMETRY.md
+index ceaa87b5..9bd4f4f0 100644
+--- a/docs/TELEMETRY.md
++++ b/docs/TELEMETRY.md
+@@ -23,13 +23,14 @@ One record per **physical request attempt**. Two requests that carry the same `X
+ 
+ ```json
+ {
+-  "schema_version": "strata.request-telemetry/1",
++  "schema_version": "strata.request-telemetry/2",
+   "identity": {
+     "request_id": "9ca8c311a98448e5a10827dd9cac6b7b",
+     "client_request_id": "my-trace-42",
+     "engine_instance_id": "pid-8123-gen-2",
+     "server_instance_id": "c14ecbc49c694f2fbd08b10cfdbdcd7b",
+-    "engine_invocation_id": "9ca8c311a98448e5a10827dd9cac6b7b",
++    "engine_invocation_id": "5d0f7b1c2a9e4f6b8c3d1e0f5a6b7c8d",
++    "engine_invocation_ordinal": 1,
+     "slot_id": 0,
+     "model_id": "qwen3.8-flash",
+     "build_revision": "5b0e549b762d"
+@@ -38,22 +39,57 @@ One record per **physical request attempt**. Two requests that carry the same `X
+                 "finish_reason": "stop"},
+   "prompt": {"rendered_tokens": 246, "submitted_tokens": 246, "matched_prefix_tokens": 200,
+              "reused_prefix_tokens": 200, "evaluated_tokens": 46, "replayed_tokens": 0,
+-             "non_prefix_reused_tokens": null, "evaluation_work_tokens": 46,
++             "non_prefix_reused_tokens": 0, "evaluation_work_tokens": 46,
+              "first_divergent_token_index": null},
+   "cache": {"source": "conversation_cache", "disposition": "partial_hit", "reason_code": "exact_match",
+             "restore_attempted": true, "restore_succeeded": true, "restore_ms": 3.2},
+   "timing_ms": {"prefill_wall": 41.5, "decode_wall": 210.0, "http_first_token": 55.2, "total": 268.0},
+   "generation": {"requested_max_output_tokens": 512, "effective_max_output_tokens": 512,
+-                 "generated_tokens": 63, "emitted_tokens": 63,
++                 "generated_tokens": 63, "emitted_tokens": null,
+                  "speculative_draft_tokens": 31, "speculative_accepted_tokens": 24},
+-  "measurement_quality": {"state": "complete", "unavailable_fields": {}, "timing_authority": {...}}
++  "invocations": [
++    {"identity": {"engine_invocation_id": "5d0f7b1c2a9e4f6b8c3d1e0f5a6b7c8d", "ordinal": 1,
++                  "engine_instance_id": "pid-8123-gen-2", "model_id": "qwen3.8-flash",
++                  "build_revision": "5b0e549b762d", "slot_id": 0},
++     "state": "completed",
++     "prompt": {"submitted_tokens": 246, "matched_prefix_tokens": 200, "reused_prefix_tokens": 200,
++                "evaluated_tokens": 46, "evaluation_work_tokens": 46},
++     "timing_ms": {"cache_lookup": 2.1, "cache_restore": 3.2, "prefill_wall": 41.5, "decode_wall": 210.0},
++     "measurement_quality": {"native_correlation": "verified", "native_partial": false,
++                             "measurement_valid": true,
++                             "accounting": {"state": "satisfied", "valid": true, "problems": []},
++                             "admission": {"complete_cache_ratio": true, "native_duration": true, ...}}}
++  ],
++  "measurement_quality": {"state": "partial", "unavailable_fields": {"generation.emitted_tokens": "..."},
++                          "timing_authority": {...}}
+ }
+ ```
+ 
+-The schema is [`docs/telemetry/strata-request-telemetry-1.schema.json`](telemetry/strata-request-telemetry-1.schema.json)
++The schema is [`docs/telemetry/strata-request-telemetry-2.schema.json`](telemetry/strata-request-telemetry-2.schema.json)
+ (JSON Schema draft 2020-12). It is checked by an executable test, so the contract on the wire and the contract in
+ the code cannot drift apart.
+ 
++### The native invocations
++
++One physical HTTP request can dispatch the engine **more than once**: a thinking budget wraps the reasoning up and
++continues, a recovery sends the request again. Every dispatch is its own **invocation**, and every invocation owns
++its own measurements, in the record's `invocations` section (ACT-...-AMENDMENT-03, G1).
++
++* The invocation's id is generated immediately before the dispatch, and the engine echoes it back on its `DONE`
++  line. The id, the ordinal, the engine instance, the model and the build revision are bound to the invocation
++  **before** the dispatch, and the terminal evidence is checked against exactly that identity.
++* A measurement of one invocation is **never** published under the identity of another one. A receipt that carries
++  another invocation's id is refused, and the invocation that was waited for keeps its own numbers - a missing
++  measurement stays `null`.
++* The record's own native fields (`prompt.matched_prefix_tokens`, `cache_lookup`, ...) describe **one** invocation:
++  the request's, when there was only one. With more than one they would be a summary of several prompts, so they
++  are `null` and the per-invocation receipts carry the numbers.
++* The request's prompt domain is the prompt the HTTP request carried. An invocation's prompt domain is the prompt
++  **that dispatch** gave the engine. The positions of two different prompts are never added together and never
++  published as one prompt's coverage.
++* The history is bounded: at most 8 receipts and 32 KiB per request. A receipt that does not fit is **counted as a
++  loss** (`measurement_quality.invocations_dropped`) and the record says so - it is never dropped silently.
++
+ ### Identity
+ 
+ * `request_id` is the **server's** id: unique per physical attempt, never derived from the client's. It is
+@@ -154,6 +190,28 @@ correlated** stays in the collection as a diagnostic receipt and contributes **n
+ measurement the server owns (the submitted prompt) stays eligible even when the engine's receipt could not be
+ correlated.
+ 
++### The admission is per measurement class
++
++One rule for every measurement is too coarse: an uncorrelated duration and an accounting that did not close are
++different problems, and each class has its own rule (ACT-...-AMENDMENT-03, G2). The record's and every
++invocation's `measurement_quality.admission` says, per class, whether the measurement may enter the authoritative
++totals:
++
++| Class | It needs |
++|---|---|
++| `http` | the measurement itself. The server's own numbers stand on their own. |
++| `native_prompt_position` | a correlated receipt, valid numbers, and an accounting that is not violated. |
++| `native_execution_work` | a correlated receipt and valid numbers. An accounting that could not be **evaluated** does not exclude a measured work counter; a **violated** one does. |
++| `native_duration` | a correlated receipt and a **whole** invocation. A duration is independently trustworthy: a broken token count does not turn it into a guess, and a batch slot's admission segment is not the whole invocation. |
++| `cache_restore` | a correlated receipt and valid numbers. |
++| `complete_cache_ratio` | a correlated receipt, valid numbers, and an accounting that **satisfied**. The ratio's denominator is "the prompts whose accounting closes". |
++| `partial_diagnostic` | nothing: a partial segment's evidence is published as a diagnostic and never as the whole. |
++
++The **coverage** of the accounting is published with both populations: the native invocations whose accounting
++closed (`eligible_invocations`) and the ones whose receipt never arrived (`missing_invocations`). A lost receipt
++lowers the coverage - it never improves it. The physical HTTP request's own coverage is published beside it
++(`request_coverage`): the two describe different populations.
++
+ ## The HTTP API
+ 
+ Read-only, metadata-only, and on the existing port. No new service, no database, no extra listener.
+@@ -243,8 +301,15 @@ strata_requests_in_flight      strata_telemetry_retained_records
+ strata_requests_queued         strata_telemetry_retained_bytes
+ strata_telemetry_available     strata_cache_reuse_ratio
+ strata_telemetry_accounting_coverage
++strata_telemetry_accounted_invocations
++strata_telemetry_missing_invocations
++strata_telemetry_request_coverage
+ ```
+ 
++`strata_telemetry_accounting_coverage` is the share of the **native invocations** whose cache-reuse accounting is
++complete; `strata_telemetry_request_coverage` is the share of the **physical HTTP requests** with at least one
++complete native accounting. The two describe different populations and are published separately.
++
+ The labels are bounded enumerations only. There is **no** request id, session, engine instance, prompt, user,
+ error message or dynamic model identity in a label.
+ 
+diff --git a/docs/telemetry/strata-request-telemetry-1.schema.json b/docs/telemetry/strata-request-telemetry-1.schema.json
+deleted file mode 100644
+index aad403d2..00000000
+--- a/docs/telemetry/strata-request-telemetry-1.schema.json
++++ /dev/null
+@@ -1,501 +0,0 @@
+-{
+-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+-  "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-1.json",
+-  "title": "Strata per-request telemetry record",
+-  "type": "object",
+-  "required": [
+-    "schema_version",
+-    "identity",
+-    "lifecycle",
+-    "prompt",
+-    "cache",
+-    "timing_ms",
+-    "generation",
+-    "measurement_quality"
+-  ],
+-  "additionalProperties": false,
+-  "properties": {
+-    "schema_version": {
+-      "const": "strata.request-telemetry/1"
+-    },
+-    "seq": {
+-      "type": "integer",
+-      "minimum": 1
+-    },
+-    "identity": {
+-      "type": "object",
+-      "required": [
+-        "request_id",
+-        "client_request_id",
+-        "engine_instance_id",
+-        "server_instance_id",
+-        "engine_invocation_id",
+-        "engine_invocation_ordinal",
+-        "slot_id",
+-        "model_id",
+-        "build_revision"
+-      ],
+-      "additionalProperties": false,
+-      "properties": {
+-        "request_id": {
+-          "type": "string",
+-          "minLength": 1
+-        },
+-        "client_request_id": {
+-          "type": [
+-            "string",
+-            "null"
+-          ],
+-          "maxLength": 128
+-        },
+-        "engine_instance_id": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "server_instance_id": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "engine_invocation_id": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "engine_invocation_ordinal": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 1
+-        },
+-        "slot_id": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "model_id": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "build_revision": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        }
+-      }
+-    },
+-    "lifecycle": {
+-      "type": "object",
+-      "required": [
+-        "state",
+-        "api",
+-        "received_at",
+-        "started_at",
+-        "finished_at",
+-        "http_status",
+-        "finish_reason",
+-        "detail"
+-      ],
+-      "additionalProperties": false,
+-      "properties": {
+-        "state": {
+-          "enum": [
+-            "queued",
+-            "running",
+-            "completed",
+-            "cancelled",
+-            "failed",
+-            "rejected"
+-          ]
+-        },
+-        "api": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "received_at": {
+-          "type": [
+-            "number",
+-            "null"
+-          ]
+-        },
+-        "started_at": {
+-          "type": [
+-            "number",
+-            "null"
+-          ]
+-        },
+-        "finished_at": {
+-          "type": [
+-            "number",
+-            "null"
+-          ]
+-        },
+-        "http_status": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 100,
+-          "maximum": 599
+-        },
+-        "finish_reason": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "detail": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        }
+-      }
+-    },
+-    "prompt": {
+-      "type": "object",
+-      "required": [
+-        "rendered_tokens",
+-        "submitted_tokens",
+-        "matched_prefix_tokens",
+-        "reused_prefix_tokens",
+-        "evaluated_tokens",
+-        "replayed_tokens",
+-        "non_prefix_reused_tokens",
+-        "evaluation_work_tokens",
+-        "first_divergent_token_index"
+-      ],
+-      "additionalProperties": false,
+-      "properties": {
+-        "rendered_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "submitted_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "matched_prefix_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "reused_prefix_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "evaluated_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "replayed_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "non_prefix_reused_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "evaluation_work_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "first_divergent_token_index": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        }
+-      }
+-    },
+-    "cache": {
+-      "type": "object",
+-      "required": [
+-        "source",
+-        "disposition",
+-        "reason_code",
+-        "restore_attempted",
+-        "restore_succeeded",
+-        "restore_ms",
+-        "recurrent_state",
+-        "attention_state",
+-        "checkpoint_state",
+-        "invalidations",
+-        "evictions"
+-      ],
+-      "additionalProperties": false,
+-      "properties": {
+-        "source": {
+-          "enum": [
+-            "none",
+-            "resident_slot",
+-            "conversation_cache",
+-            "restored_checkpoint",
+-            "multiple",
+-            "unknown"
+-          ]
+-        },
+-        "disposition": {
+-          "enum": [
+-            "cold_miss",
+-            "full_hit",
+-            "partial_hit",
+-            "match_without_usable_state",
+-            "bypassed",
+-            "invalidated",
+-            "unknown"
+-          ]
+-        },
+-        "reason_code": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "restore_attempted": {
+-          "type": [
+-            "boolean",
+-            "null"
+-          ]
+-        },
+-        "restore_succeeded": {
+-          "type": [
+-            "boolean",
+-            "null"
+-          ]
+-        },
+-        "restore_ms": {
+-          "type": [
+-            "number",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "recurrent_state": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "attention_state": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "checkpoint_state": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
+-        },
+-        "invalidations": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "evictions": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        }
+-      }
+-    },
+-    "timing_ms": {
+-      "type": "object",
+-      "additionalProperties": {
+-        "type": [
+-          "number",
+-          "null"
+-        ],
+-        "minimum": 0
+-      }
+-    },
+-    "generation": {
+-      "type": "object",
+-      "required": [
+-        "requested_max_output_tokens",
+-        "effective_max_output_tokens",
+-        "generated_tokens",
+-        "emitted_tokens",
+-        "speculative_draft_tokens",
+-        "speculative_accepted_tokens"
+-      ],
+-      "additionalProperties": false,
+-      "properties": {
+-        "requested_max_output_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "effective_max_output_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "generated_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "emitted_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "speculative_draft_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "speculative_accepted_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        }
+-      }
+-    },
+-    "measurement_quality": {
+-      "type": "object",
+-      "required": [
+-        "state",
+-        "unavailable_fields",
+-        "timing_authority",
+-        "first_token_includes_reasoning",
+-        "native_correlation",
+-        "native_partial",
+-        "measurement_valid",
+-        "aggregate_eligible",
+-        "accounting"
+-      ],
+-      "additionalProperties": false,
+-      "properties": {
+-        "state": {
+-          "enum": [
+-            "complete",
+-            "partial",
+-            "unsupported",
+-            "instrumentation_error"
+-          ]
+-        },
+-        "unavailable_fields": {
+-          "type": "object",
+-          "additionalProperties": {
+-            "type": "string"
+-          }
+-        },
+-        "timing_authority": {
+-          "type": "object",
+-          "additionalProperties": {
+-            "type": "string"
+-          }
+-        },
+-        "first_token_includes_reasoning": {
+-          "type": [
+-            "boolean",
+-            "null"
+-          ]
+-        },
+-        "native_correlation": {
+-          "enum": [
+-            "verified",
+-            "unavailable",
+-            "rejected",
+-            "not_applicable"
+-          ]
+-        },
+-        "native_partial": {
+-          "type": "boolean"
+-        },
+-        "measurement_valid": {
+-          "type": "boolean"
+-        },
+-        "aggregate_eligible": {
+-          "type": "boolean"
+-        },
+-        "accounting": {
+-          "type": "object",
+-          "required": [
+-            "state",
+-            "valid",
+-            "problems"
+-          ],
+-          "additionalProperties": false,
+-          "properties": {
+-            "state": {
+-              "enum": [
+-                "satisfied",
+-                "violated",
+-                "unevaluated"
+-              ]
+-            },
+-            "valid": {
+-              "type": [
+-                "boolean",
+-                "null"
+-              ]
+-            },
+-            "problems": {
+-              "type": "array",
+-              "items": {
+-                "type": "string"
+-              }
+-            }
+-          }
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/docs/telemetry/strata-request-telemetry-2.schema.json b/docs/telemetry/strata-request-telemetry-2.schema.json
+new file mode 100644
+index 00000000..089c32c1
+--- /dev/null
++++ b/docs/telemetry/strata-request-telemetry-2.schema.json
+@@ -0,0 +1,932 @@
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-2.json",
++  "title": "Strata per-request telemetry record",
++  "type": "object",
++  "required": [
++    "schema_version",
++    "identity",
++    "lifecycle",
++    "prompt",
++    "cache",
++    "timing_ms",
++    "generation",
++    "measurement_quality",
++    "invocations"
++  ],
++  "additionalProperties": false,
++  "properties": {
++    "schema_version": {
++      "const": "strata.request-telemetry/2"
++    },
++    "seq": {
++      "type": "integer",
++      "minimum": 1
++    },
++    "identity": {
++      "type": "object",
++      "required": [
++        "request_id",
++        "client_request_id",
++        "engine_instance_id",
++        "server_instance_id",
++        "engine_invocation_id",
++        "engine_invocation_ordinal",
++        "slot_id",
++        "model_id",
++        "build_revision"
++      ],
++      "additionalProperties": false,
++      "properties": {
++        "request_id": {
++          "type": "string",
++          "minLength": 1
++        },
++        "client_request_id": {
++          "type": [
++            "string",
++            "null"
++          ],
++          "maxLength": 128
++        },
++        "engine_instance_id": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "server_instance_id": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "engine_invocation_id": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "engine_invocation_ordinal": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 1
++        },
++        "slot_id": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "model_id": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "build_revision": {
++          "type": [
++            "string",
++            "null"
++          ]
++        }
++      }
++    },
++    "lifecycle": {
++      "type": "object",
++      "required": [
++        "state",
++        "api",
++        "received_at",
++        "started_at",
++        "finished_at",
++        "http_status",
++        "finish_reason",
++        "detail"
++      ],
++      "additionalProperties": false,
++      "properties": {
++        "state": {
++          "enum": [
++            "queued",
++            "running",
++            "completed",
++            "cancelled",
++            "failed",
++            "rejected"
++          ]
++        },
++        "api": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "received_at": {
++          "type": [
++            "number",
++            "null"
++          ]
++        },
++        "started_at": {
++          "type": [
++            "number",
++            "null"
++          ]
++        },
++        "finished_at": {
++          "type": [
++            "number",
++            "null"
++          ]
++        },
++        "http_status": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 100,
++          "maximum": 599
++        },
++        "finish_reason": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "detail": {
++          "type": [
++            "string",
++            "null"
++          ]
++        }
++      }
++    },
++    "prompt": {
++      "type": "object",
++      "required": [
++        "rendered_tokens",
++        "submitted_tokens",
++        "matched_prefix_tokens",
++        "reused_prefix_tokens",
++        "evaluated_tokens",
++        "replayed_tokens",
++        "non_prefix_reused_tokens",
++        "evaluation_work_tokens",
++        "first_divergent_token_index"
++      ],
++      "additionalProperties": false,
++      "properties": {
++        "rendered_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "submitted_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "matched_prefix_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "reused_prefix_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "evaluated_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "replayed_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "non_prefix_reused_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "evaluation_work_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "first_divergent_token_index": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        }
++      }
++    },
++    "cache": {
++      "type": "object",
++      "required": [
++        "source",
++        "disposition",
++        "reason_code",
++        "restore_attempted",
++        "restore_succeeded",
++        "restore_ms",
++        "recurrent_state",
++        "attention_state",
++        "checkpoint_state",
++        "invalidations",
++        "evictions"
++      ],
++      "additionalProperties": false,
++      "properties": {
++        "source": {
++          "enum": [
++            "none",
++            "resident_slot",
++            "conversation_cache",
++            "restored_checkpoint",
++            "multiple",
++            "unknown"
++          ]
++        },
++        "disposition": {
++          "enum": [
++            "cold_miss",
++            "full_hit",
++            "partial_hit",
++            "match_without_usable_state",
++            "bypassed",
++            "invalidated",
++            "unknown"
++          ]
++        },
++        "reason_code": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "restore_attempted": {
++          "type": [
++            "boolean",
++            "null"
++          ]
++        },
++        "restore_succeeded": {
++          "type": [
++            "boolean",
++            "null"
++          ]
++        },
++        "restore_ms": {
++          "type": [
++            "number",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "recurrent_state": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "attention_state": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "checkpoint_state": {
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "invalidations": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "evictions": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        }
++      }
++    },
++    "timing_ms": {
++      "type": "object",
++      "additionalProperties": {
++        "type": [
++          "number",
++          "null"
++        ],
++        "minimum": 0
++      }
++    },
++    "generation": {
++      "type": "object",
++      "required": [
++        "requested_max_output_tokens",
++        "effective_max_output_tokens",
++        "generated_tokens",
++        "emitted_tokens",
++        "speculative_draft_tokens",
++        "speculative_accepted_tokens"
++      ],
++      "additionalProperties": false,
++      "properties": {
++        "requested_max_output_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "effective_max_output_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "generated_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "emitted_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "speculative_draft_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        },
++        "speculative_accepted_tokens": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 0
++        }
++      }
++    },
++    "measurement_quality": {
++      "type": "object",
++      "required": [
++        "state",
++        "unavailable_fields",
++        "timing_authority",
++        "first_token_includes_reasoning",
++        "native_correlation",
++        "native_partial",
++        "measurement_valid",
++        "aggregate_eligible",
++        "accounting"
++      ],
++      "additionalProperties": false,
++      "properties": {
++        "state": {
++          "enum": [
++            "complete",
++            "partial",
++            "unsupported",
++            "instrumentation_error"
++          ]
++        },
++        "unavailable_fields": {
++          "type": "object",
++          "additionalProperties": {
++            "type": "string"
++          }
++        },
++        "timing_authority": {
++          "type": "object",
++          "additionalProperties": {
++            "type": "string"
++          }
++        },
++        "first_token_includes_reasoning": {
++          "type": [
++            "boolean",
++            "null"
++          ]
++        },
++        "native_correlation": {
++          "enum": [
++            "verified",
++            "unavailable",
++            "rejected",
++            "not_applicable"
++          ]
++        },
++        "native_partial": {
++          "type": "boolean"
++        },
++        "measurement_valid": {
++          "type": "boolean"
++        },
++        "aggregate_eligible": {
++          "type": "boolean"
++        },
++        "admission": {
++          "type": "object",
++          "additionalProperties": {
++            "type": "boolean"
++          }
++        },
++        "invocation_count": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "invocations_dispatched": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "invocations_dropped": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "invocation_bytes": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "accounting": {
++          "type": "object",
++          "required": [
++            "state",
++            "valid",
++            "problems"
++          ],
++          "additionalProperties": false,
++          "properties": {
++            "state": {
++              "enum": [
++                "satisfied",
++                "violated",
++                "unevaluated"
++              ]
++            },
++            "valid": {
++              "type": [
++                "boolean",
++                "null"
++              ]
++            },
++            "problems": {
++              "type": "array",
++              "items": {
++                "type": "string"
++              }
++            }
++          }
++        }
++      }
++    },
++    "invocations": {
++      "type": "array",
++      "items": {
++        "type": "object",
++        "required": [
++          "identity",
++          "state",
++          "prompt",
++          "cache",
++          "timing_ms",
++          "generation",
++          "measurement_quality"
++        ],
++        "additionalProperties": false,
++        "properties": {
++          "identity": {
++            "type": "object",
++            "required": [
++              "engine_invocation_id",
++              "ordinal",
++              "engine_instance_id",
++              "model_id",
++              "build_revision",
++              "slot_id"
++            ],
++            "additionalProperties": false,
++            "properties": {
++              "engine_invocation_id": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "ordinal": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 1
++              },
++              "engine_instance_id": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "model_id": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "build_revision": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "slot_id": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              }
++            }
++          },
++          "state": {
++            "enum": [
++              "running",
++              "completed",
++              "cancelled",
++              "failed",
++              "rejected"
++            ]
++          },
++          "prompt": {
++            "type": "object",
++            "required": [
++              "rendered_tokens",
++              "submitted_tokens",
++              "matched_prefix_tokens",
++              "reused_prefix_tokens",
++              "evaluated_tokens",
++              "replayed_tokens",
++              "non_prefix_reused_tokens",
++              "evaluation_work_tokens",
++              "first_divergent_token_index"
++            ],
++            "additionalProperties": false,
++            "properties": {
++              "rendered_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "submitted_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "matched_prefix_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "reused_prefix_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "evaluated_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "replayed_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "non_prefix_reused_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "evaluation_work_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "first_divergent_token_index": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              }
++            }
++          },
++          "cache": {
++            "type": "object",
++            "required": [
++              "source",
++              "disposition",
++              "reason_code",
++              "restore_attempted",
++              "restore_succeeded",
++              "restore_ms",
++              "recurrent_state",
++              "attention_state",
++              "checkpoint_state",
++              "invalidations",
++              "evictions"
++            ],
++            "additionalProperties": false,
++            "properties": {
++              "source": {
++                "enum": [
++                  "none",
++                  "resident_slot",
++                  "conversation_cache",
++                  "restored_checkpoint",
++                  "multiple",
++                  "unknown"
++                ]
++              },
++              "disposition": {
++                "enum": [
++                  "cold_miss",
++                  "full_hit",
++                  "partial_hit",
++                  "match_without_usable_state",
++                  "bypassed",
++                  "invalidated",
++                  "unknown"
++                ]
++              },
++              "reason_code": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "restore_attempted": {
++                "type": [
++                  "boolean",
++                  "null"
++                ]
++              },
++              "restore_succeeded": {
++                "type": [
++                  "boolean",
++                  "null"
++                ]
++              },
++              "restore_ms": {
++                "type": [
++                  "number",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "recurrent_state": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "attention_state": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "checkpoint_state": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "invalidations": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "evictions": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              }
++            }
++          },
++          "timing_ms": {
++            "type": "object",
++            "additionalProperties": {
++              "type": [
++                "number",
++                "null"
++              ],
++              "minimum": 0
++            }
++          },
++          "generation": {
++            "type": "object",
++            "required": [
++              "requested_max_output_tokens",
++              "effective_max_output_tokens",
++              "generated_tokens",
++              "emitted_tokens",
++              "speculative_draft_tokens",
++              "speculative_accepted_tokens"
++            ],
++            "additionalProperties": false,
++            "properties": {
++              "requested_max_output_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "effective_max_output_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "generated_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "emitted_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "speculative_draft_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              },
++              "speculative_accepted_tokens": {
++                "type": [
++                  "integer",
++                  "null"
++                ],
++                "minimum": 0
++              }
++            }
++          },
++          "measurement_quality": {
++            "type": "object",
++            "required": [
++              "state",
++              "unavailable_fields",
++              "timing_authority",
++              "native_correlation",
++              "native_partial",
++              "measurement_valid",
++              "accounting",
++              "admission"
++            ],
++            "additionalProperties": false,
++            "properties": {
++              "state": {
++                "enum": [
++                  "complete",
++                  "partial",
++                  "unsupported",
++                  "instrumentation_error"
++                ]
++              },
++              "unavailable_fields": {
++                "type": "object",
++                "additionalProperties": {
++                  "type": "string"
++                }
++              },
++              "timing_authority": {
++                "type": "object",
++                "additionalProperties": {
++                  "type": "string"
++                }
++              },
++              "native_correlation": {
++                "enum": [
++                  "verified",
++                  "unavailable",
++                  "rejected",
++                  "not_applicable"
++                ]
++              },
++              "native_partial": {
++                "type": "boolean"
++              },
++              "measurement_valid": {
++                "type": "boolean"
++              },
++              "accounting": {
++                "type": "object",
++                "required": [
++                  "state",
++                  "valid",
++                  "problems"
++                ],
++                "additionalProperties": false,
++                "properties": {
++                  "state": {
++                    "enum": [
++                      "satisfied",
++                      "violated",
++                      "unevaluated"
++                    ]
++                  },
++                  "valid": {
++                    "type": [
++                      "boolean",
++                      "null"
++                    ]
++                  },
++                  "problems": {
++                    "type": "array",
++                    "items": {
++                      "type": "string"
++                    }
++                  }
++                }
++              },
++              "admission": {
++                "type": "object",
++                "additionalProperties": {
++                  "type": "boolean"
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++}
+diff --git a/serve/reqtelemetry/accounting.py b/serve/reqtelemetry/accounting.py
+index 60511e16..1baf3135 100644
+--- a/serve/reqtelemetry/accounting.py
++++ b/serve/reqtelemetry/accounting.py
+@@ -99,7 +99,19 @@ def measurement_valid(record) -> bool:
+ 
+ def correlation_state(record) -> str:
+     """How well the engine's receipt is tied to this request: verified, unavailable or rejected."""
+-    return getattr(record, "native_correlation", CORRELATION_NOT_APPLICABLE)
++    return correlation_of(record)
++
++
++def correlation_of(obj) -> str:
++    """The correlation state of a record or of an invocation receipt (G1).
++
++    The record aggregates the states of its receipts; a receipt carries its OWN.  One place reads both, so the
++    two cannot drift apart.
++    """
++    state = getattr(obj, "correlation", None)
++    if state is not None:
++        return state
++    return getattr(obj, "native_correlation", CORRELATION_NOT_APPLICABLE)
+ 
+ 
+ def aggregate_eligible(record) -> bool:
+@@ -205,3 +217,94 @@ def accounting_state(record) -> dict:
+                if value is None]
+     return {"state": "unevaluated", "valid": None, "problems": [],
+             "missing": missing + ([] if record.state == "completed" else ["the request did not complete"])}
++
++
++# ---------------------------------------------------------------------------------------------
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G2): the admission is METRIC-SPECIFIC.
++#
++# The predecessor used ONE global predicate (the record is valid, the accounting is not violated, the receipt is
++# correlated) for every measurement.  That made three wrong admissions possible:
++#
++#   * an UNEVALUATED accounting (the complete prompt accounting was not available) was admitted to the COMPLETE
++#     cache-reuse ratio - a ratio whose denominator is "the prompts whose accounting closes" must not count a
++#     prompt whose accounting did not close;
++#   * a NATIVE DURATION was observed in a histogram without the correlation and the segment-completeness checks -
++#     an uncorrelated duration is somebody else's measurement;
++#   * a valid PARTIAL work counter was excluded just because the complete-prompt accounting was unavailable.
++#
++# Each measurement class has its OWN rule now, and the rules are here - one place, so they cannot drift.
++METRIC_HTTP = "http"
++METRIC_NATIVE_PROMPT_POSITION = "native_prompt_position"
++METRIC_NATIVE_EXECUTION_WORK = "native_execution_work"
++METRIC_NATIVE_DURATION = "native_duration"
++METRIC_CACHE_RESTORE = "cache_restore"
++METRIC_COMPLETE_CACHE_RATIO = "complete_cache_ratio"
++METRIC_PARTIAL_DIAGNOSTIC = "partial_diagnostic"
++# the engine's own generation counters: they need a correlated receipt and valid numbers, like the restoration's
++# outcome - they are not part of the prompt's accounting.
++METRIC_NATIVE_GENERATION = "native_generation"
++
++METRICS = (METRIC_HTTP, METRIC_NATIVE_PROMPT_POSITION, METRIC_NATIVE_EXECUTION_WORK, METRIC_NATIVE_DURATION,
++           METRIC_CACHE_RESTORE, METRIC_COMPLETE_CACHE_RATIO, METRIC_PARTIAL_DIAGNOSTIC, METRIC_NATIVE_GENERATION)
++
++
++def invocation_admission(inv, metric: str) -> bool:
++    """Whether a MEASUREMENT CLASS of this invocation may enter an authoritative aggregate (G2).
++
++    `inv` is an invocation receipt (serve/reqtelemetry/invocation.py) or the record itself.  The rules:
++
++      * HTTP            - the server's own numbers.  They stand on their own: a NATIVE measurement that was
++                          refused at the admission boundary does not make the server's own number a guess.
++      * PROMPT_POSITION - the engine's prompt positions (matched, reused, evaluated).  They need a CORRELATED
++                          receipt, valid numbers and an accounting that is not violated.
++      * EXECUTION_WORK  - the work counters (replayed, evaluation work).  They keep their OWN authority: an
++                          UNEVALUATED accounting (the complete prompt accounting was not available) does not
++                          exclude a measured work counter - a VIOLATED identity does.
++      * DURATION        - a native duration.  It is independently trustworthy when the receipt is CORRELATED to
++                          this invocation and the invocation is WHOLE (a batch slot's admission segment is not
++                          the whole invocation).  It does NOT depend on the token accounting: a broken token
++                          count does not turn a measured duration into a guess.
++      * CACHE_RESTORE   - the restoration's outcome: a correlated receipt and valid numbers.
++      * COMPLETE_RATIO  - the complete cache-reuse ratio: a correlated receipt, valid numbers and an account-
++                          ing that SATISFIED - not merely one that is not violated.
++      * PARTIAL         - the diagnostic evidence of a partial segment.  It is published as a diagnostic and
++                          never as the whole invocation.
++    """
++    if metric == METRIC_PARTIAL_DIAGNOSTIC:
++        return True
++    verified = correlation_of(inv) == CORRELATION_VERIFIED
++    valid = measurement_valid(inv)
++    partial = bool(getattr(inv, "native_partial", False))
++    state = inv.accounting_state()["state"]
++    if metric == METRIC_HTTP:
++        return True
++    if metric == METRIC_NATIVE_PROMPT_POSITION:
++        return verified and valid and not partial and state != "violated"
++    if metric == METRIC_NATIVE_EXECUTION_WORK:
++        return verified and valid and not partial and state != "violated"
++    if metric == METRIC_NATIVE_DURATION:
++        return verified and not partial
++    if metric == METRIC_CACHE_RESTORE:
++        return verified and valid and not partial
++    if metric == METRIC_NATIVE_GENERATION:
++        return verified and valid and not partial
++    if metric == METRIC_COMPLETE_CACHE_RATIO:
++        return verified and valid and not partial and state == "satisfied"
++    return False
++
++
++def field_admission(record, name: str, metric: str, inv=None) -> bool:
++    """Whether ONE measurement may enter an authoritative aggregate, for ONE metric class (G2).
++
++    The measurement itself must be a measurement (a whole, non-negative count); then the class rule decides.
++    """
++    target = inv if inv is not None else record
++    value = getattr(target, name, None)
++    if value is None:
++        return False
++    if name in TOKEN_FIELDS and not valid_token_count(value):
++        return False
++    if metric == METRIC_HTTP:
++        # the server's own number: it is a measurement of the request, whatever the engine's receipt says
++        return True
++    return invocation_admission(target, metric)
+diff --git a/serve/reqtelemetry/correlation.py b/serve/reqtelemetry/correlation.py
+index 00e46d40..57c8bbb5 100644
+--- a/serve/reqtelemetry/correlation.py
++++ b/serve/reqtelemetry/correlation.py
+@@ -55,103 +55,119 @@ def new_invocation_id() -> str:
+     return uuid.uuid4().hex
+ 
+ 
+-def _admit(record, name, value):
++def _admit(target, name, value):
+     """One native measurement, at the admission boundary (AMENDMENT-02, G1).
+ 
+-    A measurement that is not a whole, non-negative number is REFUSED: it is not written into the record, the field
+-    stays null and the record says why.  A refused measurement is never clamped, coerced or counted - and the
+-    record is marked as carrying an invalid measurement, so it does not enter the authoritative aggregates.
++    A measurement that is not a whole, non-negative number is REFUSED: it is not written into the receipt, the
++    field stays null and the receipt says why.  A refused measurement is never clamped, coerced or counted - and
++    the receipt is marked as carrying an invalid measurement, so it does not enter the authoritative aggregates.
+     """
+     if value is None:
+         return None
+     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+-        record.measurements_invalid = True
+-        record.mark_unavailable(f"prompt.{name}",
++        target.measurements_invalid = True
++        target.mark_unavailable(f"prompt.{name}",
+                                 f"the engine reported a {name} that is not a whole, non-negative token count",
+                                 INSTRUMENTATION_ERROR)
+         return None
+     return value
+ 
+ 
+-def apply_engine(record: RequestRecord, figures: dict | None, expected_invocation_id: str | None = None):
+-    """The engine's own measurements for this request, into the record.
++def apply_engine(record: RequestRecord, figures: dict | None, expected_invocation_id: str | None = None,
++                 receipt=None, terminal_state: str = "completed", native_segment_only: bool = False):
++    """The engine's own measurements for ONE native invocation, into ITS receipt (AMENDMENT-03, G1).
+ 
+     `figures` is the `telemetry` part of the engine's DONE line: what the engine measured about the cache and about
+     the work it did.  A field the engine did not send stays null - it is NOT a zero, and it is NOT guessed from the
+     server's own timings.
+ 
+-    AMENDMENT-02 (G2/A2): the receipt is bound to the NATIVE INVOCATION, not to the request.  The server knows which
+-    invocation it dispatched (it generated the id itself, immediately before the dispatch) and the engine echoes
+-    that id on its DONE line.  A receipt that carries ANOTHER invocation's id is FOREIGN: none of its numbers are
+-    attached to this request - not even the positional DONE fields outside the telemetry suffix - its aggregates stay
+-    clean, and the request says it had an instrumentation error.  A receipt with no id at all (an older engine)
+-    leaves the correlation explicitly unavailable - never an asserted join.
++    AMENDMENT-02 (G2/A2): the receipt is bound to the NATIVE INVOCATION, not to the request.  AMENDMENT-03 (G1):
++    it is bound to the receipt of THAT invocation - every dispatch owns its own measurements, and a measurement
++    of one invocation is never published under the identity of another one.  The server knows which invocation it
++    dispatched (it generated the id itself, immediately before the dispatch) and the engine echoes that id on its
++    DONE line.  A receipt that carries ANOTHER invocation's id is FOREIGN: none of its numbers are attached to
++    this request - not even the positional DONE fields outside the telemetry suffix - its aggregates stay clean,
++    and the request says it had an instrumentation error.  A receipt with no id at all (an older engine) leaves
++    the correlation explicitly unavailable - never an asserted join.
+ 
+     The return value is the VERDICT: {"correlation": ..., "admitted": bool}.  The caller uses it to decide whether
+     the receipt's other fields (the timings, the generated count) may be applied at all.
+     """
++    expected = expected_invocation_id
++    if expected is None:
++        expected = record.engine_invocation_id
++    if expected is None:
++        expected = record.request_id
++    # the receipt this evidence belongs to: the one the server bound before the dispatch, or a new one for a
++    # caller that did not bind it (the predecessor's path).
++    if receipt is None:
++        receipt = record.invocation_for(expected)
++    if receipt is None:
++        receipt = record.begin_invocation(expected)
+     if not figures:
++        receipt.correlation = CORRELATION_UNAVAILABLE
++        receipt.mark_unavailable("cache", "the engine reported no cache measurements for this invocation")
++        receipt.mark_unavailable("prompt.matched_prefix_tokens", "the engine reported no cache measurements")
+         record.mark_unavailable("cache", "the engine reported no cache measurements for this request")
+         record.mark_unavailable("prompt.matched_prefix_tokens", "the engine reported no cache measurements")
+-        record.native_correlation = CORRELATION_UNAVAILABLE
++        record.native_correlation = record.aggregate_correlation()
++        record._sync_parent()
+         return {"correlation": CORRELATION_UNAVAILABLE, "admitted": False}
+     # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G2): the receipt is BOUND to the request that asked for
+     # it.  The engine echoes the request's own id on its DONE line; a receipt that carries another request's id is
+     # FOREIGN and none of its numbers are attached to this record (the aggregate counters are not touched either -
+     # this record never sees them).  The request itself goes on: a telemetry problem never decides an inference.
+     rid = figures.get("rid")
+-    # the expectation: the invocation this request dispatched.  A record that never dispatched one falls back to
+-    # the request's own id (the predecessor's rule), so an older caller still gets the same protection.
+-    expected = expected_invocation_id
+-    if expected is None:
+-        expected = record.engine_invocation_id
+-    if expected is None:
+-        expected = record.request_id
+     if rid is not None and expected is not None and rid != expected:
++        receipt.correlation = CORRELATION_REJECTED
++        receipt.mark_unavailable("engine_telemetry",
++                                 "the engine's receipt carried another invocation's id: its measurements were "
++                                 "not attached to this invocation", INSTRUMENTATION_ERROR)
+         record.mark_unavailable("engine_telemetry",
+                                 "the engine's receipt carried another invocation's id: its measurements were not "
+                                 "attached to this request", INSTRUMENTATION_ERROR)
+-        record.native_correlation = CORRELATION_REJECTED
+-        # the foreign id is NOT recorded as this request's invocation: the receipt belongs to somebody else
+-        record.engine_invocation_id = None
++        record.native_correlation = record.aggregate_correlation()
++        record._sync_parent()
+         return {"correlation": CORRELATION_REJECTED, "admitted": False}
+     if rid and expected is not None:
+-        record.native_correlation = CORRELATION_VERIFIED
+-        record.engine_invocation_id = rid
++        receipt.correlation = CORRELATION_VERIFIED
++        if record.engine_invocation_id is None:
++            # the dispatcher owns the record's invocation id (it is the LAST dispatch's id); the receipt's id
++            # is never written over it - an earlier invocation's receipt must not become the record's identity
++            record.engine_invocation_id = rid
+     elif rid:
+         # an id the server cannot check against an invocation it dispatched: the correlation stays unavailable
+-        record.native_correlation = CORRELATION_UNAVAILABLE
+-        record.engine_invocation_id = rid
+-        record.mark_unavailable("identity.engine_invocation_id",
+-                                "the engine's receipt carried an id, but this request did not dispatch that "
+-                                "invocation: the native measurements cannot be tied to it by id")
++        receipt.correlation = CORRELATION_UNAVAILABLE
++        receipt.mark_unavailable("identity.engine_invocation_id",
++                                 "the engine's receipt carried an id, but this request did not dispatch that "
++                                 "invocation: the native measurements cannot be tied to it by id")
+     else:
+         # An older engine does not echo the id: the correlation is UNAVAILABLE, never an asserted join.
+-        record.native_correlation = CORRELATION_UNAVAILABLE
+-        record.mark_unavailable("identity.engine_invocation_id",
+-                                "the engine did not echo the invocation's id (an older engine): the native "
+-                                "invocation cannot be tied to this request by id")
++        receipt.correlation = CORRELATION_UNAVAILABLE
++        receipt.mark_unavailable("identity.engine_invocation_id",
++                                 "the engine did not echo the invocation's id (an older engine): the native "
++                                 "invocation cannot be tied to this request by id")
+ 
+-    matched = _admit(record, "matched_prefix_tokens", figures.get("matched"))
+-    reused = _admit(record, "reused_prefix_tokens", figures.get("reused"))
+-    evaluated = _admit(record, "evaluated_tokens", figures.get("evaluated"))
+-    replayed = _admit(record, "replayed_tokens", figures.get("replayed"))
+-    work = _admit(record, "evaluation_work_tokens", figures.get("work"))
++    matched = _admit(receipt, "matched_prefix_tokens", figures.get("matched"))
++    reused = _admit(receipt, "reused_prefix_tokens", figures.get("reused"))
++    evaluated = _admit(receipt, "evaluated_tokens", figures.get("evaluated"))
++    replayed = _admit(receipt, "replayed_tokens", figures.get("replayed"))
++    work = _admit(receipt, "evaluation_work_tokens", figures.get("work"))
+ 
+     # The engine writes the divergent index as: a position (0 or more), -1 for "the sequences agree throughout"
+-    # and -2 for "not measured".  The record's field is null in both of those cases - there is no mismatch to
++    # and -2 for "not measured".  The receipt's field is null in both of those cases - there is no mismatch to
+     # report - and the reason says which of the two it was.
+     divergent = figures.get("divergent")
+     if divergent is not None:
+         if divergent >= 0:
+-            record.first_divergent_token_index = int(divergent)
++            receipt.first_divergent_token_index = int(divergent)
+         elif divergent == -1:
+-            record.mark_unavailable("prompt.first_divergent_token_index",
+-                                    "the sequences agree throughout: there is no mismatch")
++            receipt.mark_unavailable("prompt.first_divergent_token_index",
++                                     "the sequences agree throughout: there is no mismatch")
+         else:
+-            record.mark_unavailable("prompt.first_divergent_token_index",
+-                                    "the engine did not report a divergence index")
+-    record.set_native_cache(
++            receipt.mark_unavailable("prompt.first_divergent_token_index",
++                                     "the engine did not report a divergence index")
++    receipt.set_native_cache(
+         matched_prefix=matched, reused_prefix=reused, evaluated=evaluated,
+         replayed=replayed, evaluation_work=work,
+         source=SOURCE_NAMES.get(figures.get("cache_source", ""), SOURCE_UNKNOWN),
+@@ -162,19 +178,35 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
+         invalidations=figures.get("invalidations"), evictions=figures.get("evictions"))
+     # the engine's own durations: the lookup and the restoration it measured
+     if figures.get("lookup_ms") is not None:
+-        record.set_timing("cache_lookup", figures["lookup_ms"], "native_engine")
++        receipt.set_timing("cache_lookup", figures["lookup_ms"], "native_engine")
+     if figures.get("restore_ms") is not None:
+-        record.set_timing("cache_restore", figures["restore_ms"], "native_engine")
++        receipt.set_timing("cache_restore", figures["restore_ms"], "native_engine")
+     if "slot" in figures:
+         slot = figures["slot"]
+         # the engine writes a slot only when there is one; a stray negative is "no slot", not a slot
+-        record.slot_id = int(slot) if isinstance(slot, int) and not isinstance(slot, bool) and slot >= 0 else None
++        receipt.slot_id = int(slot) if isinstance(slot, int) and not isinstance(slot, bool) and slot >= 0 else None
+     if matched is None:
+-        record.mark_unavailable("prompt.matched_prefix_tokens", "the engine did not report a prefix match")
++        receipt.mark_unavailable("prompt.matched_prefix_tokens", "the engine did not report a prefix match")
+     if reused is None:
+-        record.mark_unavailable("prompt.reused_prefix_tokens", "the engine did not report a reused prefix")
++        receipt.mark_unavailable("prompt.reused_prefix_tokens", "the engine did not report a reused prefix")
+     if evaluated is None:
+-        record.mark_unavailable("prompt.evaluated_tokens", "the engine did not report the tokens it evaluated")
++        receipt.mark_unavailable("prompt.evaluated_tokens", "the engine did not report the tokens it evaluated")
++    # the invocation's OWN prompt domain: what this dispatch gave the engine.  When the caller did not bind it
++    # (the predecessor's path), the request's own prompt is the domain - they are the same for an ordinary
++    # single-dispatch request.
++    if receipt.submitted_tokens is None:
++        receipt.submitted_tokens = record.submitted_tokens
++    # AMENDMENT-03 (G1): the invocation's own terminal state, and its own partial flag
++    receipt.state = terminal_state
++    if native_segment_only:
++        receipt.native_partial = True
++        receipt.mark_unavailable("cache",
++                                 "the engine's batch slot reported only its admission segment: the native "
++                                 "accounting is not the whole invocation")
++    receipt.seal()
++    # the parent's fields are the single invocation's; with more than one invocation they stay null (ambiguous)
++    record.native_correlation = record.aggregate_correlation()
++    record._sync_parent()
+     # AMENDMENT-02 (G1): the receipt's measurements are in the record, but they are only AUTHORITATIVE when the
+     # correlation was verified.  An unavailable correlation (an older engine) keeps the numbers as diagnostics.
+-    return {"correlation": record.native_correlation, "admitted": record.native_correlation == CORRELATION_VERIFIED}
++    return {"correlation": receipt.correlation, "admitted": receipt.correlation == CORRELATION_VERIFIED}
+diff --git a/serve/reqtelemetry/evidence.py b/serve/reqtelemetry/evidence.py
+index c8c24bdf..278c693b 100644
+--- a/serve/reqtelemetry/evidence.py
++++ b/serve/reqtelemetry/evidence.py
+@@ -40,14 +40,30 @@ class EvidenceLog:
+         self.lock = threading.Lock()
+         self.queue = []
+         self.writing = 0                  # the records the worker took out of the queue and is writing now
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G3): the counter domains are exact and apart:
++        #
++        #     submitted = accepted + refused
++        #     accepted  = written + failed + outstanding
++        #
++        # A submission that is REFUSED is not an accepted record: it is counted in its own domain (the
++        # serialization, the capacity or the shutdown), never in the accepted one.  The outstanding records are
++        # what the writer still holds: the QUEUED ones AND the ones it has DETACHED and is writing.
++        self.submitted = 0
+         self.accepted = 0
+         self.written = 0
+-        self.failed = 0
+-        self.dropped = 0
+-        self.errors = 0                   # the same as `failed`: kept for the older name
++        self.failed = 0                  # accepted records that failed while they were written
++        self.refused = 0
++        self.init_failures = 0           # the log could not be opened at all
++        self.serialization_refusals = 0  # the record could not be serialized
++        self.capacity_refusals = 0       # the queue was full
++        self.shutdown_refusals = 0       # the acceptance boundary was closed
++        self.dropped = 0                 # the older name of the refusals
++        self.errors = 0                  # the same as `failed`: kept for the older name
+         self.outstanding_records = 0
+         self.outstanding_bytes = 0
+         self.flush_incomplete = 0         # the shutdown flushes that did not finish (G6)
++        self.closed = False              # the acceptance boundary (G3)
++        self._handle_closed = False
+         self._stop = threading.Event()
+         self._thread = None
+         self._handle = None
+@@ -60,32 +76,57 @@ class EvidenceLog:
+         except OSError:
+             self._handle = None
+             with self.lock:
++                # AMENDMENT-03 (G3): an initialization failure is NEITHER an accepted record nor a failed
++                # accepted record: it has its own domain.
++                self.init_failures += 1
+                 self.errors += 1
+-                self.failed += 1
+             return
+         self._thread = threading.Thread(target=self._loop, daemon=True, name="strata-telemetry-evidence")
+         self._thread.start()
+ 
+     def write(self, record: dict) -> bool:
+-        """Queue a terminal record.  True when it was queued, False when it was dropped or refused."""
+-        if self._handle is None:
+-            # no handle: the record is REFUSED, and it is counted as such (AMENDMENT-02, A5)
+-            with self.lock:
+-                self.failed += 1
++        """Queue a terminal record.  True when it was queued, False when it was refused.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G3): the bound is checked against the
++        AUTHORITATIVE outstanding counter - what the writer really holds, the queued records AND the ones it has
++        detached and is writing.  The old check (`len(queue) + writing`) left the detached records out, so the
++        writer could hold more records than its own limit said.
++        """
++        with self.lock:
++            self.submitted += 1
++            if self._handle is None:
++                # no handle: the record is REFUSED, and it is counted as such (AMENDMENT-02, A5)
++                if self.closed:
++                    self.shutdown_refusals += 1
++                else:
++                    self.init_failures += 1
++                self.refused += 1
++                self.dropped += 1
+                 self.errors += 1
+-            return False
++                return False
++            if self.closed:
++                # the acceptance boundary is closed: a submission that races the shutdown is refused, never
++                # accepted and then abandoned
++                self.shutdown_refusals += 1
++                self.refused += 1
++                self.dropped += 1
++                return False
+         try:
+             line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+         except (TypeError, ValueError):
+             with self.lock:
++                self.serialization_refusals += 1
++                self.refused += 1
++                self.dropped += 1
+                 self.errors += 1
+-                self.failed += 1
+             return False
+         with self.lock:
+             # the bound counts what the writer HOLDS: the queued records AND the one being written right now
+-            if len(self.queue) + self.writing >= self.queue_size \
++            if self.outstanding_records >= self.queue_size \
+                     or self.outstanding_bytes + len(line) > self.queue_bytes:
+-                self.dropped += 1              # the queue is full: the record is DROPPED and counted, never written
++                self.capacity_refusals += 1      # the queue is full: the record is REFUSED and counted
++                self.refused += 1
++                self.dropped += 1
+                 return False
+             self.queue.append(line)
+             self.queue_size_bytes += len(line)
+@@ -100,8 +141,13 @@ class EvidenceLog:
+                 pending, self.queue = self.queue, []
+                 self.queue_size_bytes = 0
+             if not pending:
+-                if self._stop.is_set():
+-                    return                       # the queue is empty and the writer was told to stop
++                with self.lock:
++                    if self.queue:
++                        continue               # something arrived while we looked: take it
++                    if self._stop.is_set():
++                        # the acceptance boundary is closed (the stop is set together with it), so no record can
++                        # arrive any more: nothing is left behind
++                        return
+                 self._stop.wait(0.05)
+                 continue
+             for line in pending:
+@@ -143,8 +189,16 @@ class EvidenceLog:
+ 
+         The worker owns the file handle until it has stopped using it: the handle is closed only after the thread
+         has ended, so a worker that is still writing never writes to a closed handle.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G3): the acceptance boundary closes ATOMICALLY, in
++        the same lock the submissions take, BEFORE the worker is told to stop: a submission that races the
++        shutdown is either accepted before the boundary (and then the worker writes it) or refused (and then it
++        is counted as a shutdown refusal).  Nothing is accepted and abandoned.  When the worker does not stop in
++        time, the handle is closed LATER - by a reaper that waits for the worker - never while it is in use.
+         """
+-        self._stop.set()
++        with self.lock:
++            self.closed = True                 # the acceptance boundary
++            self._stop.set()                   # and the worker's signal, in the same breath
+         stopped = True
+         if self._thread is not None:
+             self._thread.join(timeout=5.0)
+@@ -152,17 +206,38 @@ class EvidenceLog:
+         if not stopped:
+             with self.lock:
+                 self.flush_incomplete += 1       # the writer did not stop: the evidence is incomplete
++            self._start_reaper()
+             return
+-        if self._handle is not None:
++        self._close_handle()
++
++    def _start_reaper(self):
++        """Close the handle when the worker has really stopped (G3).  The handle is never closed while the
++        worker may still be using it."""
++        worker = self._thread
++
++        def reap():
++            if worker is not None:
++                worker.join()
++            self._close_handle()
++
++        threading.Thread(target=reap, daemon=True, name="strata-telemetry-evidence-reaper").start()
++
++    def _close_handle(self):
++        """Close the file handle once, and only when no worker can be using it."""
++        with self.lock:
++            if self._handle_closed:
++                return
++            self._handle_closed = True
++            handle, self._handle = self._handle, None
++        if handle is not None:
+             try:
+-                self._handle.close()
++                handle.close()
+             except OSError:
+                 pass
+-            self._handle = None
+ 
+     def counters(self) -> dict:
+         with self.lock:
+-            # what the writer really did: the lines it wrote, the ones it dropped, the ones that failed, and the
++            # what the writer really did: the lines it wrote, the ones it refused, the ones that failed, and the
+             # queue it is holding now (G6)
+             return {"written": self.written, "dropped": self.dropped, "errors": self.errors,
+                     "queue_size": self.queue_size, "queue_bytes": self.queue_size_bytes,
+@@ -173,4 +248,15 @@ class EvidenceLog:
+                     "failed_records": self.failed, "dropped_records": self.dropped,
+                     "outstanding_records": self.outstanding_records,
+                     "outstanding_bytes": self.outstanding_bytes,
+-                    "incomplete_flushes": self.flush_incomplete}
++                    "incomplete_flushes": self.flush_incomplete,
++                    # AMENDMENT-03 (G3): the exact domains of the acceptance boundary.  The identity
++                    #     submitted = accepted + refused
++                    #     accepted  = written + failed + outstanding
++                    # holds at every moment, and the refusals are told apart by their own cause.
++                    "submitted_records": self.submitted, "refused_records": self.refused,
++                    "initialization_failures": self.init_failures,
++                    "serialization_refusals": self.serialization_refusals,
++                    "capacity_refusals": self.capacity_refusals,
++                    "shutdown_refusals": self.shutdown_refusals,
++                    "write_failures": self.failed,
++                    "closed": self.closed}
+diff --git a/serve/reqtelemetry/invocation.py b/serve/reqtelemetry/invocation.py
+new file mode 100644
+index 00000000..dd958d30
+--- /dev/null
++++ b/serve/reqtelemetry/invocation.py
+@@ -0,0 +1,277 @@
++"""serve/reqtelemetry/invocation.py - the NATIVE INVOCATION's own measurement receipt (G1).
++
++ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): one native dispatch owns ONE measurement receipt.
++
++The predecessor generated a fresh invocation id for every dispatch, but the CANONICAL RECORD still carried a
++single mutable set of native measurements.  So the measurements of an earlier invocation survived under the
++identity of a later one: invocation B's `evaluated` and `lookup_ms` were published as invocation C's.
++
++This module is the fix: every dispatch gets its OWN receipt, bound to the invocation id, the ordinal, the engine
++instance, the model and the build identity BEFORE the dispatch, and it is validated against that identity when
++the terminal evidence arrives.  The receipts are kept INDEPENDENTLY: a receipt that does not report a measurement
++keeps that measurement null - it never inherits a value from another invocation.
++
++THE PROMPT DOMAINS (G1, G2c): the parent record's `submitted_tokens` is the REQUEST's prompt domain - the prompt
++the HTTP request carried.  An invocation's `submitted_tokens` is ITS OWN prompt domain - the prompt that dispatch
++gave the engine.  They are equal for the ordinary single-dispatch request.  A recovery dispatch that sends a
++DIFFERENT prompt has a different prompt domain, and its prompt positions are never added to the request's own
++prompt coverage: the sum of distinct positions of two different prompts is not one prompt's distinct coverage.
++
++THE BOUNDS (G1): the receipts of one request are bounded by COUNT and by BYTES, and every receipt that does not
++fit is counted as a loss - a lost receipt is visible, never silently dropped:
++
++    MAX_INVOCATION_RECORDS  how many receipts one request keeps
++    MAX_INVOCATION_BYTES    how many bytes of receipts one request keeps
++
++The oldest receipt is the one that goes when the bound is reached: the LAST dispatch is the one the request's
++terminal outcome belongs to.  The loss is counted in `invocations_dropped` and it is published in the record.
++"""
++from __future__ import annotations
++
++from serve.reqtelemetry.vocabulary import (COMPLETE, INSTRUMENTATION_ERROR, MAX_INVOCATION_BYTES,
++                                           MAX_INVOCATION_RECORDS, PARTIAL, UNSUPPORTED)
++
++
++def _num(value):
++    """A number or None: 0 stays 0 (a measured zero), anything that is not a number becomes null."""
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return None
++    return value
++
++
++class InvocationReceipt:
++    """One native dispatch's OWN measurements.
++
++    It carries the same native vocabulary as the record (the prompt positions, the cache attribution, the
++    durations, the generation counters) and it keeps its OWN correlation, its OWN validity and its OWN accounting
++    state.  Two invocations of the same request never share a field.
++    """
++
++    def __init__(self, invocation_id, ordinal, engine_instance_id=None, model_id=None, build_revision=None):
++        self.invocation_id = invocation_id
++        self.ordinal = ordinal
++        self.engine_instance_id = engine_instance_id
++        self.model_id = model_id
++        self.build_revision = build_revision
++        # how well this receipt's evidence is tied to THIS invocation: verified, unavailable or rejected
++        self.correlation = "not_applicable"
++        # the invocation's own terminal state: "running" until its terminal evidence arrives
++        self.state = "running"
++        # the engine sent a measurement that is not a measurement (AMENDMENT-02, G1)
++        self.measurements_invalid = False
++        # the native figures cover one segment of the invocation only (AMENDMENT-02, A9)
++        self.native_partial = False
++        # the prompt this dispatch gave the engine (the invocation's OWN prompt domain)
++        self.submitted_tokens = None
++        self.rendered_tokens = None
++        self.slot_id = None
++        self.matched_prefix_tokens = None
++        self.reused_prefix_tokens = None
++        self.evaluated_tokens = None
++        self.replayed_tokens = None
++        self.non_prefix_reused_tokens = None
++        self.evaluation_work_tokens = None
++        self.first_divergent_token_index = None
++        # the cache attribution
++        self.cache_source = "unknown"
++        self.cache_disposition = "unknown"
++        self.cache_reason_code = None
++        self.cache_restore_attempted = None
++        self.cache_restore_succeeded = None
++        self.cache_restore_ms = None
++        self.cache_recurrent_state = None
++        self.cache_attention_state = None
++        self.cache_checkpoint_state = None
++        self.cache_invalidations = None
++        self.cache_evictions = None
++        # the durations (milliseconds) and who measured them
++        self.timing = {}
++        self.timing_authority = {}
++        # the generation
++        self.requested_max_output_tokens = None
++        self.effective_max_output_tokens = None
++        self.generated_tokens = None
++        self.emitted_tokens = None
++        self.speculative_draft_tokens = None
++        self.speculative_accepted_tokens = None
++        self.finish_reason = None
++        # why a measurement is missing
++        self.unavailable = {}
++        self.quality = COMPLETE
++        self.accounting = {"state": "unevaluated", "valid": None, "problems": []}
++
++
++    # ------------------------------------------------------------------ the measurements
++    def mark_unavailable(self, field, reason, quality=UNSUPPORTED):
++        """A measurement this invocation could not make: the field stays null and the receipt says why."""
++        self.unavailable[field] = reason
++        if quality == INSTRUMENTATION_ERROR:
++            self.quality = INSTRUMENTATION_ERROR
++        elif self.quality == COMPLETE:
++            self.quality = PARTIAL
++
++    def set_timing(self, name, ms, authority):
++        """A duration in milliseconds, from a monotonic clock, with the authority that measured it."""
++        value = _num(ms)
++        if value is None:
++            return
++        self.timing[name] = round(float(value), 3)
++        self.timing_authority[name] = authority
++
++    def set_native_cache(self, *, matched_prefix=None, reused_prefix=None, evaluated=None, replayed=None,
++                         non_prefix_reused=None, evaluation_work=None, first_divergent=None,
++                         source=None, disposition=None, reason_code=None, restore_attempted=None,
++                         restore_succeeded=None, restore_ms=None, recurrent_state=None, attention_state=None,
++                         checkpoint_state=None, invalidations=None, evictions=None):
++        """What the NATIVE ENGINE measured about the cache and the prompt, for THIS invocation."""
++        if matched_prefix is not None:
++            self.matched_prefix_tokens = _num(matched_prefix)
++        if reused_prefix is not None:
++            self.reused_prefix_tokens = _num(reused_prefix)
++        if evaluated is not None:
++            self.evaluated_tokens = _num(evaluated)
++        if replayed is not None:
++            self.replayed_tokens = _num(replayed)
++        if non_prefix_reused is not None:
++            self.non_prefix_reused_tokens = _num(non_prefix_reused)
++        if evaluation_work is not None:
++            self.evaluation_work_tokens = _num(evaluation_work)
++        if first_divergent is not None:
++            self.first_divergent_token_index = _num(first_divergent)
++        if source is not None:
++            self.cache_source = source
++        if disposition is not None:
++            self.cache_disposition = disposition
++        if reason_code is not None:
++            self.cache_reason_code = reason_code
++        if restore_attempted is not None:
++            self.cache_restore_attempted = restore_attempted
++        if restore_succeeded is not None:
++            self.cache_restore_succeeded = restore_succeeded
++        if restore_ms is not None:
++            self.cache_restore_ms = _num(restore_ms)
++        if recurrent_state is not None:
++            self.cache_recurrent_state = recurrent_state
++        if attention_state is not None:
++            self.cache_attention_state = attention_state
++        if checkpoint_state is not None:
++            self.cache_checkpoint_state = checkpoint_state
++        if invalidations is not None:
++            self.cache_invalidations = _num(invalidations)
++        if evictions is not None:
++            self.cache_evictions = _num(evictions)
++
++    def set_generation(self, *, requested_max=None, effective_max=None, generated=None, emitted=None,
++                       draft_tokens=None, accepted_tokens=None, finish_reason=None):
++        """What this invocation generated."""
++        if requested_max is not None:
++            self.requested_max_output_tokens = _num(requested_max)
++        if effective_max is not None:
++            self.effective_max_output_tokens = _num(effective_max)
++        if generated is not None:
++            self.generated_tokens = _num(generated)
++        if emitted is not None:
++            self.emitted_tokens = _num(emitted)
++        if draft_tokens is not None:
++            self.speculative_draft_tokens = _num(draft_tokens)
++        if accepted_tokens is not None:
++            self.speculative_accepted_tokens = _num(accepted_tokens)
++        if finish_reason is not None:
++            self.finish_reason = finish_reason
++
++    # ------------------------------------------------------------------ the accounting rules
++    def seal(self):
++        """Close the receipt: the structural zero of the reuse outside the prefix, and its own accounting state."""
++        if self.non_prefix_reused_tokens is None and self.reused_prefix_tokens is not None:
++            # Strata's execution path reuses a CONTIGUOUS prefix only, so the reuse outside the prefix is a
++            # STRUCTURAL ZERO, not an unmeasured value (include/strata/program/reqtelemetry.hpp).
++            self.non_prefix_reused_tokens = 0
++        self.accounting = self.accounting_state()
++        if self.accounting["state"] == "violated" and self.quality == COMPLETE:
++            self.quality = PARTIAL
++        return self
++
++    def conservation(self) -> list:
++        """The accounting identities that must hold - CHECKED, never enforced."""
++        from serve.reqtelemetry import accounting
++        return accounting.conservation(self)
++
++    def identity_evaluable(self) -> bool:
++        """Whether the sum identity can be evaluated at all."""
++        from serve.reqtelemetry import accounting
++        return accounting.identity_evaluable(self)
++
++    # ------------------------------------------------------------------ the receipt itself
++    def to_dict(self) -> dict:
++        """The receipt as it goes into the record: its own measurements, its own admission decisions."""
++        from serve.reqtelemetry import accounting
++        admission = {metric: accounting.invocation_admission(self, metric) for metric in accounting.METRICS}
++        return {
++            "identity": {
++                "engine_invocation_id": self.invocation_id,
++                "ordinal": self.ordinal,
++                "engine_instance_id": self.engine_instance_id,
++                "model_id": self.model_id,
++                "build_revision": self.build_revision,
++                "slot_id": self.slot_id,
++            },
++            "state": self.state,
++            "prompt": {
++                "rendered_tokens": self.rendered_tokens,
++                "submitted_tokens": self.submitted_tokens,
++                "matched_prefix_tokens": self.matched_prefix_tokens,
++                "reused_prefix_tokens": self.reused_prefix_tokens,
++                "evaluated_tokens": self.evaluated_tokens,
++                "replayed_tokens": self.replayed_tokens,
++                "non_prefix_reused_tokens": self.non_prefix_reused_tokens,
++                "evaluation_work_tokens": self.evaluation_work_tokens,
++                "first_divergent_token_index": self.first_divergent_token_index,
++            },
++            "cache": {
++                "source": self.cache_source,
++                "disposition": self.cache_disposition,
++                "reason_code": self.cache_reason_code,
++                "restore_attempted": self.cache_restore_attempted,
++                "restore_succeeded": self.cache_restore_succeeded,
++                "restore_ms": self.cache_restore_ms,
++                "recurrent_state": self.cache_recurrent_state,
++                "attention_state": self.cache_attention_state,
++                "checkpoint_state": self.cache_checkpoint_state,
++                "invalidations": self.cache_invalidations,
++                "evictions": self.cache_evictions,
++            },
++            "timing_ms": {k: self.timing[k] for k in sorted(self.timing)},
++            "generation": {
++                "requested_max_output_tokens": self.requested_max_output_tokens,
++                "effective_max_output_tokens": self.effective_max_output_tokens,
++                "generated_tokens": self.generated_tokens,
++                "emitted_tokens": self.emitted_tokens,
++                "speculative_draft_tokens": self.speculative_draft_tokens,
++                "speculative_accepted_tokens": self.speculative_accepted_tokens,
++            },
++            "measurement_quality": {
++                "state": self.quality,
++                "unavailable_fields": dict(sorted(self.unavailable.items())),
++                "timing_authority": dict(sorted(self.timing_authority.items())),
++                "native_correlation": self.correlation,
++                "native_partial": self.native_partial,
++                "measurement_valid": self.measurement_valid(),
++                "accounting": {"state": self.accounting.get("state", "unevaluated"),
++                               "valid": self.accounting.get("valid"),
++                               "problems": list(self.accounting.get("problems") or [])},
++                # the per-metric admission decisions of THIS invocation (G2): one global predicate for all
++                # measurements is what made an uncorrelated duration and an unevaluated accounting admissible
++                "admission": admission,
++            },
++        }
++
++
++    def accounting_state(self) -> dict:
++        """This invocation's own accounting state: satisfied, violated or unevaluated."""
++        from serve.reqtelemetry import accounting
++        return accounting.accounting_state(self)
++
++    def measurement_valid(self) -> bool:
++        """Whether this receipt's own numbers are measurements at all."""
++        from serve.reqtelemetry import accounting
++        return accounting.measurement_valid(self)
+diff --git a/serve/reqtelemetry/record.py b/serve/reqtelemetry/record.py
+index 1356ff0e..668704d2 100644
+--- a/serve/reqtelemetry/record.py
++++ b/serve/reqtelemetry/record.py
+@@ -23,15 +23,28 @@ import json
+ import time
+ import uuid
+ 
++from serve.reqtelemetry.accounting import (CORRELATION_REJECTED, CORRELATION_UNAVAILABLE, CORRELATION_VERIFIED,
++                                           METRICS as METRIC_CLASSES)
++from serve.reqtelemetry.invocation import InvocationReceipt
+ from serve.reqtelemetry.vocabulary import (CLIENT_ID_ALLOWED, CLIENT_ID_MAX, COMPLETE, DEFAULT_PAGE_SIZE,
+                                          DEFAULT_RETENTION_BYTES, DEFAULT_RETENTION_RECORDS, DISPOSITIONS,
+                                          DISPOSITION_BYPASSED, DISPOSITION_COLD_MISS, DISPOSITION_FULL_HIT,
+                                          DISPOSITION_INVALIDATED, DISPOSITION_MATCH_WITHOUT_STATE,
+                                          DISPOSITION_PARTIAL_HIT, DISPOSITION_UNKNOWN, INSTRUMENTATION_ERROR,
+-                                         MAXIMUM_PAGE_SIZE, PARTIAL, SCHEMA_VERSION, SOURCES, SOURCE_CONVERSATION_CACHE,
++                                         MAXIMUM_PAGE_SIZE, MAX_INVOCATION_BYTES, MAX_INVOCATION_RECORDS, PARTIAL,
++                                         SCHEMA_VERSION, SOURCES, SOURCE_CONVERSATION_CACHE,
+                                          SOURCE_MULTIPLE, SOURCE_NONE, SOURCE_RESIDENT_SLOT,
+                                          SOURCE_RESTORED_CHECKPOINT, SOURCE_UNKNOWN, STATES, UNSUPPORTED)
+ 
++
++def _receipt_size(receipt) -> int:
++    """The UTF-8 BYTES of one invocation receipt: the bound of the per-request invocation history is a byte
++    budget, and a character count is not a byte count."""
++    try:
++        return len(json.dumps(receipt.to_dict(), ensure_ascii=False).encode("utf-8"))
++    except (TypeError, ValueError):
++        return 0
++
+ def valid_client_request_id(value) -> bool:
+     """True when a client-supplied request id may be kept: printable ASCII, bounded, no whitespace or control
+     characters.  Anything else is dropped (the request still runs; it just has no client id)."""
+@@ -133,6 +146,15 @@ class RequestRecord:
+         # AMENDMENT-02 (A9): the native figures cover only ONE segment of the invocation (a batch slot's
+         # admission segment): they stay in the record as diagnostics and do not enter the authoritative totals.
+         self.native_partial = False
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the per-invocation measurement receipts.
++        # Every native dispatch owns ONE receipt, and the measurements of one invocation never appear under the
++        # identity of another one.  The bounds are a COUNT and a BYTE budget; a receipt that does not fit is
++        # counted as a loss, never dropped silently.
++        self.invocations = []
++        self.invocations_total = 0            # how many native invocations this request dispatched
++        self.invocations_bytes = 0
++        self.invocations_dropped = 0
++        self.invocations_dropped_bytes = 0
+         # AMENDMENT-02 (G1): the engine sent a measurement that is not a measurement (a negative count, a
+         # fraction, a bool).  It was refused at the admission boundary and the record says so.
+         self.measurements_invalid = False
+@@ -284,6 +306,148 @@ class RequestRecord:
+         if finish_reason is not None:
+             self.finish_reason = finish_reason
+ 
++    # ------------------------------------------------------------------ the native invocations (G1)
++    def begin_invocation(self, invocation_id, ordinal=None, engine_instance_id=None, model_id=None,
++                         build_revision=None):
++        """The measurement receipt of ONE native dispatch (AMENDMENT-03, G1).
++
++        The receipt is bound to the invocation id, the ordinal, the engine instance, the model and the build
++        identity IMMEDIATELY BEFORE the dispatch, so the terminal evidence can be validated against exactly that
++        identity - and against nothing else.  The receipt is created empty: a measurement that the invocation
++        does not report stays null in it, and it never inherits a value from another invocation.
++        """
++        if invocation_id is None:
++            return None
++        existing = self.invocation_for(invocation_id)
++        if existing is not None:
++            return existing
++        receipt = InvocationReceipt(invocation_id,
++                                    int(ordinal) if ordinal else len(self.invocations) + 1,
++                                    engine_instance_id=engine_instance_id if engine_instance_id is not None
++                                    else self.engine_instance_id,
++                                    model_id=model_id if model_id is not None else self.model_id,
++                                    build_revision=build_revision if build_revision is not None
++                                    else self.build_revision)
++        self.invocations_total += 1
++        self._add_receipt(receipt)
++        return receipt
++
++    def invocation_for(self, invocation_id):
++        """The receipt of one invocation id, or None."""
++        if invocation_id is None:
++            return None
++        for receipt in self.invocations:
++            if receipt.invocation_id == invocation_id:
++                return receipt
++        return None
++
++    def _add_receipt(self, receipt):
++        """Keep the receipt inside the documented bounds; a receipt that does not fit is COUNTED as a loss."""
++        size = _receipt_size(receipt)
++        receipt._size = size
++        while self.invocations and (len(self.invocations) >= MAX_INVOCATION_RECORDS
++                                    or self.invocations_bytes + size > MAX_INVOCATION_BYTES):
++            dropped = self.invocations.pop(0)
++            dropped_size = getattr(dropped, "_size", 0)
++            self.invocations_bytes -= dropped_size
++            self.invocations_dropped += 1
++            self.invocations_dropped_bytes += dropped_size
++        self.invocations.append(receipt)
++        self.invocations_bytes += size
++        self._sync_parent()
++        self._merge_unavailable()
++        if self.invocations_dropped:
++            self.mark_unavailable("invocations",
++                                  f"{self.invocations_dropped} native invocation receipt(s) did not fit in the "
++                                  f"record's bounds ({MAX_INVOCATION_RECORDS} receipts, {MAX_INVOCATION_BYTES} bytes) "
++                                  f"and were dropped: the record does not show them")
++
++    def _sync_parent(self):
++        """The parent's native scalars describe ONE invocation - and only when that is unambiguous (G1).
++
++        With one native invocation the parent's fields are that invocation's fields (the predecessor's contract).
++        With more than one they would be a summary of several prompts, which is ambiguous: they are null, the
++        record says so, and the per-invocation receipts carry the numbers.
++        """
++        if self.invocations_total <= 1:
++            if len(self.invocations) == 1:
++                self._mirror_receipt(self.invocations[0])
++            self._merge_unavailable()
++            return
++        self._clear_native_fields()
++        self._merge_unavailable()
++
++    def _merge_unavailable(self):
++        """The receipts' own "why this is missing" reasons reach the record too: the operator reads the record."""
++        for receipt in self.invocations:
++            for field, reason in receipt.unavailable.items():
++                self.unavailable.setdefault(field, reason)
++
++    def _mirror_receipt(self, receipt):
++        """Copy one receipt's native measurements into the parent's fields (the unambiguous single-invocation
++        case).  A REJECTED receipt is never mirrored: its numbers belong to somebody else."""
++        if receipt.correlation == CORRELATION_REJECTED:
++            return
++        self.matched_prefix_tokens = receipt.matched_prefix_tokens
++        self.reused_prefix_tokens = receipt.reused_prefix_tokens
++        self.evaluated_tokens = receipt.evaluated_tokens
++        self.replayed_tokens = receipt.replayed_tokens
++        self.non_prefix_reused_tokens = receipt.non_prefix_reused_tokens
++        self.evaluation_work_tokens = receipt.evaluation_work_tokens
++        self.first_divergent_token_index = receipt.first_divergent_token_index
++        self.cache_source = receipt.cache_source
++        self.cache_disposition = receipt.cache_disposition
++        self.cache_reason_code = receipt.cache_reason_code
++        self.cache_restore_attempted = receipt.cache_restore_attempted
++        self.cache_restore_succeeded = receipt.cache_restore_succeeded
++        self.cache_restore_ms = receipt.cache_restore_ms
++        self.cache_recurrent_state = receipt.cache_recurrent_state
++        self.cache_attention_state = receipt.cache_attention_state
++        self.cache_checkpoint_state = receipt.cache_checkpoint_state
++        self.cache_invalidations = receipt.cache_invalidations
++        self.cache_evictions = receipt.cache_evictions
++        self.generated_tokens = receipt.generated_tokens
++        self.speculative_draft_tokens = receipt.speculative_draft_tokens
++        self.speculative_accepted_tokens = receipt.speculative_accepted_tokens
++        self.slot_id = receipt.slot_id
++        for name, value in receipt.timing.items():
++            self.set_timing(name, value, receipt.timing_authority.get(name, "native_engine"))
++        self.native_partial = receipt.native_partial
++        self.measurements_invalid = receipt.measurements_invalid
++        self.native_correlation = receipt.correlation
++
++    def _clear_native_fields(self):
++        """The parent's native fields are AMBIGUOUS (more than one invocation): they are null, not a guess."""
++        self.matched_prefix_tokens = None
++        self.reused_prefix_tokens = None
++        self.evaluated_tokens = None
++        self.replayed_tokens = None
++        self.non_prefix_reused_tokens = None
++        self.evaluation_work_tokens = None
++        self.first_divergent_token_index = None
++        self.cache_source = SOURCE_UNKNOWN
++        self.cache_disposition = DISPOSITION_UNKNOWN
++        self.cache_reason_code = None
++        self.cache_restore_attempted = None
++        self.cache_restore_succeeded = None
++        self.cache_restore_ms = None
++        self.cache_recurrent_state = None
++        self.cache_attention_state = None
++        self.cache_checkpoint_state = None
++        self.cache_invalidations = None
++        self.cache_evictions = None
++        self.generated_tokens = None
++        self.speculative_draft_tokens = None
++        self.speculative_accepted_tokens = None
++        self.slot_id = None
++        self.measurements_invalid = any(receipt.measurements_invalid for receipt in self.invocations)
++        for name in ("cache_lookup", "cache_restore", "prefill_wall", "decode_wall"):
++            self.timing.pop(name, None)
++            self.timing_authority.pop(name, None)
++        self.native_partial = any(receipt.native_partial for receipt in self.invocations)
++
++
++
+     # ------------------------------------------------------------------ the accounting rules
+     def seal(self, state=None, http_status=None, finish_reason=None, detail=None):
+         """Close the record: the state it ended in, and the checks that describe how complete it is.
+@@ -300,6 +464,11 @@ class RequestRecord:
+         if detail is not None:
+             self.outcome_detail = detail
+         self.finished_at = time.time()
++        # AMENDMENT-03 (G1): every receipt closes with its OWN accounting, and the parent is re-synced: the
++        # parent's native scalars are the single invocation's, or null when the request dispatched more than one.
++        for receipt in self.invocations:
++            receipt.seal()
++        self._sync_parent()
+         self.cache_disposition = self.derive_disposition()
+         if self.state in ("cancelled", "failed", "rejected") and self.quality == COMPLETE:
+             self.quality = PARTIAL
+@@ -388,6 +557,10 @@ class RequestRecord:
+                 "evictions": self.cache_evictions,
+             },
+             "timing_ms": {k: self.timing[k] for k in sorted(self.timing)},
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the per-invocation receipts.  Each one
++            # carries its own measurements, its own correlation and its own admission decisions; the parent's
++            # native scalars above are null when the request dispatched more than one invocation.
++            "invocations": [receipt.to_dict() for receipt in self.invocations],
+             "generation": {
+                 "requested_max_output_tokens": self.requested_max_output_tokens,
+                 "effective_max_output_tokens": self.effective_max_output_tokens,
+@@ -404,16 +577,55 @@ class RequestRecord:
+                 # AMENDMENT-02 (G1): the record says whether its numbers may enter the authoritative aggregates,
+                 # and why not when they may not.  The three decisions stay apart: the measurements are valid, the
+                 # accounting is not violated, and the engine's receipt is correlated to this request.
+-                "native_correlation": self.native_correlation,
++                "native_correlation": self.aggregate_correlation(),
+                 "native_partial": self.native_partial,
+                 "measurement_valid": self.measurement_valid(),
+                 "aggregate_eligible": self.aggregate_eligible(),
+                 "accounting": {"state": self.accounting.get("state", "unevaluated"),
+                                "valid": self.accounting.get("valid"),
+                                "problems": list(self.accounting.get("problems") or [])},
++                # AMENDMENT-03 (G2): the admission decisions are PER METRIC CLASS.  One global predicate for
++                # every measurement is what admitted an uncorrelated duration and an unevaluated accounting to
++                # aggregates they do not belong in.
++                "admission": {metric: self.metric_admission(metric) for metric in METRIC_CLASSES},
++                # AMENDMENT-03 (G1): the invocation history of this request and its bounds
++                "invocation_count": len(self.invocations),
++                "invocations_dispatched": self.invocations_total,
++                "invocations_dropped": self.invocations_dropped,
++                "invocation_bytes": self.invocations_bytes,
+             },
+         }
+ 
++    def aggregate_correlation(self) -> str:
++        """The record's correlation state: the receipts' OWN states (G1).
++
++        One receipt: its own state.  Several receipts: VERIFIED only when every one of them is verified; a
++        rejected receipt (a foreign or a stale one) makes the record's state rejected - the record then says
++        that something was wrong with the evidence.  Anything else is unavailable, never an asserted join.
++        """
++        if not self.invocations:
++            return self.native_correlation
++        states = [receipt.correlation for receipt in self.invocations]
++        if any(state == CORRELATION_REJECTED for state in states):
++            return CORRELATION_REJECTED
++        if all(state == CORRELATION_VERIFIED for state in states):
++            return CORRELATION_VERIFIED
++        return CORRELATION_UNAVAILABLE
++
++    def metric_admission(self, metric: str) -> bool:
++        """Whether this RECORD's own measurements of one metric class may enter an authoritative aggregate.
++
++        The record's native fields are the single invocation's - so they are admitted exactly when that
++        invocation is.  With more than one invocation the parent's native fields are null (ambiguous), so the
++        native classes are not admitted at the record level: each receipt decides for itself.
++        """
++        from serve.reqtelemetry import accounting
++        if metric == accounting.METRIC_HTTP:
++            return True
++        if self.invocations_total > 1:
++            return False
++        return accounting.invocation_admission(self, metric)
++
+     # ------------------------------------------------------------------ the admission decisions
+     def measurement_valid(self) -> bool:
+         """Whether the record's own numbers are measurements at all (whole, non-negative counts)."""
+diff --git a/serve/reqtelemetry/schema.py b/serve/reqtelemetry/schema.py
+index d0ec7563..fb58783d 100644
+--- a/serve/reqtelemetry/schema.py
++++ b/serve/reqtelemetry/schema.py
+@@ -23,11 +23,11 @@ def _str_or_null(max_length=None):
+ # executable test, so the contract on the wire and the contract in the code cannot drift apart.
+ SCHEMA = {
+     "$schema": "https://json-schema.org/draft/2020-12/schema",
+-    "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-1.json",
++    "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-2.json",
+     "title": "Strata per-request telemetry record",
+     "type": "object",
+     "required": ["schema_version", "identity", "lifecycle", "prompt", "cache", "timing_ms", "generation",
+-                 "measurement_quality"],
++                 "measurement_quality", "invocations"],
+     "additionalProperties": False,
+     "properties": {
+         "schema_version": {"const": SCHEMA_VERSION},
+@@ -138,6 +138,13 @@ SCHEMA = {
+                 "native_partial": {"type": "boolean"},
+                 "measurement_valid": {"type": "boolean"},
+                 "aggregate_eligible": {"type": "boolean"},
++                # AMENDMENT-03 (G2): the admission decisions are PER METRIC CLASS, and the invocation history's
++                # own numbers are published beside them
++                "admission": {"type": "object", "additionalProperties": {"type": "boolean"}},
++                "invocation_count": {"type": "integer", "minimum": 0},
++                "invocations_dispatched": {"type": "integer", "minimum": 0},
++                "invocations_dropped": {"type": "integer", "minimum": 0},
++                "invocation_bytes": {"type": "integer", "minimum": 0},
+                 "accounting": {
+                     "type": "object",
+                     "required": ["state", "valid", "problems"],
+@@ -154,6 +161,55 @@ SCHEMA = {
+ }
+ 
+ 
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the per-invocation receipts are part of the
++# contract.  They are built from the SAME sub-schemas as the record's own sections, so the two cannot drift.
++SCHEMA["properties"]["invocations"] = {
++    "type": "array",
++    "items": {
++        "type": "object",
++        "required": ["identity", "state", "prompt", "cache", "timing_ms", "generation", "measurement_quality"],
++        "additionalProperties": False,
++        "properties": {
++            "identity": {
++                "type": "object",
++                "required": ["engine_invocation_id", "ordinal", "engine_instance_id", "model_id", "build_revision",
++                             "slot_id"],
++                "additionalProperties": False,
++                "properties": {
++                    "engine_invocation_id": _str_or_null(),
++                    "ordinal": {"type": ["integer", "null"], "minimum": 1},
++                    "engine_instance_id": _str_or_null(),
++                    "model_id": _str_or_null(),
++                    "build_revision": _str_or_null(),
++                    "slot_id": {"type": ["integer", "null"], "minimum": 0},
++                },
++            },
++            "state": {"enum": ["running", "completed", "cancelled", "failed", "rejected"]},
++            "prompt": SCHEMA["properties"]["prompt"],
++            "cache": SCHEMA["properties"]["cache"],
++            "timing_ms": SCHEMA["properties"]["timing_ms"],
++            "generation": SCHEMA["properties"]["generation"],
++            "measurement_quality": {
++                "type": "object",
++                "required": ["state", "unavailable_fields", "timing_authority", "native_correlation",
++                             "native_partial", "measurement_valid", "accounting", "admission"],
++                "additionalProperties": False,
++                "properties": {
++                    "state": {"enum": [COMPLETE, PARTIAL, UNSUPPORTED, INSTRUMENTATION_ERROR]},
++                    "unavailable_fields": {"type": "object", "additionalProperties": {"type": "string"}},
++                    "timing_authority": {"type": "object", "additionalProperties": {"type": "string"}},
++                    "native_correlation": {"enum": ["verified", "unavailable", "rejected", "not_applicable"]},
++                    "native_partial": {"type": "boolean"},
++                    "measurement_valid": {"type": "boolean"},
++                    "accounting": SCHEMA["properties"]["measurement_quality"]["properties"]["accounting"],
++                    "admission": {"type": "object", "additionalProperties": {"type": "boolean"}},
++                },
++            },
++        },
++    },
++}
++
++
+ def validate(record: dict, schema: dict | None = None) -> list:
+     """The schema errors of a record (an empty list when it is valid).
+ 
+@@ -216,10 +272,13 @@ def _validate_builtin(record: dict, schema: dict) -> list:
+             errors.append(f"{key}: {value!r} is not {node['const']!r}")
+         if isinstance(value, dict) and node.get("properties"):
+             errors.extend(_validate_builtin(value, node))
+-        if isinstance(value, dict) and node.get("additionalProperties") is False and node.get("properties"):
++        if isinstance(value, dict) and node.get("properties") and node.get("additionalProperties") is False:
+             for sub in value:
+                 if sub not in node["properties"]:
+                     errors.append(f"{key}/{sub}: not in the schema")
++        if isinstance(value, list) and isinstance(node.get("items"), dict):
++            for index, item in enumerate(value):
++                errors.extend(_validate_builtin(item, node["items"]))
+         if "maxLength" in node and isinstance(value, str) and len(value) > node["maxLength"]:
+             errors.append(f"{key}: longer than {node['maxLength']}")
+         if "minimum" in node and isinstance(value, (int, float)) and not isinstance(value, bool) \
+diff --git a/serve/reqtelemetry/server.py b/serve/reqtelemetry/server.py
+index 7c1bf8ba..fcaf57a9 100644
+--- a/serve/reqtelemetry/server.py
++++ b/serve/reqtelemetry/server.py
+@@ -82,7 +82,10 @@ class ServerTelemetry:
+             self.store.receipt_failed()      # lost request: the terminal outcome above still stands
+             raise
+         if self.evidence is not None:
+-            self.evidence.write(data)
++            # AMENDMENT-03 (G5): the loss of the evidence delivery is visible on its own: the receipt is in the
++            # store, the line on the disk is missing.
++            if not self.evidence.write(data):
++                self.store.evidence_failed()
+         return data
+ 
+     def inflight(self) -> int:
+@@ -109,6 +112,9 @@ class ServerTelemetry:
+             "retention": summary["retention"],
+             "quality": "complete" if self.enabled else "unsupported",
+             "counters": summary["counters"],
++            # AMENDMENT-03 (G5): the evidence writer's own counters, so the loss of an evidence delivery is
++            # visible here and not only in the log's file
++            "evidence": self.evidence.counters() if self.evidence is not None else None,
+         }
+ 
+     def close(self):
+diff --git a/serve/reqtelemetry/store.py b/serve/reqtelemetry/store.py
+index 7f6121ca..794d4174 100644
+--- a/serve/reqtelemetry/store.py
++++ b/serve/reqtelemetry/store.py
+@@ -10,10 +10,12 @@ import json
+ import threading
+ import uuid
+ 
++from serve.reqtelemetry import accounting as ACCOUNTING
+ from serve.reqtelemetry.metrics import DURATION_BUCKETS, DURATION_METRICS, observe_duration
+ from serve.reqtelemetry.record import decode_cursor, encode_cursor
+ from serve.reqtelemetry.vocabulary import (CURSOR_TTL_S, DEFAULT_PAGE_SIZE, DEFAULT_RETENTION_BYTES,
+-                                         DEFAULT_RETENTION_RECORDS, INSTRUMENTATION_ERROR, MAXIMUM_PAGE_SIZE)
++                                         DEFAULT_RETENTION_RECORDS, INSTRUMENTATION_ERROR, MAXIMUM_PAGE_SIZE,
++                                         MAX_ENGINE_INSTANCES)
+ 
+ class TelemetryStore:
+     """The bounded store of recent request records, and the process-lifetime counters beside it.
+@@ -52,7 +54,22 @@ class TelemetryStore:
+             "requests_accepted": 0, "requests_terminal_completed": 0, "requests_terminal_cancelled": 0,
+             "requests_terminal_failed": 0, "requests_terminal_rejected": 0,
+             "receipts_created": 0, "receipt_delivery_failures": 0,
++            # AMENDMENT-03 (G5): the loss of the EVIDENCE delivery is its own domain: the receipt may be in the
++            # store while the evidence line never reached the disk.  The two are not the same failure.
++            "evidence_delivery_failures": 0,
+             "records_aggregate_eligible": 0, "records_aggregate_excluded": 0,
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G2c): the COVERAGE of the accounting, with
++            # the eligible population and the missing population beside it.  The population is the native
++            # INVOCATION: a receipt that never arrived is in the missing population, so a lost receipt lowers the
++            # coverage instead of silently improving it.
++            "native_invocations": 0, "native_invocations_accounted": 0, "native_invocations_missing": 0,
++            "requests_with_complete_accounting": 0,
++            # the positions of the invocations whose prompt domain is NOT the request's own prompt domain (a
++            # recovery dispatch that sent another prompt): they are work, never the request's prompt coverage
++            "native_positions_matched_total": 0, "native_positions_reused_total": 0,
++            "native_positions_evaluated_total": 0,
++            # the evictions of an engine whose identity is unknown: they cannot be attributed to a domain
++            "cache_evictions_unattributed": 0,
+         }
+         # the engine's own eviction counter, per engine instance: it restarts with the engine, and a counter that
+         # falls would be a counter that lies (G6)
+@@ -86,6 +103,12 @@ class TelemetryStore:
+         with self.lock:
+             self.counters["receipt_delivery_failures"] += 1
+ 
++    def evidence_failed(self):
++        """The evidence line of a receipt was REFUSED by the writer: the receipt is in the store, the evidence
++        line never reached the disk.  It is its own domain (G5)."""
++        with self.lock:
++            self.counters["evidence_delivery_failures"] += 1
++
+     def add(self, record: RequestRecord) -> dict:
+         """Seal the record, keep it, and count it.  Returns the record's dict (what the API hands out)."""
+         with self.lock:
+@@ -112,11 +135,13 @@ class TelemetryStore:
+         """The process-lifetime counters.  A counter only moves when a measurement exists: an unavailable
+         measurement is not counted as zero.
+ 
+-        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (G1): a measurement enters an authoritative aggregate
+-        only when it is VALID, its ACCOUNTING is not violated and - for the engine's own numbers - its RECEIPT is
+-        correlated to this request.  A record that fails any of these stays in the store as a diagnostic receipt and
+-        contributes NOTHING to the totals: an invalid or unattributed measurement never distorts them, and a counter
+-        never falls because one was admitted.
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1, G2): the counters are fed by the record's own
++        HTTP-owned measurements and by the PER-INVOCATION receipts - never by a summary of several invocations.
++        A native measurement is counted only when ITS OWN metric class admits it (serve/reqtelemetry/accounting.py):
++        the prompt positions need a correlated receipt and an accounting that is not violated, the work counters
++        keep their own authority, the durations need a correlated WHOLE invocation, and the complete cache-reuse
++        ratio needs an accounting that SATISFIED.  The same native work is never counted twice: a measurement that
++        the parent mirrors from its single receipt is counted from the receipt, not from the parent.
+         """
+         c = self.counters
+         c["requests_total"] += 1
+@@ -128,75 +153,127 @@ class TelemetryStore:
+         elif state in ("failed", "rejected"):
+             c["requests_failed"] += 1
+         quality = data["measurement_quality"]
+-        # the three decisions, kept apart (AMENDMENT-02, G1): the numbers are valid, the accounting holds, and the
+-        # engine's receipt is correlated to this request.
+-        valid = bool(quality.get("measurement_valid"))
+-        accounting_ok = (quality.get("accounting") or {}).get("state") != "violated"
+-        correlated = quality.get("native_correlation") == "verified" and not quality.get("native_partial")
+-        eligible = bool(quality.get("aggregate_eligible"))
+-        prompt, gen, cache = data["prompt"], data["generation"], data["cache"]
+-        # the tokens the SERVER measured (the submitted prompt) and the tokens the ENGINE measured (the match, the
+-        # reuse, the evaluation): the engine's numbers need a correlated receipt, the server's do not.
+-        for key, counter, native in (("submitted_tokens", "prompt_tokens_submitted", False),
+-                                     ("matched_prefix_tokens", "prompt_tokens_matched", True),
+-                                     ("reused_prefix_tokens", "prompt_tokens_reused", True),
+-                                     ("evaluated_tokens", "prompt_tokens_evaluated", True),
+-                                     ("replayed_tokens", "prompt_tokens_replayed", True),
+-                                     ("evaluation_work_tokens", "prompt_evaluation_work_tokens", True)):
+-            value = prompt.get(key)
+-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+-                continue                            # not a measurement: it is not counted
+-            if native:
+-                if not (valid and accounting_ok and correlated):
+-                    continue                        # unattributed or invalid: not an authoritative number
+-            elif not (valid and accounting_ok):
+-                continue                            # the server's own number is valid, or it is not counted
+-            c[counter] += value
+-        for key, counter in (("generated_tokens", "generated_tokens"), ("emitted_tokens", "emitted_tokens"),
+-                             ("speculative_draft_tokens", "speculative_draft_tokens"),
+-                             ("speculative_accepted_tokens", "speculative_accepted_tokens")):
+-            value = gen.get(key)
+-            # the engine's own generation counters need a correlated receipt too
+-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+-                continue
+-            if key in ("generated_tokens", "speculative_draft_tokens", "speculative_accepted_tokens") \
+-                    and not (valid and accounting_ok and correlated):
+-                continue
+-            if key == "emitted_tokens" and not (valid and accounting_ok):
+-                continue
+-            c[counter] += value
+-        if cache.get("restore_attempted") is True and valid and accounting_ok and correlated:
+-            c["cache_restore_attempts"] += 1
+-            if cache.get("restore_succeeded") is False:
+-                c["cache_restore_failures"] += 1
+-        evictions = cache.get("evictions")
+-        if isinstance(evictions, int) and not isinstance(evictions, bool) and valid and accounting_ok and correlated:
+-            instance = data["identity"].get("engine_instance_id") or "unknown"
+-            previous = self._evictions_by_engine.get(instance, 0)
+-            # AMENDMENT-02 (G5): the engine's own counter is a HIGH-WATER MARK per engine instance: it only goes
+-            # up inside one instance, and a smaller reading (a counter that fell, or a receipt that arrived out of
+-            # order) never lowers the mark and never lowers the total.
+-            if evictions >= previous:
+-                c["cache_evictions"] += evictions - previous
+-                self._evictions_by_engine[instance] = evictions
+-        submitted = prompt.get("submitted_tokens")
+-        reused = prompt.get("reused_prefix_tokens")
+-        # the ELIGIBLE population of the cache-reuse ratio: the requests whose reuse accounting is complete AND
+-        # correlated.  Its numerator and denominator come from this population only, so the ratio stays in [0, 1].
+-        if (isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0
+-                and isinstance(reused, int) and not isinstance(reused, bool) and 0 <= reused <= submitted
+-                and valid and accounting_ok and correlated):
+-            c["requests_reuse_accounted"] += 1
+-            c["prompt_tokens_reused_eligible"] += reused
+-            c["prompt_tokens_submitted_eligible"] += submitted
+-        if data["measurement_quality"]["state"] == INSTRUMENTATION_ERROR:
++        prompt, gen = data["prompt"], data["generation"]
++        accounting_state = (quality.get("accounting") or {}).get("state")
++        # the HTTP-owned measurements: the server's own numbers.  They do not depend on the engine's receipt,
++        # but they do depend on the token accounting not being broken (the identity involves the submitted
++        # prompt, which the server measured).
++        if accounting_state != "violated":
++            submitted = prompt.get("submitted_tokens")
++            if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0:
++                c["prompt_tokens_submitted"] += submitted
++            emitted = gen.get("emitted_tokens")
++            if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
++                c["emitted_tokens"] += emitted
++        # the native measurements: every invocation's own receipt decides for itself
++        request_submitted = prompt.get("submitted_tokens")
++        accounted_request = False
++        for invocation in data.get("invocations") or []:
++            if self._count_invocation_locked(c, invocation, request_submitted):
++                accounted_request = True
++        if accounted_request:
++            c["requests_with_complete_accounting"] += 1
++        if quality.get("state") == INSTRUMENTATION_ERROR:
+             c["instrumentation_errors"] += 1
+-        if eligible:
++        if quality.get("aggregate_eligible"):
+             c["records_aggregate_eligible"] += 1
+         else:
+             c["records_aggregate_excluded"] += 1
+         self._observe_locked(data)
+ 
++    def _count_invocation_locked(self, c, invocation, request_submitted) -> bool:
++        """One native invocation's receipt, counted under its OWN metric classes (G1, G2).
++
++        True when this invocation's accounting SATISFIED - that is, when it belongs to the eligible population of
++        the complete cache-reuse ratio.
++        """
++        iq = invocation.get("measurement_quality") or {}
++        admission = iq.get("admission") or {}
++        iprompt = invocation.get("prompt") or {}
++        icache = invocation.get("cache") or {}
++        igen = invocation.get("generation") or {}
++        c["native_invocations"] += 1
++        # the eligible and the missing populations of the accounting coverage (G2c)
++        eligible = bool(admission.get(ACCOUNTING.METRIC_COMPLETE_CACHE_RATIO))
++        if eligible:
++            c["native_invocations_accounted"] += 1
++        else:
++            c["native_invocations_missing"] += 1
++        # the prompt positions: the REQUEST's own prompt domain only.  An invocation that worked on another
++        # prompt (a recovery dispatch) is work, never this prompt's coverage.  An invocation whose own prompt
++        # length was not measured cannot be a different domain: it stays in the request's domain.
++        same_domain = (request_submitted is None or iprompt.get("submitted_tokens") is None
++                       or iprompt.get("submitted_tokens") == request_submitted)
++        if admission.get(ACCOUNTING.METRIC_NATIVE_PROMPT_POSITION):
++            for key, counter, total in (("matched_prefix_tokens", "prompt_tokens_matched",
++                                         "native_positions_matched_total"),
++                                        ("reused_prefix_tokens", "prompt_tokens_reused",
++                                         "native_positions_reused_total"),
++                                        ("evaluated_tokens", "prompt_tokens_evaluated",
++                                         "native_positions_evaluated_total")):
++                value = iprompt.get(key)
++                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
++                    continue
++                c[total] += value
++                if same_domain:
++                    c[counter] += value
++        # the work counters: they keep their own authority - an UNEVALUATED accounting does not exclude them
++        if admission.get(ACCOUNTING.METRIC_NATIVE_EXECUTION_WORK):
++            for key, counter in (("replayed_tokens", "prompt_tokens_replayed"),
++                                 ("evaluation_work_tokens", "prompt_evaluation_work_tokens")):
++                value = iprompt.get(key)
++                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
++                    c[counter] += value
++        # the engine's own generation counters
++        if admission.get(ACCOUNTING.METRIC_NATIVE_GENERATION):
++            for key, counter in (("generated_tokens", "generated_tokens"),
++                                 ("speculative_draft_tokens", "speculative_draft_tokens"),
++                                 ("speculative_accepted_tokens", "speculative_accepted_tokens")):
++                value = igen.get(key)
++                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
++                    c[counter] += value
++        # the restoration's outcome
++        if admission.get(ACCOUNTING.METRIC_CACHE_RESTORE) and icache.get("restore_attempted") is True:
++            c["cache_restore_attempts"] += 1
++            if icache.get("restore_succeeded") is False:
++                c["cache_restore_failures"] += 1
++        # the engine's own eviction counter: a HIGH-WATER MARK per engine instance (G5)
++        evictions = icache.get("evictions")
++        if isinstance(evictions, int) and not isinstance(evictions, bool) and evictions >= 0 \
++                and admission.get(ACCOUNTING.METRIC_NATIVE_PROMPT_POSITION):
++            self._count_evictions_locked(c, (invocation.get("identity") or {}).get("engine_instance_id"), evictions)
++        # the complete cache-reuse ratio: the numerator and the denominator come from THIS invocation, so the
++        # ratio stays in [0, 1] and the population is the invocations whose accounting closed
++        if eligible:
++            submitted = iprompt.get("submitted_tokens")
++            reused = iprompt.get("reused_prefix_tokens")
++            if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0 \
++                    and isinstance(reused, int) and not isinstance(reused, bool) and 0 <= reused <= submitted:
++                c["requests_reuse_accounted"] += 1
++                c["prompt_tokens_reused_eligible"] += reused
++                c["prompt_tokens_submitted_eligible"] += submitted
++        return eligible
++
++    def _count_evictions_locked(self, c, instance, evictions):
++        """The engine's eviction counter, per engine instance (G5).
++
++        AMENDMENT-03 (G5): an engine whose identity is UNKNOWN is not merged into a domain: its counter cannot be
++        attributed to an engine process, so it is published as unattributed instead of pretending that two
++        different engines are one.  The retired instances' state is BOUNDED: the oldest mark goes when the bound
++        is reached, so a long run does not grow the state without limit.
++        """
++        if not instance:
++            c["cache_evictions_unattributed"] += evictions
++            return
++        previous = self._evictions_by_engine.get(instance, 0)
++        if evictions >= previous:
++            c["cache_evictions"] += evictions - previous
++            self._evictions_by_engine[instance] = evictions
++        while len(self._evictions_by_engine) > MAX_ENGINE_INSTANCES:
++            oldest = next(iter(self._evictions_by_engine))
++            del self._evictions_by_engine[oldest]
++
++
+     def _observe_locked(self, data):
+         """The duration histograms: what the Prometheus exporter reads.
+ 
+@@ -204,10 +281,29 @@ class TelemetryStore:
+         timings are milliseconds; the conversion to seconds happens ONCE, in serve/reqtelemetry/metrics.py, and the
+         histogram keeps the real cumulative bucket counts (a bucket says how many observations were at or below it -
+         not the total count).
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G2b): the durations are admitted by their OWN class.
++        The HTTP-owned durations (the queue wait, the total, the time to the first byte) are the server's own
++        measurements and are always observed.  A NATIVE duration is observed only from the invocation receipt that
++        measured it, and only when that receipt is CORRELATED to its invocation and covers the WHOLE invocation:
++        an uncorrelated duration is somebody else's measurement, and a batch slot's admission segment is not the
++        whole invocation.  The parent's copy of a native duration is not observed again - it is the receipt's
++        measurement, and it is observed once, there.
+         """
+         timing = data["timing_ms"]
++        authority = (data["measurement_quality"] or {}).get("timing_authority") or {}
+         for name, metric in DURATION_METRICS:
++            if authority.get(name) == "native_engine":
++                continue                        # the receipt's own duration: it is observed there, once
+             observe_duration(self.histograms, metric, timing.get(name))
++        for invocation in data.get("invocations") or []:
++            iq = invocation.get("measurement_quality") or {}
++            admission = iq.get("admission") or {}
++            if not admission.get(ACCOUNTING.METRIC_NATIVE_DURATION):
++                continue                        # not correlated, or only a segment of the invocation
++            itiming = invocation.get("timing_ms") or {}
++            for name, metric in DURATION_METRICS:
++                observe_duration(self.histograms, metric, itiming.get(name))
+ 
+     # ------------------------------------------------------------------ reading
+     def get(self, request_id):
+@@ -226,19 +322,20 @@ class TelemetryStore:
+         simply is not in the next page - the cursor never skips back to a newer record.
+         """
+         limit = max(1, min(int(limit), MAXIMUM_PAGE_SIZE))
+-        after = None
+-        if cursor:
+-            after = decode_cursor(cursor, self.server_instance_id, CURSOR_TTL_S)
+-            with self.lock:
+-                newest = self.seq
+-                oldest = self.records[0][0] if self.records else None
++        # AMENDMENT-03 (G5): the cursor's validation and the page come from ONE snapshot of the store.  The
++        # validation used to read the retention bounds, release the lock and only then read the rows: a record
++        # evicted in between made the validation and the page disagree about the same collection.
++        after = decode_cursor(cursor, self.server_instance_id, CURSOR_TTL_S) if cursor else None
++        with self.lock:
++            newest = self.seq
++            oldest = self.records[0][0] if self.records else None
+             # AMENDMENT-02 (G6): a cursor that names a record this store never wrote, or one whose page was already
+             # evicted, is REFUSED.  It is never treated as an exhausted collection: the operator sees an error.
+-            if after > newest:
+-                raise ValueError("the cursor names a record this server never wrote")
+-            if oldest is not None and after < oldest - 1:
+-                raise ValueError("the records of this page are no longer retained")
+-        with self.lock:
++            if after is not None:
++                if after > newest:
++                    raise ValueError("the cursor names a record this server never wrote")
++                if oldest is not None and after < oldest - 1:
++                    raise ValueError("the records of this page are no longer retained")
+             rows = [data for _, data, _ in self.records]
+         rows.reverse()                                   # newest first
+         out, last = [], None
+@@ -281,11 +378,23 @@ class TelemetryStore:
+                     "receipts_created": self.counters["receipts_created"],
+                     "receipt_delivery_failures": self.counters["receipt_delivery_failures"],
+                 },
+-                # the cache-reuse ratio, with BOTH of its numbers and the coverage of the population it covers
++                # the cache-reuse ratio, with BOTH of its numbers and the coverage of the population it covers.
++                # AMENDMENT-03 (G2c): the population is the native INVOCATION whose accounting closed; the
++                # missing population is published beside it, so a lost receipt lowers the coverage instead of
++                # silently improving it.  The physical HTTP request's own coverage is published separately.
+                 "cache_reuse": {"ratio": round(reused / submitted, 6) if submitted else None,
+                                 "reused_tokens": reused, "submitted_tokens": submitted,
+                                 "eligible_requests": eligible, "requests": total,
+-                                "coverage": round(eligible / total, 6) if total else None},
++                                "eligible_invocations": self.counters["native_invocations_accounted"],
++                                "missing_invocations": self.counters["native_invocations_missing"],
++                                "invocations": self.counters["native_invocations"],
++                                "requests_with_complete_accounting":
++                                    self.counters["requests_with_complete_accounting"],
++                                "coverage": round(self.counters["native_invocations_accounted"]
++                                                  / self.counters["native_invocations"], 6)
++                                if self.counters["native_invocations"] else None,
++                                "request_coverage": round(self.counters["requests_with_complete_accounting"]
++                                                          / total, 6) if total else None},
+                 "histograms": {k: {"sum": v["sum"], "count": v["n"],
+                                    "buckets": {str(edge): v["buckets"][i]
+                                                for i, edge in enumerate(DURATION_BUCKETS)}}
+diff --git a/serve/reqtelemetry/vocabulary.py b/serve/reqtelemetry/vocabulary.py
+index 6bea2c74..c7dcc652 100644
+--- a/serve/reqtelemetry/vocabulary.py
++++ b/serve/reqtelemetry/vocabulary.py
+@@ -5,7 +5,19 @@ exporter all speak these words, so they cannot drift apart.
+ """
+ from __future__ import annotations
+ 
+-SCHEMA_VERSION = "strata.request-telemetry/1"
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the record contract changed INCOMPATIBLY - the
++# per-invocation receipts are a new section and the parent's native scalars are null when the request dispatched
++# more than one native invocation - so the contract is versioned up.
++SCHEMA_VERSION = "strata.request-telemetry/2"
++
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the bounds of the per-invocation history.  They are
++# a COUNT and a BYTE budget, and a receipt that does not fit is counted as a loss - never dropped silently.
++MAX_INVOCATION_RECORDS = 8
++MAX_INVOCATION_BYTES = 32 << 10            # 32 KiB of receipts per request
++
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G5): how many engine instances' eviction high-water
++# marks the store keeps.  The retired instances' state is bounded: a long run does not grow it without limit.
++MAX_ENGINE_INSTANCES = 64
+ 
+ # The measurement quality of a record as a whole, and of a single field.
+ COMPLETE = "complete"

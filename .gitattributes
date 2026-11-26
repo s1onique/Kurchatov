@@ -18,3 +18,4 @@ data/quant_quality/** -text
 
 # llama.cpp's flash-attention kernel and its patch: git apply (tools/test_fattn_sync.py) rejects them with CRLF
 src/poly/fattn_mma.* text eol=lf
+docs/evidence/**/*.diff -whitespace
