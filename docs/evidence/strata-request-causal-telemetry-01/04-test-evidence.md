@@ -29,6 +29,11 @@ repository's own test is **not** changed.
 
 With the fix, `serve.test_reqtelemetry` + `serve.test_responses` + `serve.test_parallel` run together: **OK**.
 
+The baseline was checked too, in a temporary worktree at the entry commit (`git worktree add --detach /tmp/baseline
+5b0e549b`): **1005 tests, OK (skipped=23)**. So the race was latent before this ACT and this ACT's test file
+widened the window; the fix closes it. The temporary worktree was removed afterwards; the repository's own
+worktrees and the deployment repository were not touched.
+
 ## The qualification matrix
 
 The honest column is the last one. **A native control that was not executed is NOT_EXECUTED, never PASS.**

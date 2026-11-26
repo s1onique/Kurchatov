@@ -91,6 +91,7 @@ The changes are one commit per concern, in the order below, so a reviewer can re
 | 5 | the web view | `serve/web/telemetry.html`, `serve/web/telemetry.js`, `serve/web/index.html`, `serve/web/app.js`, `serve/web/app.css` |
 | 6 | the tests | `serve/test_reqtelemetry.py`, `tools/test_reqtelemetry_roundtrip.py`, `tools/test_reqtelemetry_schema.py` |
 | 7 | the documentation and the evidence | `docs/TELEMETRY.md`, `docs/telemetry/`, `docs/evidence/strata-request-causal-telemetry-01/` |
+| 8 | the tests' isolation fix and the checksums | `serve/test_reqtelemetry.py`, `docs/evidence/.../SHA256SUMS` |
 
 ## What was NOT changed
 
