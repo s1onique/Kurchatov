@@ -30,6 +30,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
     <button class="st-tab" role="tab" id="tab-btn-requests" aria-controls="view-requests" aria-selected="false" data-tab="requests">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-layers"/></svg>Requests</button>
+    <button class="st-tab" role="tab" id="tab-btn-telemetry" aria-controls="view-telemetry" aria-selected="false" data-tab="telemetry">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Telemetry</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
   </nav>
@@ -186,6 +188,13 @@
           start the server with <code>--api-monitor</code>, then restart it.</p>
       </div>
     </div>
+  </section>
+
+  <!-- ============================ Telemetry ============================ -->
+  <section class="view view--telemetry" id="view-telemetry" role="tabpanel" aria-labelledby="tab-btn-telemetry" hidden>
+    <!-- ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry view.  It is its own page, and it works without the
+         API monitor: it shows counts and timings only, never a prompt or an answer. -->
+    <iframe class="requests-frame" id="telemetry-frame" title="Request telemetry" src="telemetry"></iframe>
   </section>
 
   <!-- ============================ About ============================ -->

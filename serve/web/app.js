@@ -72,7 +72,7 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 });
 
 let tab = "chat";
-const TABS = ["chat", "images", "monitor", "requests", "about"];
+const TABS = ["chat", "images", "monitor", "requests", "telemetry", "about"];
 function showTab(name) {
   tab = TABS.includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
@@ -83,6 +83,8 @@ function showTab(name) {
   if (tab === "monitor") loadMcp();
   if (tab === "about") loadConfig();
   if (tab === "requests") showRequests();
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: the telemetry view is its own page (serve/web/telemetry.html); it
+  // polls itself, so opening the tab only shows it.
   if (lastMetrics) render(lastMetrics);
 }
 // #142: the Requests tab shows the /api-monitor page, loaded the first time the tab opens, or how to turn it on.
