@@ -12,6 +12,8 @@ run.
 | 4 | `/tmp/stratavenv/bin/python tools/test_telemetry_mutations.py` | 12 witnesses, OK |
 | 5 | `/tmp/stratavenv/bin/python tools/test_telemetry_web_accounting.py` | `4 cases checked with osascript` |
 | 6 | `git diff --check 579f5cef..HEAD` | clean (no whitespace error) |
+| 7 | `/tmp/reqtelemetry_test` (built with `clang++ -std=c++17 -O1 -Iinclude src/program/reqtelemetry_test.cpp`) | `reqtelemetry_test: all checks passed` (exit 0) |
+| 8 | `/tmp/stratavenv/bin/python tools/test_reqtelemetry_roundtrip.py` (the real native writer built) | 6 tests, OK |
 
 ## The whole suite
 

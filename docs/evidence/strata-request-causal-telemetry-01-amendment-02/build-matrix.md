@@ -8,8 +8,28 @@
 | the non-vacuity witnesses | `/tmp/stratavenv/bin/python tools/test_telemetry_mutations.py` | 12 witnesses, OK |
 | the browser's accounting bar | `/tmp/stratavenv/bin/python tools/test_telemetry_web_accounting.py` | 4 cases, checked with `osascript -l JavaScript` |
 | the patch hygiene | `git diff --check 579f5cef..HEAD` | clean |
-| the native writer/reader roundtrip | `python tools/test_reqtelemetry_roundtrip.py` | needs the engine binary: **NOT_EXECUTED** (no build here) |
+| the native writer/reader roundtrip | `python tools/test_reqtelemetry_roundtrip.py` (with the writer built, see below) | **6 tests, OK** - the real native writer's DONE line read by the real server reader |
+| the native encoder's own test | `clang++ -std=c++17 -O1 -Iinclude src/program/reqtelemetry_test.cpp -o /tmp/reqtelemetry_test && /tmp/reqtelemetry_test` | `reqtelemetry_test: all checks passed` (exit 0) |
 | the CUDA engine (SM61, SM120) | `cmake -DSTRATA_ENABLE_CUDA=ON` | **NOT_EXECUTED**: this host has no CUDA toolkit and no GPU |
+
+## The native host checks (executed here)
+
+The CMake configure fetches `llama.cpp` through `FetchContent`, and this host has no network access, so the whole
+project cannot be configured here.  The two native telemetry programs are standalone (they need only
+`include/strata/program/reqtelemetry.hpp`), so they are compiled directly:
+
+```bash
+clang++ -std=c++17 -O1 -Iinclude src/program/reqtelemetry_test.cpp -o /tmp/reqtelemetry_test
+/tmp/reqtelemetry_test                                  # reqtelemetry_test: all checks passed (exit 0)
+
+clang++ -std=c++17 -O1 -Iinclude src/program/reqtelemetry_roundtrip.cpp \
+        -o /tmp/rtcache/reqtelemetry_roundtrip
+/tmp/stratavenv/bin/python tools/test_reqtelemetry_roundtrip.py    # 6 tests, OK
+```
+
+The roundtrip drives the SERVER's reader with a DONE line the ENGINE's own writer produced, so the two halves
+cannot drift apart; it also checks the switch-off case (T19: with `STRATA_TELEMETRY=0` the DONE line carries no
+telemetry key at all).
 
 ## What this host cannot do
 

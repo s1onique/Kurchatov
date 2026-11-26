@@ -36,9 +36,11 @@ G8_REVIEW_COMPLETENESS: DONE - 01-native-production.diff, 02-http-production.dif
 
 REAL_DEPENDENCY_FULL_SUITE: 1129 tests, OK (skipped=20), exit code 0 - /tmp/stratavenv has the repository's
   real jinja2, regex and jsonschema; no stand-in was used.
-HOST_NATIVE_TESTS: NOT_EXECUTED - the native writer/reader roundtrip needs the engine binary, which needs a
-  build; this host has no CUDA toolkit.  The telemetry's own host-compilable test (src/program/reqtelemetry_test.cpp)
-  was NOT rebuilt either: the encoder was not changed.
+HOST_NATIVE_TESTS: EXECUTED - the two standalone native telemetry programs were compiled on this host
+  (clang++ -std=c++17 -O1 -Iinclude ...): `reqtelemetry_test` passes (the encoder's own checks) and the
+  writer/reader roundtrip passes with the REAL native writer's DONE line read by the real server reader
+  (tools/test_reqtelemetry_roundtrip.py: 6 tests, OK, including the switch-off case T19).  The CMake configure
+  itself cannot run here: it fetches llama.cpp and this host has no network access.
 CUDA_BUILD: NOT_EXECUTED - no CUDA toolkit on this host (SM61 and SM120).
 LIVE_NATIVE_QUALIFICATION: NOT_EXECUTED - not authorized here; it is the next ACT's work.
 PERFORMANCE_PARITY: NOT_EXECUTED - it needs the engine and a GPU.
