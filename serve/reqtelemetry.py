@@ -920,10 +920,22 @@ def apply_engine(record: RequestRecord, figures: dict | None):
     matched = figures.get("matched")
     reused = figures.get("reused")
     evaluated = figures.get("evaluated")
+    # The engine writes the divergent index as: a position (0 or more), -1 for "the sequences agree throughout"
+    # and -2 for "not measured".  The record's field is null in both of those cases - there is no mismatch to
+    # report - and the reason says which of the two it was.
+    divergent = figures.get("divergent")
+    if divergent is not None:
+        if divergent >= 0:
+            record.first_divergent_token_index = int(divergent)
+        elif divergent == -1:
+            record.mark_unavailable("prompt.first_divergent_token_index",
+                                    "the sequences agree throughout: there is no mismatch")
+        else:
+            record.mark_unavailable("prompt.first_divergent_token_index",
+                                    "the engine did not report a divergence index")
     record.set_native_cache(
         matched_prefix=matched, reused_prefix=reused, evaluated=evaluated,
         replayed=figures.get("replayed"), evaluation_work=figures.get("work"),
-        first_divergent=figures.get("divergent"),
         source=SOURCE_NAMES.get(figures.get("cache_source", ""), SOURCE_UNKNOWN),
         reason_code=REASON_CODES.get(figures.get("cache_reason", ""), "unknown"),
         restore_attempted=(figures.get("restore") != "none") if "restore" in figures else None,
@@ -936,7 +948,9 @@ def apply_engine(record: RequestRecord, figures: dict | None):
     if figures.get("restore_ms") is not None:
         record.set_timing("cache_restore", figures["restore_ms"], "native_engine")
     if "slot" in figures:
-        record.slot_id = figures["slot"]
+        slot = figures["slot"]
+        # the engine writes a slot only when there is one; a stray negative is "no slot", not a slot
+        record.slot_id = int(slot) if isinstance(slot, int) and slot >= 0 else None
     if matched is None:
         record.mark_unavailable("prompt.matched_prefix_tokens", "the engine did not report a prefix match")
     if reused is None:

@@ -232,6 +232,36 @@ class Accounting(unittest.TestCase):
         self.assertEqual(r.quality, PARTIAL)
 
 
+class Schema(unittest.TestCase):
+    """Every figure the engine can write must produce a record that validates."""
+
+    def test_every_figure_the_engine_can_write_validates(self):
+        figures = [
+            {}, {"matched": 0}, {"matched": 40, "reused": 40, "evaluated": 60, "work": 60},
+            {"divergent": -1}, {"divergent": -2}, {"divergent": 0}, {"divergent": 12},
+            {"slot": -1}, {"slot": 0}, {"slot": 3},
+            {"restore": "none"}, {"restore": "succeeded"}, {"restore": "failed"},
+            {"cache_source": "live"}, {"cache_source": "parked_checkpoint"}, {"cache_source": "nonsense"},
+            {"cache_reason": "EXACT_MATCH"}, {"cache_reason": "STEERING_MISMATCH"}, {"cache_reason": "NONSENSE"},
+            {"rid": "abc123"}, {"restore_ms": 1.5}, {"lookup_ms": 0.25},
+            {"replayed": 10}, {"invalidations": 0}, {"evictions": 3},
+        ]
+        for fig in figures:
+            r = RequestRecord("abc")
+            apply_engine(r, fig)
+            r.set_prompt_tokens(rendered=100, submitted=100)
+            r.set_native_cache(non_prefix_reused=0)
+            r.seal("completed", 200)
+            errors = validate(r.to_dict())
+            self.assertEqual(errors, [], f"the figures {fig} produced an invalid record: {errors}")
+
+    def test_a_negative_divergence_is_never_a_position(self):
+        r = RequestRecord("abc")
+        apply_engine(r, {"divergent": -1})
+        self.assertIsNone(r.first_divergent_token_index)
+        self.assertIn("prompt.first_divergent_token_index", r.unavailable)
+
+
 class Store(unittest.TestCase):
     """The store: its bounds, its pagination and its counters."""
 
