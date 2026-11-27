@@ -19,6 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# the serving layer lives in terminal/, so `serve.` is a package under terminal/.
+sys.path.insert(0, str(ROOT / 'terminal'))
 
 from serve.reqtelemetry import SCHEMA, RequestRecord, ServerTelemetry, validate  # noqa: E402
 from serve.reqtelemetry.schema import SCHEMA_V2, SCHEMA_V3  # noqa: E402
@@ -79,7 +81,7 @@ def main() -> int:
     check(validate(broken), "a record with an unknown section is rejected")
 
     # 4. the HISTORICAL fixture validates against the historical contract (A5c), and NOT against the current one
-    fixture = ROOT / "serve/fixtures/telemetry/record-v2.json"
+    fixture = ROOT / "terminal/serve/fixtures/telemetry/record-v2.json"
     if fixture.exists():
         historical = json.loads(fixture.read_text())
         check(not validate(historical, SCHEMA_V2),

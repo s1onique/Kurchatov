@@ -26,8 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-ACCOUNTING = ROOT / "serve/web/telemetry_accounting.js"
-PAGE = ROOT / "serve/web/telemetry.js"
+ACCOUNTING = ROOT / "terminal/serve/web/telemetry_accounting.js"
+PAGE = ROOT / "terminal/serve/web/telemetry.js"
 
 UNAVAILABLE = "—"
 

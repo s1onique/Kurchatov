@@ -26,8 +26,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# the serving layer lives in terminal/, so `serve.` is a package under terminal/.
+sys.path.insert(0, str(ROOT / 'terminal'))
 
-JS = ROOT / "serve/web/telemetry_accounting.js"
+JS = ROOT / "terminal/serve/web/telemetry_accounting.js"
 
 # the character the page shows for a measurement that was not taken (an em dash)
 UNAVAILABLE = "—"

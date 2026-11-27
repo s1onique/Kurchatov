@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-JS = ROOT / "serve/web/telemetry_accounting.js"
+JS = ROOT / "terminal/serve/web/telemetry_accounting.js"
 
 # the four cases the amendment names: complete, incomplete, violated and unavailable
 CASES = {

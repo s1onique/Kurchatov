@@ -26,7 +26,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
 def load_from_server(names):
     """The named top-level definitions of serve/server.py, taken from its source: no imports of their own, so the
     test does not need the server's dependencies."""
-    source = (ROOT / 'serve' / 'server.py').read_text(encoding='utf-8')
+    source = (ROOT / 'terminal' / 'serve' / 'server.py').read_text(encoding='utf-8')
     tree = ast.parse(source)
     wanted = set(names)
     module = ast.Module(body=[], type_ignores=[])
@@ -34,7 +34,7 @@ def load_from_server(names):
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in wanted:
             module.body.append(node)
     namespace = {'json': json, 'os': os}
-    exec(compile(module, str(ROOT / 'serve' / 'server.py'), 'exec'), namespace)
+    exec(compile(module, str(ROOT / 'terminal' / 'serve' / 'server.py'), 'exec'), namespace)
     return namespace
 
 
@@ -42,11 +42,11 @@ _NS = load_from_server(['build_identity'])
 build_identity = _NS['build_identity']
 
 
-INDEX = (ROOT / 'serve' / 'web' / 'index.html').read_text(encoding='utf-8')
-MONITOR = (ROOT / 'serve' / 'web' / 'monitor.html').read_text(encoding='utf-8')
-APP_JS = (ROOT / 'serve' / 'web' / 'app.js').read_text(encoding='utf-8')
-MONITOR_JS = (ROOT / 'serve' / 'web' / 'monitor.js').read_text(encoding='utf-8')
-SERVER = (ROOT / 'serve' / 'server.py').read_text(encoding='utf-8')
+INDEX = (ROOT / 'terminal' / 'serve' / 'web' / 'index.html').read_text(encoding='utf-8')
+MONITOR = (ROOT / 'terminal' / 'serve' / 'web' / 'monitor.html').read_text(encoding='utf-8')
+APP_JS = (ROOT / 'terminal' / 'serve' / 'web' / 'app.js').read_text(encoding='utf-8')
+MONITOR_JS = (ROOT / 'terminal' / 'serve' / 'web' / 'monitor.js').read_text(encoding='utf-8')
+SERVER = (ROOT / 'terminal' / 'serve' / 'server.py').read_text(encoding='utf-8')
 
 
 class KurchatovIdentityTest(unittest.TestCase):

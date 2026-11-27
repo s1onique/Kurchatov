@@ -16,8 +16,10 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# the serving layer lives in terminal/, so `serve.` is a package under terminal/.
+for _p in (ROOT, ROOT / "terminal"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from serve.reqtelemetry import accounting, correlation, evidence, record, store  # noqa: E402
 from serve import test_telemetry_amendment03 as witnesses  # noqa: E402
@@ -209,9 +211,12 @@ class Mutations(unittest.TestCase):
 
     def test_the_restore_error_duration_is_not_discarded(self):
         """RESTORE_ERROR_DURATION_DISCARDED: the native error path does not copy the measured duration."""
-        source = (ROOT / "src/program/generate.cpp").read_text()
+        source = (ROOT / "engine/src/program/generate.cpp").read_text()
         marker = "tele.restore_ms = tele_restore_ms;"
-        index = source.find("ERR restoring a conversation checkpoint failed")
+        # upstream has TWO "ERR restoring a conversation checkpoint failed" lines: the batch slot's own restore
+        # and the main session's.  Only the latter carries the telemetry, so the witness must look at the one
+        # that does - the site whose ERR line takes the telemetry's own text.
+        index = source.find("ERR restoring a conversation checkpoint failed%s")
         self.assertGreater(index, 0, "the native restoration error path is gone")
         block = source[max(0, index - 1500):index]
         self.assertIn(marker, block,

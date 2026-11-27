@@ -21,15 +21,17 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
 def load_from_server(names):
     """The named top-level definitions of serve/server.py, taken from its source: no imports of their own, so the
     test does not need the server's dependencies."""
-    source = (ROOT / 'serve' / 'server.py').read_text(encoding='utf-8')
+    source = (ROOT / 'terminal' / 'serve' / 'server.py').read_text(encoding='utf-8')
     tree = ast.parse(source)
     wanted = set(names)
     module = ast.Module(body=[], type_ignores=[])
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in wanted:
             module.body.append(node)
-    namespace = {'re': __import__('re'), 'os': os, 'time': __import__('time')}
-    exec(compile(module, str(ROOT / 'serve' / 'server.py'), 'exec'), namespace)
+    # upstream's ConvCacheLog takes a lock, so the extracted namespace needs threading too.
+    namespace = {'re': __import__('re'), 'os': os, 'time': __import__('time'),
+                 'threading': __import__('threading')}
+    exec(compile(module, str(ROOT / 'terminal' / 'serve' / 'server.py'), 'exec'), namespace)
     return namespace
 
 

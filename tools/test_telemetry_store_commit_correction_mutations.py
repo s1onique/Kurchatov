@@ -16,8 +16,10 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# the serving layer lives in terminal/, so `serve.` is a package under terminal/.
+for _p in (ROOT, ROOT / "terminal"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from serve.reqtelemetry import store  # noqa: E402
 from serve import test_telemetry_store_commit_correction as witnesses  # noqa: E402

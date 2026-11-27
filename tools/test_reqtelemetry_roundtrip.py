@@ -22,7 +22,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT)]
+# the serving layer lives in terminal/, so `serve.` is a package under terminal/.
+sys.path[:0] = [str(ROOT), str(ROOT / 'terminal')]
 
 from serve.reqtelemetry import apply_engine, valid_client_request_id  # noqa: E402
 from serve.server import (REQTELEMETRY_FLOAT_KEYS, REQTELEMETRY_INT_KEYS,  # noqa: E402
@@ -88,7 +89,7 @@ class Roundtrip(unittest.TestCase):
 
     def test_the_field_names_are_the_same_on_both_sides(self):
         """The keys the engine writes are the keys the server reads: one list, checked against the header."""
-        header = (ROOT / "include/strata/program/reqtelemetry.hpp").read_text()
+        header = (ROOT / "engine/include/strata/program/reqtelemetry.hpp").read_text()
         for key in REQTELEMETRY_INT_KEYS + REQTELEMETRY_FLOAT_KEYS + REQTELEMETRY_TEXT_KEYS:
             self.assertIn(f'"{key}"', header, f"the server reads {key}, so the engine must write it")
 
