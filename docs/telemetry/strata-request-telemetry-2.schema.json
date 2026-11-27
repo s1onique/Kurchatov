@@ -457,6 +457,9 @@
             "not_applicable"
           ]
         },
+        "native_correlation_complete": {
+          "type": "boolean"
+        },
         "native_partial": {
           "type": "boolean"
         },
@@ -481,6 +484,10 @@
           "minimum": 0
         },
         "invocations_dropped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "invocation_dropped_bytes": {
           "type": "integer",
           "minimum": 0
         },
@@ -593,7 +600,8 @@
               "completed",
               "cancelled",
               "failed",
-              "rejected"
+              "rejected",
+              "unknown"
             ]
           },
           "prompt": {
@@ -601,6 +609,7 @@
             "required": [
               "rendered_tokens",
               "submitted_tokens",
+              "domain",
               "matched_prefix_tokens",
               "reused_prefix_tokens",
               "evaluated_tokens",
@@ -624,6 +633,12 @@
                   "null"
                 ],
                 "minimum": 0
+              },
+              "domain": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "matched_prefix_tokens": {
                 "type": [
@@ -791,7 +806,8 @@
               "generated_tokens",
               "emitted_tokens",
               "speculative_draft_tokens",
-              "speculative_accepted_tokens"
+              "speculative_accepted_tokens",
+              "finish_reason"
             ],
             "additionalProperties": false,
             "properties": {
@@ -836,6 +852,12 @@
                   "null"
                 ],
                 "minimum": 0
+              },
+              "finish_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             }
           },

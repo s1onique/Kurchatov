@@ -37,13 +37,17 @@ from serve.reqtelemetry.vocabulary import (CLIENT_ID_ALLOWED, CLIENT_ID_MAX, COM
                                          SOURCE_RESTORED_CHECKPOINT, SOURCE_UNKNOWN, STATES, UNSUPPORTED)
 
 
-def _receipt_size(receipt) -> int:
-    """The UTF-8 BYTES of one invocation receipt: the bound of the per-request invocation history is a byte
-    budget, and a character count is not a byte count."""
+def _receipt_size(receipt):
+    """The UTF-8 BYTES of one invocation receipt, or None when it cannot be serialized.
+
+    The bound of the per-request invocation history is a byte budget, and a character count is not a byte count.
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): a receipt that cannot be serialized has an UNKNOWN
+    size - it is not a zero-byte receipt, and it is never admitted as if it were free.
+    """
     try:
-        return len(json.dumps(receipt.to_dict(), ensure_ascii=False).encode("utf-8"))
+        return len(json.dumps(receipt.to_dict(), ensure_ascii=False, allow_nan=False).encode("utf-8"))
     except (TypeError, ValueError):
-        return 0
+        return None
 
 def valid_client_request_id(value) -> bool:
     """True when a client-supplied request id may be kept: printable ASCII, bounded, no whitespace or control
@@ -114,6 +118,25 @@ def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s:
     return seq
 
 
+class _Omitted:
+    """The sentinel for an argument that was NOT given at all.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2a): it is not None.  An argument that is not given
+    falls back to the record's own identity; an argument that is given as None means "this identity was not
+    available", and the two must not be confused.
+    """
+
+    def __repr__(self):
+        return "<omitted>"
+
+
+OMITTED = _Omitted()
+
+# how many dispatched invocation ids a record remembers (the bounded evidence that a receipt belongs to a
+# dispatch of THIS request)
+MAX_DISPATCHED_IDS = 64
+
+
 def _num(value):
     """A number or None: 0 stays 0 (a measured zero), anything that is not a number becomes null."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -152,6 +175,9 @@ class RequestRecord:
         # counted as a loss, never dropped silently.
         self.invocations = []
         self.invocations_total = 0            # how many native invocations this request dispatched
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): the ids this request DISPATCHED (bounded).
+        # The dispatch boundary is the only authority that may create a dispatch; the terminal evidence may not.
+        self.dispatched_ids = []
         self.invocations_bytes = 0
         self.invocations_dropped = 0
         self.invocations_dropped_bytes = 0
@@ -222,8 +248,13 @@ class RequestRecord:
             self.quality = PARTIAL
 
     def set_timing(self, name, ms, authority):
-        """A duration in milliseconds, from a monotonic clock, with the authority that measured it."""
-        value = _num(ms)
+        """A duration in milliseconds, from a monotonic clock, with the authority that measured it.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the SHARED typed rule admits it: a negative, a
+        NaN and an infinity are refused, never published.
+        """
+        from serve.reqtelemetry import accounting
+        value = accounting.admit_duration(self, name, ms, field=f"timing_ms.{name}")
         if value is None:
             return
         self.timing[name] = round(float(value), 3)
@@ -233,9 +264,13 @@ class RequestRecord:
         """The prompt's token counts.  `rendered` is the count after the template render and the tokenization;
         `submitted` is what the engine was actually given (the two differ when the server truncates)."""
         if rendered is not None:
-            self.rendered_tokens = _num(rendered)
+            from serve.reqtelemetry import accounting
+            self.rendered_tokens = accounting.admit_count(
+                self, "rendered_tokens", rendered, field="prompt.rendered_tokens")
         if submitted is not None:
-            self.submitted_tokens = _num(submitted)
+            from serve.reqtelemetry import accounting
+            self.submitted_tokens = accounting.admit_count(
+                self, "submitted_tokens", submitted, field="prompt.submitted_tokens")
 
     def set_native_cache(self, *, matched_prefix=None, reused_prefix=None, evaluated=None, replayed=None,
                          non_prefix_reused=None, evaluation_work=None, first_divergent=None,
@@ -250,20 +285,29 @@ class RequestRecord:
         distinct prompt positions the engine evaluated; `evaluation_work` is the executed prompt-token evaluations
         (repeated work counts again).
         """
+        from serve.reqtelemetry import accounting
         if matched_prefix is not None:
-            self.matched_prefix_tokens = _num(matched_prefix)
+            self.matched_prefix_tokens = accounting.admit_count(
+                self, "matched_prefix_tokens", matched_prefix, field="prompt.matched_prefix_tokens")
         if reused_prefix is not None:
-            self.reused_prefix_tokens = _num(reused_prefix)
+            self.reused_prefix_tokens = accounting.admit_count(
+                self, "reused_prefix_tokens", reused_prefix, field="prompt.reused_prefix_tokens")
         if evaluated is not None:
-            self.evaluated_tokens = _num(evaluated)
+            self.evaluated_tokens = accounting.admit_count(
+                self, "evaluated_tokens", evaluated, field="prompt.evaluated_tokens")
         if replayed is not None:
-            self.replayed_tokens = _num(replayed)
+            self.replayed_tokens = accounting.admit_count(
+                self, "replayed_tokens", replayed, field="prompt.replayed_tokens")
         if non_prefix_reused is not None:
-            self.non_prefix_reused_tokens = _num(non_prefix_reused)
+            self.non_prefix_reused_tokens = accounting.admit_count(
+                self, "non_prefix_reused_tokens", non_prefix_reused, field="prompt.non_prefix_reused_tokens")
         if evaluation_work is not None:
-            self.evaluation_work_tokens = _num(evaluation_work)
+            self.evaluation_work_tokens = accounting.admit_count(
+                self, "evaluation_work_tokens", evaluation_work, field="prompt.evaluation_work_tokens")
         if first_divergent is not None:
-            self.first_divergent_token_index = _num(first_divergent)
+            self.first_divergent_token_index = accounting.admit_count(
+                self, "first_divergent_token_index", first_divergent,
+                field="prompt.first_divergent_token_index")
         if source is not None:
             self.cache_source = source
         if disposition is not None:
@@ -275,7 +319,9 @@ class RequestRecord:
         if restore_succeeded is not None:
             self.cache_restore_succeeded = restore_succeeded
         if restore_ms is not None:
-            self.cache_restore_ms = _num(restore_ms)
+            from serve.reqtelemetry import accounting
+            self.cache_restore_ms = accounting.admit_duration(
+                self, "restore_ms", restore_ms, field="cache.restore_ms")
         if recurrent_state is not None:
             self.cache_recurrent_state = recurrent_state
         if attention_state is not None:
@@ -283,38 +329,58 @@ class RequestRecord:
         if checkpoint_state is not None:
             self.cache_checkpoint_state = checkpoint_state
         if invalidations is not None:
-            self.cache_invalidations = _num(invalidations)
+            from serve.reqtelemetry import accounting
+            self.cache_invalidations = accounting.admit_count(
+                self, "invalidations", invalidations, field="cache.invalidations")
         if evictions is not None:
-            self.cache_evictions = _num(evictions)
+            from serve.reqtelemetry import accounting
+            self.cache_evictions = accounting.admit_count(
+                self, "evictions", evictions, field="cache.evictions")
 
     def set_generation(self, *, requested_max=None, effective_max=None, generated=None, emitted=None,
                        draft_tokens=None, accepted_tokens=None, finish_reason=None):
         """What was generated.  `requested_max` is what the client asked for; `effective_max` is what the server
         actually allowed (the context's room, a budget).  They are kept apart on purpose."""
+        from serve.reqtelemetry import accounting
         if requested_max is not None:
-            self.requested_max_output_tokens = _num(requested_max)
+            self.requested_max_output_tokens = accounting.admit_count(
+                self, "requested_max_output_tokens", requested_max,
+                field="generation.requested_max_output_tokens")
         if effective_max is not None:
-            self.effective_max_output_tokens = _num(effective_max)
+            self.effective_max_output_tokens = accounting.admit_count(
+                self, "effective_max_output_tokens", effective_max,
+                field="generation.effective_max_output_tokens")
         if generated is not None:
-            self.generated_tokens = _num(generated)
+            self.generated_tokens = accounting.admit_count(
+                self, "generated_tokens", generated, field="generation.generated_tokens")
         if emitted is not None:
-            self.emitted_tokens = _num(emitted)
+            self.emitted_tokens = accounting.admit_count(
+                self, "emitted_tokens", emitted, field="generation.emitted_tokens")
         if draft_tokens is not None:
-            self.speculative_draft_tokens = _num(draft_tokens)
+            self.speculative_draft_tokens = accounting.admit_count(
+                self, "speculative_draft_tokens", draft_tokens,
+                field="generation.speculative_draft_tokens")
         if accepted_tokens is not None:
-            self.speculative_accepted_tokens = _num(accepted_tokens)
+            self.speculative_accepted_tokens = accounting.admit_count(
+                self, "speculative_accepted_tokens", accepted_tokens,
+                field="generation.speculative_accepted_tokens")
         if finish_reason is not None:
             self.finish_reason = finish_reason
 
     # ------------------------------------------------------------------ the native invocations (G1)
-    def begin_invocation(self, invocation_id, ordinal=None, engine_instance_id=None, model_id=None,
-                         build_revision=None):
+    def begin_invocation(self, invocation_id, ordinal=None, engine_instance_id=OMITTED, model_id=OMITTED,
+                         build_revision=OMITTED):
         """The measurement receipt of ONE native dispatch (AMENDMENT-03, G1).
 
         The receipt is bound to the invocation id, the ordinal, the engine instance, the model and the build
         identity IMMEDIATELY BEFORE the dispatch, so the terminal evidence can be validated against exactly that
         identity - and against nothing else.  The receipt is created empty: a measurement that the invocation
         does not report stays null in it, and it never inherits a value from another invocation.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2a): the identity arguments distinguish OMITTED from
+        EXPLICITLY UNKNOWN.  An argument that is not given at all falls back to the record's own identity (the
+        compatibility path); an argument that is given as None means "this identity was NOT AVAILABLE at the
+        dispatch" - and it stays unavailable.  The preparation-time identity is never substituted for it.
         """
         if invocation_id is None:
             return None
@@ -323,12 +389,41 @@ class RequestRecord:
             return existing
         receipt = InvocationReceipt(invocation_id,
                                     int(ordinal) if ordinal else len(self.invocations) + 1,
-                                    engine_instance_id=engine_instance_id if engine_instance_id is not None
-                                    else self.engine_instance_id,
-                                    model_id=model_id if model_id is not None else self.model_id,
-                                    build_revision=build_revision if build_revision is not None
-                                    else self.build_revision)
+                                    engine_instance_id=self.engine_instance_id if engine_instance_id is OMITTED
+                                    else engine_instance_id,
+                                    model_id=self.model_id if model_id is OMITTED else model_id,
+                                    build_revision=self.build_revision if build_revision is OMITTED
+                                    else build_revision)
         self.invocations_total += 1
+        self.dispatched_ids.append(invocation_id)
+        if len(self.dispatched_ids) > MAX_DISPATCHED_IDS:
+            del self.dispatched_ids[:-MAX_DISPATCHED_IDS]
+        self._add_receipt(receipt)
+        return receipt
+
+    def dispatched(self, invocation_id) -> bool:
+        """Whether THIS request dispatched that invocation id (the dispatch boundary is the only authority)."""
+        return invocation_id is not None and invocation_id in self.dispatched_ids
+
+    def adopt_legacy_invocation(self, invocation_id, ordinal=None):
+        """The COMPATIBILITY path: a receipt for an invocation id this request never dispatched.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): this operation is EXPLICIT and it is NOT a
+        dispatch: the dispatch counter is not incremented and the id is not remembered as dispatched.  It exists
+        for the callers that apply engine figures to a request that never went through the dispatch boundary (the
+        predecessor's path); the production terminal path never uses it, so terminal evidence can never create a
+        dispatch or resurrect a dropped receipt.
+        """
+        if invocation_id is None:
+            return None
+        existing = self.invocation_for(invocation_id)
+        if existing is not None:
+            return existing
+        receipt = InvocationReceipt(invocation_id,
+                                    int(ordinal) if ordinal else len(self.invocations) + 1,
+                                    engine_instance_id=self.engine_instance_id,
+                                    model_id=self.model_id,
+                                    build_revision=self.build_revision)
         self._add_receipt(receipt)
         return receipt
 
@@ -342,9 +437,26 @@ class RequestRecord:
         return None
 
     def _add_receipt(self, receipt):
-        """Keep the receipt inside the documented bounds; a receipt that does not fit is COUNTED as a loss."""
+        """Keep the receipt inside the documented bounds; a receipt that does not fit is COUNTED as a loss.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): a receipt that cannot fit within the byte budget
+        ON ITS OWN is refused: the predecessor admitted it when the history was empty, so one oversized receipt
+        could exceed the whole budget.  The size is the receipt's ACTUAL serialized UTF-8 size; a receipt that
+        cannot be serialized at all is refused too - a serialization failure is NOT a zero-byte receipt.
+        """
         size = _receipt_size(receipt)
+        if size is None:
+            # the receipt cannot be serialized: its size is UNKNOWN, not zero.  It is refused and counted.
+            self.invocations_dropped += 1
+            self._note_drop()
+            return
         receipt._size = size
+        if size > MAX_INVOCATION_BYTES:
+            # it cannot fit within the budget, not even alone: refused and counted as a loss
+            self.invocations_dropped += 1
+            self.invocations_dropped_bytes += size
+            self._note_drop()
+            return
         while self.invocations and (len(self.invocations) >= MAX_INVOCATION_RECORDS
                                     or self.invocations_bytes + size > MAX_INVOCATION_BYTES):
             dropped = self.invocations.pop(0)
@@ -356,11 +468,50 @@ class RequestRecord:
         self.invocations_bytes += size
         self._sync_parent()
         self._merge_unavailable()
+        self._note_drop()
+
+    def _note_drop(self):
+        """Publish the loss of a receipt: a dropped receipt is visible, never silent."""
+        self._merge_unavailable()
         if self.invocations_dropped:
             self.mark_unavailable("invocations",
                                   f"{self.invocations_dropped} native invocation receipt(s) did not fit in the "
                                   f"record's bounds ({MAX_INVOCATION_RECORDS} receipts, {MAX_INVOCATION_BYTES} bytes) "
                                   f"and were dropped: the record does not show them")
+
+    def revalidate_invocation_bytes(self):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5b, D5): the byte bound is re-checked AFTER the
+        terminal measurements have been added.
+
+        The receipt's size is measured when it is admitted - but the receipt grows afterwards: the terminal
+        measurements (the durations, the generation counters, the reason) are added to it later.  The bound is
+        therefore checked again here, on the receipts as they are published.
+        """
+        for receipt in list(self.invocations):
+            size = _receipt_size(receipt)
+            if size is None:
+                # it cannot be serialized: it is not a zero-byte receipt, it is an unusable one
+                self.invocations.remove(receipt)
+                self.invocations_bytes -= getattr(receipt, "_size", 0)
+                self.invocations_dropped += 1
+                continue
+            previous = getattr(receipt, "_size", 0)
+            receipt._size = size
+            self.invocations_bytes += size - previous
+        # the oldest receipts go until the collection is inside the byte budget again
+        while self.invocations and self.invocations_bytes > MAX_INVOCATION_BYTES:
+            dropped = self.invocations.pop(0)
+            self.invocations_bytes -= getattr(dropped, "_size", 0)
+            self.invocations_dropped += 1
+            self.invocations_dropped_bytes += getattr(dropped, "_size", 0)
+        # a receipt that alone exceeds the budget does not fit either
+        while self.invocations and getattr(self.invocations[0], "_size", 0) > MAX_INVOCATION_BYTES:
+            dropped = self.invocations.pop(0)
+            self.invocations_bytes -= getattr(dropped, "_size", 0)
+            self.invocations_dropped += 1
+            self.invocations_dropped_bytes += getattr(dropped, "_size", 0)
+        self._sync_parent()
+        self._note_drop()
 
     def _sync_parent(self):
         """The parent's native scalars describe ONE invocation - and only when that is unambiguous (G1).
@@ -468,6 +619,17 @@ class RequestRecord:
         # parent's native scalars are the single invocation's, or null when the request dispatched more than one.
         for receipt in self.invocations:
             receipt.seal()
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): an invocation whose terminal evidence never
+            # arrived is NOT presented as running.  The request is over, so nothing is still executing: the state
+            # says "unknown" and the receipt says why.  Missing telemetry is not a failure of the inference.
+            if receipt.state == "running":
+                receipt.state = "unknown"
+                receipt.mark_unavailable("terminal_evidence",
+                                        "the native invocation's terminal evidence never arrived: its outcome is "
+                                        "unknown", INSTRUMENTATION_ERROR)
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5b, D5): the receipts have just received their
+        # terminal measurements, so their serialized size is re-checked against the byte budget NOW.
+        self.revalidate_invocation_bytes()
         self._sync_parent()
         self.cache_disposition = self.derive_disposition()
         if self.state in ("cancelled", "failed", "rejected") and self.quality == COMPLETE:
@@ -578,6 +740,11 @@ class RequestRecord:
                 # and why not when they may not.  The three decisions stay apart: the measurements are valid, the
                 # accounting is not violated, and the engine's receipt is correlated to this request.
                 "native_correlation": self.aggregate_correlation(),
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the correlation of the RETAINED
+                # evidence and the correlation of the WHOLE dispatched population are different claims.  A receipt
+                # that was dropped means the request's evidence is incomplete, even when every receipt that
+                # survived is verified.
+                "native_correlation_complete": self.correlation_complete(),
                 "native_partial": self.native_partial,
                 "measurement_valid": self.measurement_valid(),
                 "aggregate_eligible": self.aggregate_eligible(),
@@ -592,6 +759,9 @@ class RequestRecord:
                 "invocation_count": len(self.invocations),
                 "invocations_dispatched": self.invocations_total,
                 "invocations_dropped": self.invocations_dropped,
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): the bytes of the dropped receipts are
+                # published beside the count: a lost receipt is visible in both.
+                "invocation_dropped_bytes": self.invocations_dropped_bytes,
                 "invocation_bytes": self.invocations_bytes,
             },
         }
@@ -611,6 +781,19 @@ class RequestRecord:
         if all(state == CORRELATION_VERIFIED for state in states):
             return CORRELATION_VERIFIED
         return CORRELATION_UNAVAILABLE
+
+    def correlation_complete(self) -> bool:
+        """Whether the native correlation covers the WHOLE dispatched population (D6).
+
+        The RETAINED evidence may be fully verified while the request's evidence is incomplete: a receipt that
+        did not fit the bounds was dropped, and the evidence of that invocation is lost.  The record then says so
+        instead of claiming a complete request-level native correlation.
+        """
+        if self.invocations_dropped:
+            return False
+        if self.invocations_total != len(self.invocations):
+            return False
+        return self.aggregate_correlation() == CORRELATION_VERIFIED
 
     def metric_admission(self, metric: str) -> bool:
         """Whether this RECORD's own measurements of one metric class may enter an authoritative aggregate.

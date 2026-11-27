@@ -74,7 +74,9 @@ class ServerTelemetry:
                 return None                 # already finished: a terminal receipt is finalized AT MOST ONCE
             del self._records[record.request_id]
         # the terminal outcome first: it does not depend on the receipt
-        self.store.end_request(state)
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the record is passed, so the outcome is counted
+        # exactly once - the store's own `add` does not count it again.
+        self.store.end_request(state, record)
         try:
             record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
             data = self.store.add(record)

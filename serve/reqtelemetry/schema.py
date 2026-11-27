@@ -134,6 +134,10 @@ SCHEMA = {
                 # AMENDMENT-02 (G1): how the engine's receipt was tied to this request, whether the numbers are
                 # measurements at all, and whether the record may enter the authoritative aggregates
                 "native_correlation": {"enum": ["verified", "unavailable", "rejected", "not_applicable"]},
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): whether the correlation covers the WHOLE
+                # dispatched population - the retained evidence may be verified while the request's evidence is
+                # incomplete (a receipt was dropped).
+                "native_correlation_complete": {"type": "boolean"},
                 # AMENDMENT-02 (A9): the native figures cover one segment of the invocation only
                 "native_partial": {"type": "boolean"},
                 "measurement_valid": {"type": "boolean"},
@@ -144,6 +148,8 @@ SCHEMA = {
                 "invocation_count": {"type": "integer", "minimum": 0},
                 "invocations_dispatched": {"type": "integer", "minimum": 0},
                 "invocations_dropped": {"type": "integer", "minimum": 0},
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): the bytes of the dropped receipts
+                "invocation_dropped_bytes": {"type": "integer", "minimum": 0},
                 "invocation_bytes": {"type": "integer", "minimum": 0},
                 "accounting": {
                     "type": "object",
@@ -184,11 +190,53 @@ SCHEMA["properties"]["invocations"] = {
                     "slot_id": {"type": ["integer", "null"], "minimum": 0},
                 },
             },
-            "state": {"enum": ["running", "completed", "cancelled", "failed", "rejected"]},
-            "prompt": SCHEMA["properties"]["prompt"],
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): "unknown" is the state of an invocation
+            # whose terminal evidence never arrived - it is NOT presented as running, and it is not a failure of
+            # the inference either.
+            "state": {"enum": ["running", "completed", "cancelled", "failed", "rejected", "unknown"]},
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the invocation's prompt section carries the
+            # DOMAIN of its dispatch - a word, never a hash and never content.  The prompt's length is not its
+            # identity.
+            "prompt": {
+                "type": "object",
+                "required": ["rendered_tokens", "submitted_tokens", "domain", "matched_prefix_tokens",
+                             "reused_prefix_tokens", "evaluated_tokens", "replayed_tokens",
+                             "non_prefix_reused_tokens", "evaluation_work_tokens", "first_divergent_token_index"],
+                "additionalProperties": False,
+                "properties": {
+                    "rendered_tokens": _int_or_null(),
+                    "submitted_tokens": _int_or_null(),
+                    "domain": {"type": ["string", "null"]},
+                    "matched_prefix_tokens": _int_or_null(),
+                    "reused_prefix_tokens": _int_or_null(),
+                    "evaluated_tokens": _int_or_null(),
+                    "replayed_tokens": _int_or_null(),
+                    "non_prefix_reused_tokens": _int_or_null(),
+                    "evaluation_work_tokens": _int_or_null(),
+                    "first_divergent_token_index": _int_or_null(),
+                },
+            },
             "cache": SCHEMA["properties"]["cache"],
             "timing_ms": SCHEMA["properties"]["timing_ms"],
-            "generation": SCHEMA["properties"]["generation"],
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the invocation's OWN generation section.  It
+            # carries the native finish reason as well - the physical HTTP finish reason is not the native
+            # invocation's finish reason, so the two are kept apart.
+            "generation": {
+                "type": "object",
+                "required": ["requested_max_output_tokens", "effective_max_output_tokens", "generated_tokens",
+                             "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens",
+                             "finish_reason"],
+                "additionalProperties": False,
+                "properties": {
+                    "requested_max_output_tokens": _int_or_null(),
+                    "effective_max_output_tokens": _int_or_null(),
+                    "generated_tokens": _int_or_null(),
+                    "emitted_tokens": _int_or_null(),
+                    "speculative_draft_tokens": _int_or_null(),
+                    "speculative_accepted_tokens": _int_or_null(),
+                    "finish_reason": _str_or_null(),
+                },
+            },
             "measurement_quality": {
                 "type": "object",
                 "required": ["state", "unavailable_fields", "timing_authority", "native_correlation",

@@ -73,6 +73,22 @@ def _admit(target, name, value):
     return value
 
 
+def _counter(value):
+    """A native CUMULATIVE counter, with the engine's own sentinel for "not measured".
+
+    The engine writes -1 for a counter it did not measure (include/strata/program/reqtelemetry.hpp) and leaves the
+    key out of the DONE line entirely; the key=value reader here keeps whatever was on the line, so a -1 can
+    reach this point.  It means "not measured" - it is NOT a negative count and NOT an invalid measurement: the
+    field stays null and the receipt says it was not measured.  Every other value goes through the shared typed
+    admission (a negative, a fraction and a bool are refused there).
+    """
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value == -1:
+        return None
+    return value
+
+
 def apply_engine(record: RequestRecord, figures: dict | None, expected_invocation_id: str | None = None,
                  receipt=None, terminal_state: str = "completed", native_segment_only: bool = False):
     """The engine's own measurements for ONE native invocation, into ITS receipt (AMENDMENT-03, G1).
@@ -98,12 +114,35 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
         expected = record.engine_invocation_id
     if expected is None:
         expected = record.request_id
-    # the receipt this evidence belongs to: the one the server bound before the dispatch, or a new one for a
-    # caller that did not bind it (the predecessor's path).
+    # the receipt this evidence belongs to: the one the server bound before the dispatch.
+    #
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): the terminal evidence may NOT create a dispatch.
+    # The predecessor called `record.begin_invocation(expected)` here, so a receipt of an invocation this request
+    # never dispatched - or of one whose receipt had already been dropped - produced a NEW dispatch: the
+    # dispatched population grew and the retained population changed.  Now:
+    #
+    #   * the receipt of an invocation this request DISPATCHED is used, even when its measurements are already
+    #     there (an identical duplicate is ignored, a conflicting one is reported);
+    #   * a receipt of an invocation this request did NOT dispatch is refused: it is not attached to anything,
+    #     it does not create a dispatch and it does not resurrect a dropped receipt;
+    #   * the compatibility path (a caller that never went through the dispatch boundary) is EXPLICIT:
+    #     `adopt_legacy_invocation` - it does not count as a dispatch.
     if receipt is None:
         receipt = record.invocation_for(expected)
     if receipt is None:
-        receipt = record.begin_invocation(expected)
+        if expected is not None and (record.invocations or record.dispatched(expected)):
+            # the receipt of an invocation this request dispatched (and whose receipt was dropped) or of one it
+            # never dispatched: the evidence belongs to nobody.  It is not attached to anything, it does not
+            # create a dispatch and it does not resurrect a dropped receipt.
+            record.mark_unavailable("engine_telemetry",
+                                    "the engine's receipt carried the id of a native invocation whose receipt "
+                                    "this request does not hold: its measurements were not attached",
+                                    INSTRUMENTATION_ERROR)
+            record.native_correlation = record.aggregate_correlation()
+            record._sync_parent()
+            return {"correlation": CORRELATION_REJECTED, "admitted": False}
+        # the compatibility path: a caller that never went through the dispatch boundary
+        receipt = record.adopt_legacy_invocation(expected)
     if not figures:
         receipt.correlation = CORRELATION_UNAVAILABLE
         receipt.mark_unavailable("cache", "the engine reported no cache measurements for this invocation")
@@ -154,6 +193,25 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
     replayed = _admit(receipt, "replayed_tokens", figures.get("replayed"))
     work = _admit(receipt, "evaluation_work_tokens", figures.get("work"))
 
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): an ALREADY ACCEPTED terminal receipt is never
+    # silently overwritten.  A duplicate that carries the SAME measurements is ignored (idempotently): it does
+    # not cause additional work accounting.  A duplicate that carries DIFFERENT measurements is a CONFLICT: the
+    # receipt keeps its accepted measurements, and the conflict is reported as explicit instrumentation evidence.
+    if receipt.terminal_accepted:
+        if receipt.same_measurements(matched, reused, evaluated, replayed, work):
+            return {"correlation": receipt.correlation, "admitted": receipt.correlation == CORRELATION_VERIFIED,
+                    "duplicate": True}
+        receipt.mark_unavailable("engine_telemetry",
+                                 "a second terminal receipt for this invocation carried DIFFERENT measurements: "
+                                 "the accepted ones were kept and the conflict is reported",
+                                 INSTRUMENTATION_ERROR)
+        record.mark_unavailable("engine_telemetry",
+                                "a second terminal receipt for this invocation carried DIFFERENT measurements: "
+                                "the accepted ones were kept and the conflict is reported", INSTRUMENTATION_ERROR)
+        record.native_correlation = record.aggregate_correlation()
+        record._sync_parent()
+        return {"correlation": receipt.correlation, "admitted": False, "conflict": True}
+
     # The engine writes the divergent index as: a position (0 or more), -1 for "the sequences agree throughout"
     # and -2 for "not measured".  The receipt's field is null in both of those cases - there is no mismatch to
     # report - and the reason says which of the two it was.
@@ -175,8 +233,11 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
         restore_attempted=(figures.get("restore") != "none") if "restore" in figures else None,
         restore_succeeded=(figures.get("restore") == "succeeded") if "restore" in figures else None,
         restore_ms=figures.get("restore_ms"),
-        invalidations=figures.get("invalidations"), evictions=figures.get("evictions"))
+        invalidations=_counter(figures.get("invalidations")),
+        evictions=_counter(figures.get("evictions")))
     # the engine's own durations: the lookup and the restoration it measured
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): a duration that is negative, NaN or infinite is
+    # REFUSED by the shared typed rule - it is never published and never a measured zero.  The receipt says why.
     if figures.get("lookup_ms") is not None:
         receipt.set_timing("cache_lookup", figures["lookup_ms"], "native_engine")
     if figures.get("restore_ms") is not None:
@@ -204,6 +265,10 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
                                  "the engine's batch slot reported only its admission segment: the native "
                                  "accounting is not the whole invocation")
     receipt.seal()
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): this invocation's terminal evidence is now
+    # ACCEPTED.  A second terminal receipt for it is a duplicate: the same one is ignored, a conflicting one is
+    # reported as explicit instrumentation evidence, and neither overwrites these measurements.
+    receipt.terminal_accepted = True
     # the parent's fields are the single invocation's; with more than one invocation they stay null (ambiguous)
     record.native_correlation = record.aggregate_correlation()
     record._sync_parent()

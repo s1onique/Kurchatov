@@ -63,6 +63,9 @@ class TelemetryStore:
             # INVOCATION: a receipt that never arrived is in the missing population, so a lost receipt lowers the
             # coverage instead of silently improving it.
             "native_invocations": 0, "native_invocations_accounted": 0, "native_invocations_missing": 0,
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the receipts that did not fit the bounds.
+            # They are missing EVIDENCE: the invocation happened, its receipt did not survive.
+            "native_invocations_dropped": 0,
             "requests_with_complete_accounting": 0,
             # the positions of the invocations whose prompt domain is NOT the request's own prompt domain (a
             # recovery dispatch that sent another prompt): they are work, never the request's prompt coverage
@@ -70,10 +73,20 @@ class TelemetryStore:
             "native_positions_evaluated_total": 0,
             # the evictions of an engine whose identity is unknown: they cannot be attributed to a domain
             "cache_evictions_unattributed": 0,
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5a): the observations that were REFUSED from
+            # the authoritative total because their engine's retired reading was gone - the attribution was
+            # unavailable, and the work was not counted twice.
+            "cache_evictions_attribution_unavailable": 0,
         }
         # the engine's own eviction counter, per engine instance: it restarts with the engine, and a counter that
         # falls would be a counter that lies (G6)
         self._evictions_by_engine = {}
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5a): the RETIRED engines' last readings.  They are
+        # kept (bounded) so that a DELAYED observation of a retired engine is compared with its own last reading
+        # instead of being counted again from zero.  The engines whose reading is gone are remembered as
+        # unattributable, so their later observations are refused rather than counted twice.
+        self._retired_evictions = {}
+        self._unattributable_engines = set()
         # The duration histograms, in SECONDS: name -> {"sum": seconds, "n": count, "buckets": [cumulative counts]}.
         # The record keeps its timings in milliseconds (the record's own unit is named in the section), and the store
         # converts them ONCE, here, when it observes them.  Everything downstream of this line is seconds.
@@ -89,14 +102,22 @@ class TelemetryStore:
         with self.lock:
             self.counters["requests_accepted"] += 1
 
-    def end_request(self, state):
-        """Count ONE terminal outcome for an accepted request (AMENDMENT-02, A4)."""
+    def end_request(self, state, record=None):
+        """Count ONE terminal outcome for an accepted request (AMENDMENT-02, A4).
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the terminal outcome is counted BEFORE the
+        receipt is sealed and stored, so a request whose terminal receipt is lost still counts in the physical
+        request's own population.  The record is marked, so the outcome is counted exactly ONCE (the store's own
+        `add` does not count it a second time).
+        """
         key = {"completed": "requests_terminal_completed", "cancelled": "requests_terminal_cancelled",
                "failed": "requests_terminal_failed", "rejected": "requests_terminal_rejected"}.get(state)
         if key is None:
             return
         with self.lock:
             self.counters[key] += 1
+        if record is not None:
+            record._terminal_counted = True
 
     def receipt_failed(self):
         """A terminal receipt that could not be delivered (sealing, storing or writing it failed)."""
@@ -121,6 +142,16 @@ class TelemetryStore:
             self.bytes += size
             self._evict_locked()
             self.counters["receipts_created"] += 1
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the physical request's own population is the
+            # requests that reached a terminal outcome.  A record that arrives WITHOUT its terminal outcome having
+            # been counted (a caller that stores the receipt itself) counts it here - exactly once.
+            if not getattr(record, "_terminal_counted", False):
+                key = {"completed": "requests_terminal_completed", "cancelled": "requests_terminal_cancelled",
+                       "failed": "requests_terminal_failed", "rejected": "requests_terminal_rejected"}.get(
+                           data["lifecycle"]["state"])
+                if key is not None:
+                    self.counters[key] += 1
+                    record._terminal_counted = True
             self._count_locked(data)
         return data
 
@@ -154,23 +185,36 @@ class TelemetryStore:
             c["requests_failed"] += 1
         quality = data["measurement_quality"]
         prompt, gen = data["prompt"], data["generation"]
-        accounting_state = (quality.get("accounting") or {}).get("state")
-        # the HTTP-owned measurements: the server's own numbers.  They do not depend on the engine's receipt,
-        # but they do depend on the token accounting not being broken (the identity involves the submitted
-        # prompt, which the server measured).
-        if accounting_state != "violated":
-            submitted = prompt.get("submitted_tokens")
-            if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0:
-                c["prompt_tokens_submitted"] += submitted
-            emitted = gen.get("emitted_tokens")
-            if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
-                c["emitted_tokens"] += emitted
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D3): the HTTP-owned measurements are admitted on
+        # THEIR OWN terms.  The server measured them itself; the native token accounting says nothing about them,
+        # so a broken NATIVE accounting never suppresses the HTTP counter (and the record's own admission
+        # decision - METRIC_HTTP is always admitted - agrees with what the store does).
+        submitted = prompt.get("submitted_tokens")
+        if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0:
+            c["prompt_tokens_submitted"] += submitted
+        emitted = gen.get("emitted_tokens")
+        if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
+            c["emitted_tokens"] += emitted
         # the native measurements: every invocation's own receipt decides for itself
         request_submitted = prompt.get("submitted_tokens")
         accounted_request = False
         for invocation in data.get("invocations") or []:
             if self._count_invocation_locked(c, invocation, request_submitted):
                 accounted_request = True
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the invocation denominator is the DISPATCHED
+        # population, not the retained one.  A receipt that was dropped is a MISSING invocation: the coverage falls,
+        # it never improves.  The dispatched count comes from the record's own dispatch accounting, so it is
+        # independent of the receipts that survived.
+        dispatched = int(quality.get("invocations_dispatched") or 0)
+        retained = len(data.get("invocations") or [])
+        dropped = max(0, dispatched - retained)
+        if dropped:
+            # the receipts that did not fit: they are in the missing population, never in the accounted one
+            c["native_invocations_missing"] += dropped
+            c["native_invocations_dropped"] += dropped
+        # the invocation population: every native invocation this request performed, whether its receipt survived
+        # or not.  It is counted from the DISPATCH accounting, never from the retained receipts alone.
+        c["native_invocations"] += retained + dropped
         if accounted_request:
             c["requests_with_complete_accounting"] += 1
         if quality.get("state") == INSTRUMENTATION_ERROR:
@@ -192,18 +236,27 @@ class TelemetryStore:
         iprompt = invocation.get("prompt") or {}
         icache = invocation.get("cache") or {}
         igen = invocation.get("generation") or {}
-        c["native_invocations"] += 1
-        # the eligible and the missing populations of the accounting coverage (G2c)
+        # the eligible and the missing populations of the accounting coverage (G2c).  The POPULATION itself is
+        # counted by the caller, from the dispatch accounting (C2): a dropped receipt is missing evidence, not a
+        # smaller population.
         eligible = bool(admission.get(ACCOUNTING.METRIC_COMPLETE_CACHE_RATIO))
         if eligible:
             c["native_invocations_accounted"] += 1
         else:
             c["native_invocations_missing"] += 1
         # the prompt positions: the REQUEST's own prompt domain only.  An invocation that worked on another
-        # prompt (a recovery dispatch) is work, never this prompt's coverage.  An invocation whose own prompt
-        # length was not measured cannot be a different domain: it stays in the request's domain.
-        same_domain = (request_submitted is None or iprompt.get("submitted_tokens") is None
-                       or iprompt.get("submitted_tokens") == request_submitted)
+        # prompt (a recovery dispatch) is work, never this prompt's coverage.
+        #
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the domain is the NAME the dispatch boundary
+        # gave it, NOT the prompt's length.  Two different prompts of the same length are two domains, and two
+        # invocations of the SAME prompt are one domain.  An invocation whose domain was not named (an older
+        # caller) falls back to the length comparison.
+        domain = iprompt.get("domain")
+        if domain is None:
+            same_domain = (request_submitted is None or iprompt.get("submitted_tokens") is None
+                           or iprompt.get("submitted_tokens") == request_submitted)
+        else:
+            same_domain = domain == "request"
         if admission.get(ACCOUNTING.METRIC_NATIVE_PROMPT_POSITION):
             for key, counter, total in (("matched_prefix_tokens", "prompt_tokens_matched",
                                          "native_positions_matched_total"),
@@ -261,17 +314,51 @@ class TelemetryStore:
         attributed to an engine process, so it is published as unattributed instead of pretending that two
         different engines are one.  The retired instances' state is BOUNDED: the oldest mark goes when the bound
         is reached, so a long run does not grow the state without limit.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5a): retiring an engine's mark must not FORGET its
+        counter domain.  The predecessor deleted the mark when the bound was reached, so a LATE observation of
+        that engine looked like a first observation and its whole cumulative counter was counted again - the same
+        work was counted twice.  Now a retired engine's last reading is kept in a SEPARATE, equally bounded map
+        of RETIRED domains: a late observation of a retired engine is compared against that reading and only its
+        DELTA is counted.  The retired map is bounded too, and when a retired reading is dropped from it the
+        domain is remembered as UNATTRIBUTABLE: a later observation of that engine is then refused from the
+        authoritative total and counted as an unavailable attribution - never counted again as if it were new.
         """
         if not instance:
             c["cache_evictions_unattributed"] += evictions
             return
-        previous = self._evictions_by_engine.get(instance, 0)
-        if evictions >= previous:
-            c["cache_evictions"] += evictions - previous
+        if instance in self._evictions_by_engine:
+            previous = self._evictions_by_engine[instance]
+            if evictions >= previous:
+                c["cache_evictions"] += evictions - previous
+                self._evictions_by_engine[instance] = evictions
+        elif instance in self._retired_evictions:
+            # a DELAYED observation of a retired engine: only the increase since its last reading is new work
+            previous = self._retired_evictions[instance]
+            if evictions >= previous:
+                c["cache_evictions"] += evictions - previous
+                self._retired_evictions[instance] = evictions
+        elif instance in self._unattributable_engines:
+            # the retired reading of this engine is gone: its exact delta cannot be recovered, so the
+            # observation is REFUSED from the authoritative total and the attribution is counted as unavailable
+            c["cache_evictions_unattributed"] += evictions
+            c["cache_evictions_attribution_unavailable"] += 1
+            return
+        else:
+            # a first observation of this engine: its whole counter is new work
+            c["cache_evictions"] += evictions
             self._evictions_by_engine[instance] = evictions
         while len(self._evictions_by_engine) > MAX_ENGINE_INSTANCES:
             oldest = next(iter(self._evictions_by_engine))
-            del self._evictions_by_engine[oldest]
+            self._retired_evictions[oldest] = self._evictions_by_engine.pop(oldest)
+            while len(self._retired_evictions) > MAX_ENGINE_INSTANCES:
+                # the retired reading goes: the engine's counter domain is no longer recoverable, so it is
+                # remembered as unattributable (a BOUNDED set, not unbounded tombstone storage)
+                gone = next(iter(self._retired_evictions))
+                del self._retired_evictions[gone]
+                self._unattributable_engines.add(gone)
+                while len(self._unattributable_engines) > MAX_ENGINE_INSTANCES:
+                    self._unattributable_engines.pop()
 
 
     def _observe_locked(self, data):
@@ -365,6 +452,13 @@ class TelemetryStore:
             submitted = self.counters["prompt_tokens_submitted_eligible"]
             reused = self.counters["prompt_tokens_reused_eligible"]
             total = self.counters["requests_total"]
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the requests that reached a TERMINAL
+            # OUTCOME.  This is the physical request's own denominator: it is independent of the receipts that were
+            # stored, so a lost terminal receipt lowers the coverage instead of shrinking the population.
+            terminal = (self.counters["requests_terminal_completed"]
+                        + self.counters["requests_terminal_cancelled"]
+                        + self.counters["requests_terminal_failed"]
+                        + self.counters["requests_terminal_rejected"])
             return {
                 "counters": dict(self.counters),
                 # AMENDMENT-02 (A4): the lifecycle accounting, independent of the records' own insertion.  At
@@ -388,13 +482,19 @@ class TelemetryStore:
                                 "eligible_invocations": self.counters["native_invocations_accounted"],
                                 "missing_invocations": self.counters["native_invocations_missing"],
                                 "invocations": self.counters["native_invocations"],
+                                "dropped_invocations": self.counters["native_invocations_dropped"],
                                 "requests_with_complete_accounting":
                                     self.counters["requests_with_complete_accounting"],
                                 "coverage": round(self.counters["native_invocations_accounted"]
                                                   / self.counters["native_invocations"], 6)
                                 if self.counters["native_invocations"] else None,
+                                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the physical request's own
+                                # coverage is measured against the requests that REACHED A TERMINAL OUTCOME, not
+                                # against the receipts that were stored: a request whose terminal receipt was lost
+                                # lowers the coverage instead of disappearing from the denominator.  A request that
+                                # is still running is not in the population - its outcome is not known yet.
                                 "request_coverage": round(self.counters["requests_with_complete_accounting"]
-                                                          / total, 6) if total else None},
+                                                          / terminal, 6) if terminal else None},
                 "histograms": {k: {"sum": v["sum"], "count": v["n"],
                                    "buckets": {str(edge): v["buckets"][i]
                                                for i, edge in enumerate(DURATION_BUCKETS)}}

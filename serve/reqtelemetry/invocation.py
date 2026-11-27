@@ -57,12 +57,20 @@ class InvocationReceipt:
         self.correlation = "not_applicable"
         # the invocation's own terminal state: "running" until its terminal evidence arrives
         self.state = "running"
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): the terminal evidence of this invocation has
+        # been ACCEPTED.  A second terminal receipt is then a duplicate: the same one is ignored, a conflicting one
+        # is reported - and the accepted measurements are never overwritten.
+        self.terminal_accepted = False
         # the engine sent a measurement that is not a measurement (AMENDMENT-02, G1)
         self.measurements_invalid = False
         # the native figures cover one segment of the invocation only (AMENDMENT-02, A9)
         self.native_partial = False
         # the prompt this dispatch gave the engine (the invocation's OWN prompt domain)
         self.submitted_tokens = None
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the NAME of the prompt domain this dispatch
+        # carried - "request", "continuation" or "other".  It is a word, not a hash and not content: the prompt's
+        # LENGTH is not its identity.
+        self.prompt_domain = None
         self.rendered_tokens = None
         self.slot_id = None
         self.matched_prefix_tokens = None
@@ -111,8 +119,14 @@ class InvocationReceipt:
             self.quality = PARTIAL
 
     def set_timing(self, name, ms, authority):
-        """A duration in milliseconds, from a monotonic clock, with the authority that measured it."""
-        value = _num(ms)
+        """A duration in milliseconds, from a monotonic clock, with the authority that measured it.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the duration is admitted by the SHARED typed
+        rule: a negative, a NaN and an infinity are refused (never published, never a measured zero), and the
+        receipt says why.
+        """
+        from serve.reqtelemetry import accounting
+        value = accounting.admit_duration(self, name, ms, field=f"timing_ms.{name}")
         if value is None:
             return
         self.timing[name] = round(float(value), 3)
@@ -123,21 +137,35 @@ class InvocationReceipt:
                          source=None, disposition=None, reason_code=None, restore_attempted=None,
                          restore_succeeded=None, restore_ms=None, recurrent_state=None, attention_state=None,
                          checkpoint_state=None, invalidations=None, evictions=None):
-        """What the NATIVE ENGINE measured about the cache and the prompt, for THIS invocation."""
+        """What the NATIVE ENGINE measured about the cache and the prompt, for THIS invocation.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): every count and every duration goes through the
+        SHARED typed admission.  An invalid value is refused (the field stays null and the receipt says why) - it
+        is never clamped, rounded or coerced into a valid one.
+        """
+        from serve.reqtelemetry import accounting
         if matched_prefix is not None:
-            self.matched_prefix_tokens = _num(matched_prefix)
+            self.matched_prefix_tokens = accounting.admit_count(
+                self, "matched_prefix_tokens", matched_prefix, field="prompt.matched_prefix_tokens")
         if reused_prefix is not None:
-            self.reused_prefix_tokens = _num(reused_prefix)
+            self.reused_prefix_tokens = accounting.admit_count(
+                self, "reused_prefix_tokens", reused_prefix, field="prompt.reused_prefix_tokens")
         if evaluated is not None:
-            self.evaluated_tokens = _num(evaluated)
+            self.evaluated_tokens = accounting.admit_count(
+                self, "evaluated_tokens", evaluated, field="prompt.evaluated_tokens")
         if replayed is not None:
-            self.replayed_tokens = _num(replayed)
+            self.replayed_tokens = accounting.admit_count(
+                self, "replayed_tokens", replayed, field="prompt.replayed_tokens")
         if non_prefix_reused is not None:
-            self.non_prefix_reused_tokens = _num(non_prefix_reused)
+            self.non_prefix_reused_tokens = accounting.admit_count(
+                self, "non_prefix_reused_tokens", non_prefix_reused, field="prompt.non_prefix_reused_tokens")
         if evaluation_work is not None:
-            self.evaluation_work_tokens = _num(evaluation_work)
+            self.evaluation_work_tokens = accounting.admit_count(
+                self, "evaluation_work_tokens", evaluation_work, field="prompt.evaluation_work_tokens")
         if first_divergent is not None:
-            self.first_divergent_token_index = _num(first_divergent)
+            self.first_divergent_token_index = accounting.admit_count(
+                self, "first_divergent_token_index", first_divergent,
+                field="prompt.first_divergent_token_index")
         if source is not None:
             self.cache_source = source
         if disposition is not None:
@@ -149,7 +177,8 @@ class InvocationReceipt:
         if restore_succeeded is not None:
             self.cache_restore_succeeded = restore_succeeded
         if restore_ms is not None:
-            self.cache_restore_ms = _num(restore_ms)
+            self.cache_restore_ms = accounting.admit_duration(
+                self, "restore_ms", restore_ms, field="cache.restore_ms")
         if recurrent_state is not None:
             self.cache_recurrent_state = recurrent_state
         if attention_state is not None:
@@ -157,35 +186,57 @@ class InvocationReceipt:
         if checkpoint_state is not None:
             self.cache_checkpoint_state = checkpoint_state
         if invalidations is not None:
-            self.cache_invalidations = _num(invalidations)
+            self.cache_invalidations = accounting.admit_count(
+                self, "invalidations", invalidations, field="cache.invalidations")
         if evictions is not None:
-            self.cache_evictions = _num(evictions)
+            self.cache_evictions = accounting.admit_count(
+                self, "evictions", evictions, field="cache.evictions")
 
     def set_generation(self, *, requested_max=None, effective_max=None, generated=None, emitted=None,
                        draft_tokens=None, accepted_tokens=None, finish_reason=None):
-        """What this invocation generated."""
+        """What this invocation generated.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the generation counters are COUNTS: a whole,
+        non-negative integer.  A negative, a fraction and a bool are refused - never rounded into a valid count.
+        """
+        from serve.reqtelemetry import accounting
         if requested_max is not None:
-            self.requested_max_output_tokens = _num(requested_max)
+            self.requested_max_output_tokens = accounting.admit_count(
+                self, "requested_max_output_tokens", requested_max,
+                field="generation.requested_max_output_tokens")
         if effective_max is not None:
-            self.effective_max_output_tokens = _num(effective_max)
+            self.effective_max_output_tokens = accounting.admit_count(
+                self, "effective_max_output_tokens", effective_max,
+                field="generation.effective_max_output_tokens")
         if generated is not None:
-            self.generated_tokens = _num(generated)
+            self.generated_tokens = accounting.admit_count(
+                self, "generated_tokens", generated, field="generation.generated_tokens")
         if emitted is not None:
-            self.emitted_tokens = _num(emitted)
+            self.emitted_tokens = accounting.admit_count(
+                self, "emitted_tokens", emitted, field="generation.emitted_tokens")
         if draft_tokens is not None:
-            self.speculative_draft_tokens = _num(draft_tokens)
+            self.speculative_draft_tokens = accounting.admit_count(
+                self, "speculative_draft_tokens", draft_tokens,
+                field="generation.speculative_draft_tokens")
         if accepted_tokens is not None:
-            self.speculative_accepted_tokens = _num(accepted_tokens)
+            self.speculative_accepted_tokens = accounting.admit_count(
+                self, "speculative_accepted_tokens", accepted_tokens,
+                field="generation.speculative_accepted_tokens")
         if finish_reason is not None:
             self.finish_reason = finish_reason
 
     # ------------------------------------------------------------------ the accounting rules
     def seal(self):
         """Close the receipt: the structural zero of the reuse outside the prefix, and its own accounting state."""
+        from serve.reqtelemetry import accounting
         if self.non_prefix_reused_tokens is None and self.reused_prefix_tokens is not None:
             # Strata's execution path reuses a CONTIGUOUS prefix only, so the reuse outside the prefix is a
             # STRUCTURAL ZERO, not an unmeasured value (include/strata/program/reqtelemetry.hpp).
             self.non_prefix_reused_tokens = 0
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the invocation's OWN disposition, derived from
+        # the SAME rules as the record's - from the evidence and nothing else.  An invocation whose reuse was not
+        # measured has an unknown disposition, not a match without usable state and not a cold miss.
+        self.cache_disposition = accounting.derive_disposition(self)
         self.accounting = self.accounting_state()
         if self.accounting["state"] == "violated" and self.quality == COMPLETE:
             self.quality = PARTIAL
@@ -219,6 +270,9 @@ class InvocationReceipt:
             "prompt": {
                 "rendered_tokens": self.rendered_tokens,
                 "submitted_tokens": self.submitted_tokens,
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the prompt DOMAIN of this dispatch.
+                # It is a word - never a hash and never content.
+                "domain": self.prompt_domain,
                 "matched_prefix_tokens": self.matched_prefix_tokens,
                 "reused_prefix_tokens": self.reused_prefix_tokens,
                 "evaluated_tokens": self.evaluated_tokens,
@@ -248,6 +302,10 @@ class InvocationReceipt:
                 "emitted_tokens": self.emitted_tokens,
                 "speculative_draft_tokens": self.speculative_draft_tokens,
                 "speculative_accepted_tokens": self.speculative_accepted_tokens,
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the NATIVE invocation's finish reason.
+                # It is not the physical HTTP request's finish reason: an invocation that exhausted its output
+                # budget may be followed by a successful continuation.
+                "finish_reason": self.finish_reason,
             },
             "measurement_quality": {
                 "state": self.quality,
@@ -270,6 +328,19 @@ class InvocationReceipt:
         """This invocation's own accounting state: satisfied, violated or unevaluated."""
         from serve.reqtelemetry import accounting
         return accounting.accounting_state(self)
+
+    def same_measurements(self, matched, reused, evaluated, replayed, work) -> bool:
+        """Whether these prompt measurements are the ones this receipt already accepted.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): it is the DUPLICATE test.  A duplicate that
+        carries the same numbers is the same evidence seen twice; a duplicate that carries different numbers is a
+        conflict, and it is reported instead of overwriting the accepted measurements.
+        """
+        return (self.matched_prefix_tokens == matched
+                and self.reused_prefix_tokens == reused
+                and self.evaluated_tokens == evaluated
+                and self.replayed_tokens == replayed
+                and self.evaluation_work_tokens == work)
 
     def measurement_valid(self) -> bool:
         """Whether this receipt's own numbers are measurements at all."""

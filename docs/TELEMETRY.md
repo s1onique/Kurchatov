@@ -212,6 +212,45 @@ closed (`eligible_invocations`) and the ones whose receipt never arrived (`missi
 lowers the coverage - it never improves it. The physical HTTP request's own coverage is published beside it
 (`request_coverage`): the two describe different populations.
 
+Both denominators are counted independently of the receipts that survived (ACT-...-CLOSURE-01, C2):
+
+| Number | What it counts |
+|---|---|
+| `invocations` | the native invocations this request DISPATCHED - a receipt that did not fit the bounds is still an invocation, and it is in the missing population |
+| `eligible_invocations` | the dispatched invocations whose accounting closed and whose receipt survived |
+| `missing_invocations` | the dispatched invocations without a complete accounting - the dropped ones among them |
+| `dropped_invocations` | the receipts that did not fit the record's bounds (a count and a number of bytes) |
+| `request_coverage` | the requests that reached a terminal outcome and had a complete accounting, over the requests that reached a terminal outcome. A request whose terminal receipt was lost lowers the coverage; it does not leave the denominator. |
+
+### The measurements are typed
+
+A measurement that is not a measurement is never published (ACT-...-CLOSURE-01, D1):
+
+| Kind | It is |
+|---|---|
+| a count (the token counts, the generation counters, the cumulative native counters) | a whole, non-negative integer. A bool, a fraction and a negative are refused. |
+| a duration (the milliseconds) | a finite, non-negative number. A negative, a NaN and an infinity are refused. |
+
+A refused value stays null, the record says why, and it never enters a total. It is never clamped, rounded or
+coerced into a valid one. The engine's own `-1` means "not measured" - it stays null and it is not an invalid
+measurement. The validity is per class: an invalid duration does not exclude the valid token counts, and an
+invalid count does not exclude the valid durations.
+
+### The native invocation's own record
+
+Every native dispatch owns one receipt, and it is terminalized on its OWN evidence (ACT-...-CLOSURE-01, C3, D4):
+
+| Field | Meaning |
+|---|---|
+| `prompt.domain` | the NAME of the prompt domain the dispatch carried: `request`, `continuation` or `other`. The prompt's LENGTH is not its identity - two different prompts of the same length are two domains, and two invocations of the same prompt are one. No content and no hash. |
+| `generation.finish_reason` | the NATIVE invocation's finish reason - not the physical HTTP request's. An invocation that exhausted its output budget may be followed by a successful continuation. |
+| `generation.effective_max_output_tokens` | the budget THIS dispatch was given, not the request's |
+| `state` | the invocation's own terminal state. `unknown` means its terminal evidence never arrived - it is never presented as `running` at the end of a request, and it is not a failure of the inference either. |
+
+A terminal receipt that was already accepted is never silently overwritten: an identical duplicate is ignored (and
+causes no additional work accounting) and a conflicting one keeps the accepted measurements and is reported as an
+instrumentation error.
+
 ## The HTTP API
 
 Read-only, metadata-only, and on the existing port. No new service, no database, no extra listener.

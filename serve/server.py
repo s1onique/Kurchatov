@@ -4676,7 +4676,8 @@ class Service:
         return f"pid-{proc.pid}-gen-{getattr(self.engine, 'gen', 0)}"
 
     def _finish_telemetry(self, tele, last, seen, submitted, generated, finish, started, emitted=None,
-                          queue_s=None, first_token_s=None, invocations=1, segments=None):
+                          queue_s=None, first_token_s=None, invocations=1, segments=None,
+                          segment_invocations=None):
         """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's MEASUREMENTS.
 
         The engine's own figures (the cache state, the tokens it evaluated, its prefill and decode time) come from
@@ -4688,74 +4689,97 @@ class Service:
         that (Service._seal_telemetry): a request whose response is still being written is never reported as
         finished, and a request that was refused, cancelled while queued or disconnected still gets exactly ONE
         terminal receipt.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): there is ONE authoritative terminalization
+        path for every native dispatch, and it runs over the SEGMENTS - each segment carries the id of the
+        dispatch that produced it, so every invocation is terminalized on its OWN evidence: its cache
+        measurements, its prefill and decode time, its generated count, its speculative counters, its native
+        finish reason, its terminal state and its partial-segment classification.  The predecessor applied the
+        telemetry suffix of the earlier segments but the POSITIONAL DONE fields only from the last one, so the
+        earlier invocations' work was lost.
         """
         if tele is None:
             return None
         from serve import reqtelemetry as rt
         try:
             engine_figures = (last or {}).get("telemetry") or {}
-            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): EVERY native invocation's evidence goes
-            # into ITS OWN receipt.  A DONE line that carries an invocation's id is applied to that invocation's
-            # receipt; a DONE line without an id (an older engine) goes to the invocation that is running now,
-            # with the correlation left unavailable - never an asserted join.  A DONE line of an invocation this
-            # request did not dispatch (a stale one) is refused: it contributes nothing.
-            if tele is not None and segments:
-                from serve import reqtelemetry as rt
-                for segment in list(segments)[:-1]:
-                    figures = (segment or {}).get("telemetry") or {}
-                    if not figures:
-                        continue
-                    rid = figures.get("rid")
-                    receipt = tele.invocation_for(rid) if rid else None
-                    if rid and receipt is None:
-                        # a receipt of an invocation this request did not dispatch (or of one that is already
-                        # gone): it is not attached to anything
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): the per-invocation terminalization.
+            # Every segment is terminalized against ITS OWN dispatch: the expected identity comes from the
+            # dispatch boundary (never from the id the engine echoed back), and the receipt is the one that
+            # dispatch bound.  The predecessor applied the telemetry suffix of the earlier segments but the
+            # POSITIONAL DONE fields only from the last one, so the earlier invocations' work was lost.
+            admitted = False
+            receipt = None
+            if segments:
+                pairs = list(zip(list(segments), list(segment_invocations or [])))
+                for index, (segment, dispatched_id) in enumerate(pairs):
+                    segment = segment or {}
+                    figures = segment.get("telemetry") or {}
+                    own = tele.invocation_for(dispatched_id)
+                    if own is None:
+                        # the receipt of that dispatch was dropped: its evidence belongs to nobody and is not
+                        # attached to another invocation's receipt
                         tele.mark_unavailable("engine_telemetry",
-                                              "the engine's receipt carried the id of a native invocation this "
-                                              "request did not dispatch: its measurements were not attached")
+                                              "the native evidence of one of this request's invocations could "
+                                              "not be attached: its receipt is no longer retained")
                         continue
-                    rt.apply_engine(tele, figures, receipt=receipt,
-                                    expected_invocation_id=rid or tele.engine_invocation_id,
-                                    native_segment_only=bool((segment or {}).get("native_segment_only")))
+                    verdict = rt.apply_engine(tele, figures, receipt=own,
+                                              expected_invocation_id=dispatched_id,
+                                              native_segment_only=bool(segment.get("native_segment_only")))
+                    if verdict.get("admitted"):
+                        admitted = True
+                        # the positional DONE fields belong to THIS invocation (C3): the prefill and the decode
+                        # it measured, the tokens it generated and the drafts it offered and accepted
+                        if segment.get("prompt_ms") is not None:
+                            own.set_timing("prefill_wall", float(segment["prompt_ms"]), "native_engine")
+                        if segment.get("decode_ms") is not None:
+                            own.set_timing("decode_wall", float(segment["decode_ms"]), "native_engine")
+                        own.set_generation(generated=segment.get("generated"),
+                                           draft_tokens=segment.get("drafts_offered"),
+                                           accepted_tokens=segment.get("drafts_accepted"))
+                    # the NATIVE finish reason of this invocation (D4): it is not the physical HTTP finish reason
+                    if segment.get("finish") is not None:
+                        own.set_generation(finish_reason=str(segment["finish"]))
+                    # the invocation's own terminal state (D4): the last dispatch of the request ends with the
+                    # request's own outcome; an earlier one ended because it was continued.
+                    own.state = "completed" if index < len(pairs) - 1 else _native_terminal_state(finish)
+                    if segment.get("native_segment_only"):
+                        own.native_partial = True
+                    own.seal()
+                    receipt = own
+                    tele._sync_parent()
             # AMENDMENT-02 (G2/A2): the receipt is bound to the native INVOCATION.  When it does not match the
             # invocation this request dispatched, NOT ONE of its numbers is applied - not even the positional DONE
             # fields outside the telemetry suffix - and the request says it had an instrumentation error.
-            verdict = rt.apply_engine(tele, engine_figures, expected_invocation_id=tele.engine_invocation_id,
-                                      native_segment_only=bool((last or {}).get("native_segment_only")))
-            admitted = bool(verdict.get("admitted"))
-            if admitted and (last or {}).get("native_segment_only"):
-                # the receipt of this invocation is the partial one (A9); the record says so too
-                tele.mark_unavailable("cache",
-                                      "the engine's batch slot reported only its admission segment: the native "
-                                      "accounting is not the whole invocation")
-            # the engine's own clock: the prefill and the decode it measured
-            # AMENDMENT-03 (G1): they belong to the INVOCATION that measured them.
-            receipt = tele.invocation_for(tele.engine_invocation_id)
-            if receipt is None and tele.invocations:
-                receipt = tele.invocations[-1]
-            if admitted and last and last.get("prompt_ms") is not None:
-                if receipt is not None:
-                    receipt.set_timing("prefill_wall", float(last["prompt_ms"]), "native_engine")
-                else:
+            if not segments:
+                verdict = rt.apply_engine(tele, engine_figures, expected_invocation_id=tele.engine_invocation_id,
+                                          native_segment_only=bool((last or {}).get("native_segment_only")))
+                admitted = bool(verdict.get("admitted"))
+                if admitted and (last or {}).get("native_segment_only"):
+                    # the receipt of this invocation is the partial one (A9); the record says so too
+                    tele.mark_unavailable("cache",
+                                          "the engine's batch slot reported only its admission segment: the native "
+                                          "accounting is not the whole invocation")
+            # the receipt of the LAST dispatch: the one the request's own outcome belongs to
+            if receipt is None:
+                receipt = tele.invocation_for(tele.engine_invocation_id)
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): there is NO fallback to the last retained
+            # receipt.  The receipt of THIS invocation is the one the dispatch bound; if it is not there (it was
+            # dropped), the measurement belongs to nobody and stays unapplied - it is never attributed to
+            # another invocation's receipt.
+            #
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3): the positional DONE fields were already
+            # applied to EACH invocation's own receipt above.  What is left here is the REQUEST's own fallback
+            # for the case where no invocation owns the evidence at all (an engine that echoed no id).
+            if admitted and receipt is None and last:
+                if last.get("prompt_ms") is not None:
                     tele.set_timing("prefill_wall", float(last["prompt_ms"]), "native_engine")
-            if admitted and last and last.get("decode_ms") is not None:
-                if receipt is not None:
-                    receipt.set_timing("decode_wall", float(last["decode_ms"]), "native_engine")
-                else:
+                if last.get("decode_ms") is not None:
                     tele.set_timing("decode_wall", float(last["decode_ms"]), "native_engine")
             # the prompt: what the engine was given.  The RENDERED count was measured where the template was
             # rendered (Service.prepare) - it is a different number and it is not copied from this one.
             if submitted is not None:
                 tele.set_prompt_tokens(submitted=submitted)
-            # the generation: the engine's own count and what the client actually received - two different numbers
-            engine_generated = last.get("generated") if (last and admitted) else None
-            drafts_offered = last.get("drafts_offered") if (last and admitted) else None
-            drafts_accepted = last.get("drafts_accepted") if (last and admitted) else None
-            # AMENDMENT-03 (G1): the engine's generation counters belong to the INVOCATION that produced them.
-            if receipt is not None:
-                receipt.set_generation(generated=engine_generated, draft_tokens=drafts_offered,
-                                       accepted_tokens=drafts_accepted)
-                tele._sync_parent()
             tele.set_generation(finish_reason=finish)
             # AMENDMENT-02 (A3): the EMITTED tokens are not the generated ones.  The generation loop counts the
             # tokens the engine produced; the response is transformed (the reasoning, the tool calls and the stop
@@ -5523,6 +5547,10 @@ class Service:
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
         # so the generated reasoning must not become this request's cached input (#615).
         segments = []
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): the invocation id each segment belongs to.
+        # The segment is bound to the dispatch that produced it - the DISPATCH boundary is the authority, never
+        # the id the engine echoed back - so every native invocation is terminalized on its own.
+        segment_invocations = []
         trace = getattr(self.request_trace, "record", None)
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's telemetry record.  The HTTP layer made it (it knows
         # the API and the client's own request id); this thread picks it up.  A request that did not come through the
@@ -5649,6 +5677,17 @@ class Service:
                             receipt = tele.invocation_for(invocation_id)
                             if receipt is not None:
                                 receipt.submitted_tokens = len(prompt)
+                                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the DOMAIN is not the
+                                # prompt's LENGTH - two different prompts of the same length are different domains,
+                                # and two invocations of the SAME prompt are the same domain.  The dispatch boundary
+                                # knows which: the first dispatch carries the request's own prompt, a continuation
+                                # carries the request's prompt plus what was generated, and a recovery carries
+                                # another prompt.  The domain is NAMED here (no prompt content, no prompt hash) and
+                                # it is what the coverage is computed from.
+                                receipt.prompt_domain = _prompt_domain(prompt, ids)
+                                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the effective output
+                                # budget of THIS dispatch is the budget the dispatch was given, not the request's.
+                                receipt.set_generation(requested_max=max_new, effective_max=max(0, max_new - n))
                             dispatch_ordinal += 1
                         if hasattr(self.engine, "set_request_id"):
                             # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G6): with the telemetry off the
@@ -5775,6 +5814,8 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                                # the segment belongs to the dispatch that produced it
+                                segment_invocations.append(invocation_id)
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -5909,7 +5950,8 @@ class Service:
                             # passing it here would overwrite the real measurement with the whole request time.
                             self._finish_telemetry(tele, last, seen, len(ids), n, finish, started,
                                                    first_token_s=first_token_s, invocations=len(segments),
-                                                   segments=segments)
+                                                   segments=segments,
+                                                   segment_invocations=segment_invocations)
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
@@ -6049,6 +6091,48 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def _prompt_domain(prompt, request_ids):
+    """The NAME of the prompt domain this dispatch carried (C4).
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the prompt's LENGTH is not its identity - two
+    different prompts of the same length are two domains, and the same prompt dispatched twice is ONE domain.
+    The dispatch boundary is the authority: it knows whether the prompt it sends is the request's own prompt, a
+    CONTINUATION of it (the request's prompt plus what the engine already generated) or a RECOVERY prompt (a
+    different prompt the server built).
+
+    No prompt content and no prompt hash is used or published: only a WORD.  The domain of the request's own
+    prompt is named by the request's own id - so two invocations of the SAME prompt share it, and a continuation
+    or a recovery carries its own name.
+    """
+    ids = request_ids or []
+    if not ids:
+        return "unknown"
+    if len(prompt) == len(ids) and list(prompt[:len(ids)]) == list(ids):
+        return "request"
+    # a continuation: the request's prompt plus what was generated
+    if len(prompt) > len(ids) and list(prompt[:len(ids)]) == list(ids):
+        return "continuation"
+    # a recovery prompt (or any other prompt the server built): its own domain
+    return "other"
+
+
+def _native_terminal_state(finish):
+    """The terminal state of the LAST native invocation of a request, from the request's own outcome.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the invocation's terminal state is not invented: it
+    follows the outcome the request really had.  A request that was cancelled, disconnected or that failed ends
+    its last invocation the same way - and an invocation whose telemetry never arrived is NOT presented as
+    running.
+    """
+    if finish in (None, "completed", "stop", "length"):
+        return "completed"
+    if finish in ("cancel", "cancelled", "disconnect"):
+        return "cancelled"
+    if finish in ("error", "failed"):
+        return "failed"
+    return "completed"
 
 
 def request_stats(segments: list[dict]) -> dict:

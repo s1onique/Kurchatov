@@ -320,9 +320,12 @@ class MetricAdmission(unittest.TestCase):
         invocation = new_invocation_id()
         record.begin_invocation(invocation, ordinal=1)
         record.invocation_for(invocation).submitted_tokens = 100
-        # the engine did not echo the id: the correlation is unavailable, never an asserted join
+        # the engine did not echo the id: the correlation is unavailable, never an asserted join.
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): the receipt is the one this request
+        # DISPATCHED - the terminal evidence never creates a dispatch, so the uncorrelated duration is measured
+        # on a receipt that really exists, and it must still not be observed.
         apply_engine(record, {"matched": 90, "reused": 90, "evaluated": 10, "lookup_ms": 1234.0},
-                     expected_invocation_id=new_invocation_id())
+                     expected_invocation_id=invocation)
         store.add(record.seal("completed", 200))
         histograms = store.summary()["histograms"]
         self.assertEqual(histograms.get("cache_lookup_duration", {}).get("count", 0), 0)

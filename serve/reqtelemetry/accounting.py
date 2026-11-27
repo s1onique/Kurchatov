@@ -8,9 +8,11 @@ has an UNKNOWN disposition - not a match without usable state and not a cold mis
 """
 from __future__ import annotations
 
+import math
+
 from serve.reqtelemetry.vocabulary import (DISPOSITION_COLD_MISS, DISPOSITION_FULL_HIT,
                                         DISPOSITION_MATCH_WITHOUT_STATE, DISPOSITION_PARTIAL_HIT,
-                                        DISPOSITION_UNKNOWN)
+                                        DISPOSITION_UNKNOWN, INSTRUMENTATION_ERROR)
 
 def derive_disposition(record):
     """The cache disposition, from the evidence and nothing else.
@@ -51,6 +53,13 @@ def derive_disposition(record):
 TOKEN_FIELDS = ("rendered_tokens", "submitted_tokens", "matched_prefix_tokens", "reused_prefix_tokens",
                 "evaluated_tokens", "replayed_tokens", "non_prefix_reused_tokens", "evaluation_work_tokens")
 
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the GENERATION counters and the CUMULATIVE native
+# counters are counts too - a whole, non-negative integer.  They are validated here, so a record that carries an
+# invalid one says so instead of publishing it.
+GENERATION_FIELDS = ("requested_max_output_tokens", "effective_max_output_tokens", "generated_tokens",
+                     "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens")
+CUMULATIVE_FIELDS = ("cache_invalidations", "cache_evictions", "first_divergent_token_index")
+
 # the fields the NATIVE ENGINE measures.  They are admitted only when the receipt is correlated to this request.
 NATIVE_TOKEN_FIELDS = ("matched_prefix_tokens", "reused_prefix_tokens", "evaluated_tokens", "replayed_tokens",
                        "evaluation_work_tokens")
@@ -67,6 +76,69 @@ def valid_token_count(value) -> bool:
     if isinstance(value, bool) or not isinstance(value, int):
         return False
     return value >= 0
+
+
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the TYPED measurement admission, shared by the record
+# and the invocation receipt.
+#
+# The predecessor's `_num` accepted anything that was a number, so a negative duration, a NaN and a fractional
+# token count all reached the published record - and the aggregate exporter then excluded them, so the record and
+# the totals disagreed.  The rules are here, in ONE place:
+#
+#   * a COUNT (token counts, generation counts, cumulative event counters) is a whole, non-negative integer; a
+#     bool is not a count;
+#   * a DURATION (milliseconds) is a FINITE, non-negative number;
+#   * an invalid value is REFUSED: it is never clamped, rounded or coerced into a valid one.  The field stays
+#     null, the receipt says why, and the measurement is marked invalid so it cannot enter a total.
+#
+# The native sentinels keep their own documented meanings (the engine writes -1 for "not measured" and leaves
+# the key out entirely), so they are handled where the figures are parsed, not here.
+def valid_count(value) -> bool:
+    """A count is a WHOLE, non-negative integer.  A bool, a fraction, a negative and a string are not counts."""
+    return valid_token_count(value)
+
+
+def valid_duration(value) -> bool:
+    """A duration in milliseconds is a FINITE, non-negative number.  NaN and infinity are not durations."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(float(value)):
+        return False
+    return float(value) >= 0.0
+
+
+def admit_count(target, name, value, field=None):
+    """ONE count, at the admission boundary.  The value or None.
+
+    An invalid count is refused, never repaired: the field stays null, the target says why, and the target is
+    marked as carrying an invalid measurement (so it does not enter the authoritative aggregates).
+    """
+    if value is None:
+        return None
+    if valid_count(value):
+        return value
+    target.measurements_invalid = True
+    target.mark_unavailable(field or name,
+                            f"the {name} that was reported is not a whole, non-negative count",
+                            INSTRUMENTATION_ERROR)
+    return None
+
+
+def admit_duration(target, name, value, field=None):
+    """ONE duration, at the admission boundary.  The value or None.
+
+    A duration that is negative, NaN or infinite is refused, never repaired: it is never published, and it never
+    reaches the histogram as a measured zero.
+    """
+    if value is None:
+        return None
+    if valid_duration(value):
+        return float(value)
+    target.measurements_invalid = True
+    target.mark_unavailable(field or name,
+                            f"the {name} that was reported is not a finite, non-negative duration",
+                            INSTRUMENTATION_ERROR)
+    return None
 
 
 def validate_measurements(record) -> list:
@@ -89,12 +161,52 @@ def validate_measurements(record) -> list:
             problems.append(f"{name} is not a whole token count")
         elif value < 0:
             problems.append(f"{name} is negative")
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the generation counters and the cumulative native
+    # counters are counts as well: a fraction, a bool and a negative are not counts.
+    for name in GENERATION_FIELDS + CUMULATIVE_FIELDS:
+        value = getattr(record, name, None)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            problems.append(f"{name} is not a whole count")
+        elif value < 0:
+            problems.append(f"{name} is negative")
+    # the durations: a NaN or an infinity is not a measurement either
+    for name, value in (getattr(record, "timing", None) or {}).items():
+        if not valid_duration(value):
+            problems.append(f"timing_ms.{name} is not a finite, non-negative duration")
     return problems
 
 
 def measurement_valid(record) -> bool:
     """Whether the record's own numbers are measurements at all."""
     return not validate_measurements(record)
+
+
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the validity is CLASS-AWARE.  An invalid DURATION does
+# not invalidate the valid token counts, and an invalid count does not invalidate the valid durations: the
+# measurement classes are independent, and each one is admitted (or refused) on its own terms.  The overall
+# `measurement_valid` still says that SOMETHING in the record is not a measurement.
+def counts_valid(record) -> bool:
+    """Whether the record's own COUNTS are measurements: whole, non-negative integers."""
+    for name in TOKEN_FIELDS + GENERATION_FIELDS + CUMULATIVE_FIELDS:
+        value = getattr(record, name, None)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+    return True
+
+
+def durations_valid(record) -> bool:
+    """Whether the record's own DURATIONS are measurements: finite and non-negative."""
+    for name, value in (getattr(record, "timing", None) or {}).items():
+        if not valid_duration(value):
+            return False
+    restore_ms = getattr(record, "cache_restore_ms", None)
+    if restore_ms is not None and not valid_duration(restore_ms):
+        return False
+    return True
 
 
 def correlation_state(record) -> str:
@@ -123,16 +235,25 @@ def aggregate_eligible(record) -> bool:
       * the ACCOUNTING must not be violated (a broken identity is not published as a total);
       * the native measurements must be CORRELATED (a receipt that could not be tied to this request says nothing
         about it - an older engine leaves the correlation unavailable, never an asserted join).
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the field is DEPRECATED as a gate - the PER-CLASS
+    admission (`measurement_quality.admission`) is the authority - but it is kept for the operator and it is now
+    CONSISTENT with it: it is true when the record is admitted for the native classes it carries.  A record whose
+    native classes are all refused (a foreign receipt, or a request that dispatched more than one invocation and
+    therefore has no unambiguous native scalars) is not eligible, even when its HTTP-owned numbers are fine.
     """
     if not measurement_valid(record):
         return False
     if record.accounting_state()["state"] == "violated":
         return False
-    if correlation_state(record) not in (CORRELATION_VERIFIED, CORRELATION_NOT_APPLICABLE):
-        return False
     if getattr(record, "native_partial", False):
         return False        # the native figures cover one segment of the invocation only (A9)
-    return True
+    classes = (METRIC_NATIVE_PROMPT_POSITION, METRIC_NATIVE_EXECUTION_WORK, METRIC_NATIVE_DURATION,
+               METRIC_CACHE_RESTORE, METRIC_NATIVE_GENERATION)
+    admitted = [metric for metric in classes if record.metric_admission(metric)]
+    if admitted:
+        return True
+    # a request that holds no invocation receipt at all carries no native measurement: only its HTTP-owned numbers
+    return not getattr(record, "invocations", None)
 
 
 def field_eligible(record, name: str) -> bool:
@@ -140,16 +261,13 @@ def field_eligible(record, name: str) -> bool:
 
     A measurement the SERVER owns stays eligible even when the engine's receipt could not be correlated: the
     request's own numbers are still the request's own numbers.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D3): the legacy helper is now a THIN wrapper around the
+    metric-specific admission, so it cannot contradict it: a native field is admitted by the NATIVE PROMPT
+    POSITION class, a server-owned field by the HTTP class.
     """
-    value = getattr(record, name, None)
-    if value is None:
-        return False
-    if not valid_token_count(value):
-        return False
-    if name in NATIVE_TOKEN_FIELDS:
-        return aggregate_eligible(record)
-    # a server-owned measurement: it needs valid numbers, and the record's accounting must not be violated
-    return measurement_valid(record) and record.accounting_state()["state"] != "violated"
+    metric = METRIC_NATIVE_PROMPT_POSITION if name in NATIVE_TOKEN_FIELDS else METRIC_HTTP
+    return field_admission(record, name, metric)
 
 
 def conservation(record) -> list:
@@ -273,23 +391,27 @@ def invocation_admission(inv, metric: str) -> bool:
     if metric == METRIC_PARTIAL_DIAGNOSTIC:
         return True
     verified = correlation_of(inv) == CORRELATION_VERIFIED
-    valid = measurement_valid(inv)
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the validity is CLASS-AWARE: an invalid duration
+    # does not exclude the valid token counts, and an invalid count does not exclude the valid durations.  The
+    # measurement classes are independent.
+    counts = counts_valid(inv)
+    durations = durations_valid(inv)
     partial = bool(getattr(inv, "native_partial", False))
     state = inv.accounting_state()["state"]
     if metric == METRIC_HTTP:
         return True
     if metric == METRIC_NATIVE_PROMPT_POSITION:
-        return verified and valid and not partial and state != "violated"
+        return verified and counts and not partial and state != "violated"
     if metric == METRIC_NATIVE_EXECUTION_WORK:
-        return verified and valid and not partial and state != "violated"
+        return verified and counts and not partial and state != "violated"
     if metric == METRIC_NATIVE_DURATION:
-        return verified and not partial
+        return verified and durations and not partial
     if metric == METRIC_CACHE_RESTORE:
-        return verified and valid and not partial
+        return verified and counts and durations and not partial
     if metric == METRIC_NATIVE_GENERATION:
-        return verified and valid and not partial
+        return verified and counts and not partial
     if metric == METRIC_COMPLETE_CACHE_RATIO:
-        return verified and valid and not partial and state == "satisfied"
+        return verified and counts and not partial and state == "satisfied"
     return False
 
 

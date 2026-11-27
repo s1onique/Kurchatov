@@ -200,6 +200,12 @@ function renderDetail() {
   if (!record.identity.engine_instance_id && !record.identity.engine_invocation_id) {
     add("The engine reported no telemetry for this request: the native figures are unavailable.");
   }
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the loss of an invocation receipt is visible here:
+  // the request's native evidence is incomplete, even when every receipt that survived is verified.
+  const droppedInvocations = (quality.invocations_dropped || 0);
+  if (droppedInvocations) {
+    add(`${droppedInvocations} native invocation receipt(s) did not fit the record's bounds: the request's native evidence is incomplete.`, true);
+  }
   if (list.children.length) warnings.append(list);
 
   const facts = $("detail-facts");
@@ -224,6 +230,31 @@ function renderDetail() {
     ["Evaluation work", num(prompt.evaluation_work_tokens)],
     ["First divergent token", prompt.first_divergent_token_index === null || prompt.first_divergent_token_index === undefined ? "—" : String(prompt.first_divergent_token_index)],
   ]) facts.append(fact(label, value));
+
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the INVOCATION-level evidence is exposed through the
+  // EXISTING inspector - the same facts list, no new page and no new feature.  Every native dispatch of this
+  // request has its own receipt, with its own measurements, its own prompt domain and its own outcome.
+  const invocations = record.invococations || [];
+  for (const invocation of invocations) {
+    const iidentity = invocation.identity || {};
+    const iprompt = invocation.prompt || {};
+    const icache = invocation.cache || {};
+    const igen = invocation.generation || {};
+    const itiming = invocation.timing_ms || {};
+    for (const [label, value] of [
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} state`, invocation.state || "—"],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} id`, iidentity.engine_invocation_id || "—"],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} prompt domain`, iprompt.domain || "—"],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} cache`, icache.disposition || "—"],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} matched`, num(iprompt.matched_prefix_tokens)],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} reused`, num(iprompt.reused_prefix_tokens)],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} evaluated`, num(iprompt.evaluated_tokens)],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} generated`, num(igen.generated_tokens)],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} native finish`, igen.finish_reason || "—"],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} prefill`, ms(itiming.prefill_wall)],
+      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} decode`, ms(itiming.decode_wall)],
+    ]) facts.append(fact(label, value));
+  }
 
   // The token accounting bar: the reused prefix, the evaluated positions and the replayed part of them.
   // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G7): a measurement that was NOT taken is not a zero.
