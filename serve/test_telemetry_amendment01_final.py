@@ -137,7 +137,12 @@ class ConcurrentPopulation(unittest.TestCase):
         self.assertEqual(tel.store.counters["native_invocations_unresolved"], 1)
 
     def test_a_failed_aggregation_commits_nothing(self):
-        """A failure inside the aggregation commits no measurement and counts nothing twice."""
+        """A failure inside the aggregation commits no measurement and counts nothing twice.
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01: the failure comes AFTER the REAL aggregation ran, so the
+        rollback is measured against a transaction that really counted something - not against one that failed
+        before it counted anything.
+        """
         tel = ServerTelemetry()
         record = tel.begin(api="openai", model_id="m")
         record.set_prompt_tokens(rendered=100, submitted=100)
@@ -147,6 +152,8 @@ class ConcurrentPopulation(unittest.TestCase):
         original = tel.store._count_locked
 
         def failing_count(data):
+            # the REAL aggregation runs first, and the failure comes after it
+            original(data)
             raise RuntimeError("the aggregation failed")
 
         tel.store._count_locked = failing_count
@@ -162,6 +169,9 @@ class ConcurrentPopulation(unittest.TestCase):
         self.assertEqual(counters["native_invocations_missing"], 1)
         self.assertEqual(counters["native_invocations"],
                          counters["native_invocations_accounted"] + counters["native_invocations_missing"])
+        # the record was not kept
+        self.assertEqual(tel.store.records, [])
+        self.assertEqual(tel.store.bytes, 0)
 
 
 class RetentionIndependentDomainAuthority(unittest.TestCase):

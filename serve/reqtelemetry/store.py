@@ -18,6 +18,12 @@ from serve.reqtelemetry.vocabulary import (CURSOR_TTL_S, DEFAULT_PAGE_SIZE, DEFA
                                          DEFAULT_RETENTION_RECORDS, INSTRUMENTATION_ERROR, MAXIMUM_PAGE_SIZE,
                                          MAX_ENGINE_INSTANCES)
 
+# ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): how many COMMITTED record identities the store remembers.
+# The memory is BOUNDED: the oldest committed identity goes when the bound is reached, so a long run does not
+# grow the store's own state without limit.
+COMMITTED_RECORDS_LIMIT = 1024
+
+
 class _SeenEngines:
     """A BOUNDED MEMBERSHIP filter over the engine identities this store has observed.
 
@@ -142,6 +148,18 @@ class TelemetryStore:
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A4): the identities this store has EVER
         # observed.  It is the authority that a forgotten identity is not a new one (see _SeenEngines).
         self._seen_engines = _SeenEngines()
+        # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R3): the engine identities that the CURRENT transaction
+        # observed.  They are remembered in the membership filter only when the transaction COMMITS: a failed
+        # transaction must not mark an uncommitted counter domain as previously observed.
+        self._pending_seen = set()
+        # whether a transaction is open right now: the membership filter is only DEFERRED while it is.
+        self._in_transaction = False
+        # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): the identities of the records that are already
+        # COMMITTED, with their sequence numbers.  The identity of a committed record is its OWN CONTENT (the
+        # digest of the serialized record), so the same committed record is never committed again, whatever
+        # path brings it back.  It is BOUNDED (see COMMITTED_RECORDS_LIMIT): a long run does not grow the
+        # store's own state without limit.
+        self._committed = {}
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the prompt-domain authority of the
         # record being aggregated.  It is set for the duration of the aggregation (which runs under the lock).
         self._authority = {}
@@ -195,15 +213,47 @@ class TelemetryStore:
         the store's lock - the global lock is not held across an arbitrary serialization - and the counting is
         ATOMIC: when the aggregation fails, the counters are rolled back to the state before it, so a failure
         cannot partially commit measurements and then count them again.
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R1, R2): the RETENTION is part of the COMMIT.  The record
+        is kept, and the old records are evicted, only AFTER the aggregation committed.  A failed transaction
+        therefore cannot evict the evidence that was already retained, cannot leave the store's byte accounting
+        describing a record that was never kept, and cannot try to remove a record that does not exist.
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R4): the retained size is the EXACT size of the record as
+        it is kept - the UTF-8 serialized representation INCLUDING the sequence field.
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): a record that is already committed is not committed
+        again: the same measurement is never counted twice, and the population is never resolved twice.
         """
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A1): the invocation POPULATION is
         # counted at the terminal boundary, before the receipt is sealed, so it does not depend on the
         # receipt's storage.  The fallback below is for a caller that stores a receipt without that boundary
         # (the store's own API): it counts the DISPATCHES, never the receipts (a compatibility receipt is
         # not a dispatch).
+        #
+        # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (F1, R4): the SERIALIZATION happens OUTSIDE the lock.
+        # `payload` is the serialized representation of the record as it is kept; the sequence field is only
+        # known inside the lock, so the size is completed there (see `_kept_size`).
         data = record.to_dict()
-        size = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): the identity of the record that is offered: the
+        # digest of its own serialized content.  The same committed record is recognized whatever path brings
+        # it back, and a DIFFERENT record is never mistaken for it.
+        digest = hashlib.blake2b(payload, digest_size=16).digest()
         with self.lock:
+            request_id = (data.get("identity") or {}).get("request_id")
+            # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): the COMMITTED identity.  A record that is already
+            # committed is not committed again: the measurement, the histogram and the population are counted
+            # exactly once.
+            committed_seq = self._committed.get(digest)
+            if self._is_committed_locked(record, digest):
+                existing = getattr(record, "_committed_data", None)
+                if existing is None and request_id:
+                    existing = self._get_locked(request_id)
+                if existing is not None:
+                    return existing                    # the committed record itself: nothing is counted again
+                data["seq"] = committed_seq if committed_seq is not None else getattr(record, "seq", 0)
+                return data
             # ACT-...-AMENDMENT-01 (F1): the state before ANY mutation.  A failure inside the aggregation
             # restores it, so nothing is partially committed and nothing is counted twice afterwards.
             snapshot = dict(self.counters)
@@ -212,17 +262,20 @@ class TelemetryStore:
             unattributable_before = set(self._unattributable_engines)
             histograms_before = {k: {"sum": v["sum"], "n": v["n"], "buckets": list(v["buckets"])}
                                  for k, v in self.histograms.items()}
+            authority_before = self._authority
+            seq_before = self.seq
+            terminal_counted_before = bool(getattr(record, "_terminal_counted", False))
             self.seq += 1
             record.seq = self.seq
             data["seq"] = self.seq
-            self.records.append((self.seq, data, size))
-            self.bytes += size
-            self._evict_locked()
+            # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R4): the EXACT size of the kept representation, the
+            # sequence field included.
+            size = self._kept_size(payload, self.seq)
             self.counters["receipts_created"] += 1
             # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the physical request's own population is the
             # requests that reached a terminal outcome.  A record that arrives WITHOUT its terminal outcome having
             # been counted (a caller that stores the receipt itself) counts it here - exactly once.
-            if not getattr(record, "_terminal_counted", False):
+            if not terminal_counted_before:
                 key = {"completed": "requests_terminal_completed", "cancelled": "requests_terminal_cancelled",
                        "failed": "requests_terminal_failed", "rejected": "requests_terminal_rejected"}.get(
                            data["lifecycle"]["state"])
@@ -242,12 +295,22 @@ class TelemetryStore:
             # authority is in force for this record: the uniqueness of the request's own prompt domain is decided
             # by the DISPATCH boundary, not by the receipts that survived the retention.
             self._authority = self._domain_authority(record)
+            # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R3): the identities this transaction observed are
+            # remembered in the membership filter only when it COMMITS.
+            self._pending_seen = set()
+            self._in_transaction = True
             try:
                 self._count_locked(data)
             except Exception:
                 # ACT-...-AMENDMENT-01 (F1): the aggregation is ATOMIC.  A failure inside it rolls the counters
                 # and the bookkeeping back: no measurement is partially committed, and nothing is counted twice
                 # afterwards.  The record itself is rolled back too - it was never aggregated.
+                #
+                # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R1, R2, R3): the ROLLBACK restores everything the
+                # transaction touched: the counters, the histograms, the engine high-water marks, the retired and
+                # unattributable marks, the membership filter's pending identities, the sequence state and the
+                # record's own marks.  The RETENTION was never touched: the record was not kept, nothing was
+                # evicted, and no record is removed that does not exist.
                 self.counters.clear()
                 self.counters.update(snapshot)
                 self._evictions_by_engine.clear()
@@ -258,10 +321,12 @@ class TelemetryStore:
                 self._unattributable_engines.update(unattributable_before)
                 self.histograms.clear()
                 self.histograms.update(histograms_before)
-                self.records.pop()
-                self.bytes -= size
-                self.seq -= 1
+                self._authority = authority_before
+                self._pending_seen = set()
+                self.seq = seq_before
                 record.seq = 0
+                data.pop("seq", None)
+                record._terminal_counted = terminal_counted_before
                 if population_counted_here:
                     # the dispatch HAPPENED: it stays in the population, and it is MISSING evidence - the
                     # aggregation failed, so nothing was measured.  The identity `dispatched = accounted + missing`
@@ -270,6 +335,29 @@ class TelemetryStore:
                     self.counters["native_invocations_missing"] += dispatched_total
                     record._population_missing = dispatched_total
                 raise
+            else:
+                # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R3): the transaction COMMITTED: the observed
+                # identities are remembered now, so a failed transaction never marked an uncommitted counter
+                # domain as previously observed.
+                for instance in self._pending_seen:
+                    self._seen_engines.add(instance)
+                self._pending_seen = set()
+                # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R1, R2): the RETENTION commits WITH the
+                # aggregation.  The record is kept, and the old records are evicted, only now: a failure cannot
+                # evict the evidence that was already there.
+                self.records.append((self.seq, data, size))
+                self.bytes += size
+                self._evict_locked()
+                # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): the committed identity, so the same record is
+                # never committed twice.
+                self._committed[digest] = self.seq
+                while len(self._committed) > COMMITTED_RECORDS_LIMIT:
+                    self._committed.pop(next(iter(self._committed)))
+                record._committed = True
+                record._committed_data = data
+            finally:
+                # the transaction is closed: the membership filter is written again at once from now on
+                self._in_transaction = False
             # ACT-...-AMENDMENT-01 (F1): the outcome of THIS request's dispatches is its own: the dispatches it
             # dispatched, less the ones its own aggregation resolved.  A concurrent request never enters here.
             accounted = self.counters["native_invocations_accounted"] - snapshot["native_invocations_accounted"]
@@ -280,6 +368,32 @@ class TelemetryStore:
             self.counters["native_invocations_unresolved"] = max(
                 0, self.counters["native_invocations_unresolved"] - dispatched_total)
         return data
+
+    def _is_committed_locked(self, record, digest) -> bool:
+        """Whether this record is ALREADY committed (R5).
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): a committed record is not committed again.  It is
+        recognized by its OWN content (the digest of the serialized record) and by the mark the commit left on
+        the record itself, so the same measurement is never counted twice - whatever path brings it back.
+        """
+        return bool(getattr(record, "_committed", False)) or digest in self._committed
+
+    @staticmethod
+    def _kept_size(payload: bytes, seq: int) -> int:
+        """The EXACT size of the kept representation: the serialized record INCLUDING its sequence field.
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R4): the size of a retained record is the size of the
+        document that is actually kept - the UTF-8 serialized representation, sequence field included.  The
+        predecessor measured the record BEFORE the sequence field was inserted, so the store's byte accounting
+        was short by the field it had just added.
+
+        The expensive serialization happens OUTSIDE the lock; the sequence is only known inside it, so the size
+        is completed here by the length of the field the sequence adds - never by a second serialization.
+        """
+        fragment = (', "seq": %d' % seq).encode("utf-8")
+        if not payload:                                # an empty record: the braces hold the field alone
+            return len(b'{"seq": %d}' % seq)
+        return len(payload) + len(fragment)
 
     # ------------------------------------------------------------------ the native dispatch population (A1)
     def count_dispatch_population(self, record):
@@ -587,6 +701,10 @@ class TelemetryStore:
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A4): was this identity EVER observed
         # here?  The membership filter never forgets an identity, so a forgotten one is never mistaken for a new
         # one.  It is asked BEFORE the identity is remembered.
+        #
+        # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R3): the identity is remembered in the filter only when
+        # the transaction COMMITS: a failed transaction must not mark an uncommitted counter domain as previously
+        # observed.  The PENDING set carries it until then.
         seen_before = instance in self._seen_engines
         if instance in self._evictions_by_engine:
             previous = self._evictions_by_engine[instance]
@@ -610,7 +728,10 @@ class TelemetryStore:
             # a first observation of this engine: its whole counter is new work
             c["cache_evictions"] += evictions
             self._evictions_by_engine[instance] = evictions
-        self._seen_engines.add(instance)
+        if self._in_transaction:
+            self._pending_seen.add(instance)
+        else:
+            self._seen_engines.add(instance)
         while len(self._evictions_by_engine) > MAX_ENGINE_INSTANCES:
             oldest = next(iter(self._evictions_by_engine))
             self._retired_evictions[oldest] = self._evictions_by_engine.pop(oldest)
@@ -659,9 +780,13 @@ class TelemetryStore:
     def get(self, request_id):
         """One record by its server id, or None."""
         with self.lock:
-            for _, data, _ in self.records:
-                if data["identity"]["request_id"] == request_id:
-                    return data
+            return self._get_locked(request_id)
+
+    def _get_locked(self, request_id):
+        """One record by its server id, or None - the lock is already held."""
+        for _, data, _ in self.records:
+            if data["identity"]["request_id"] == request_id:
+                return data
         return None
 
     def list(self, limit=DEFAULT_PAGE_SIZE, cursor=None, client_request_id=None, state=None, disposition=None):

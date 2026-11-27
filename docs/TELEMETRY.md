@@ -521,6 +521,20 @@ The witnesses are `serve/test_telemetry_amendment01_final.py`, the reversals are
 `tools/test_telemetry_amendment01_final_mutations.py`, the card is checked by
 `tools/test_telemetry_web_status.py`, and the schema resources by `tools/test_reqtelemetry_schema.py`.
 
+## The corrections of ACT-...-ATOMIC-STORE-COMMIT-01
+
+A third review looked at the store's COMMIT alone. What changed:
+
+| Where | Before | Now |
+|---|---|---|
+| the retention on a failure | the record was kept (and the old records evicted) **before** the aggregation ran, so a failed transaction evicted the evidence that was already retained, and the rollback removed a record that the retention had already dropped | the retention is part of the **commit**: the record is kept and the old records are evicted only **after** the aggregation committed. A failure touches nothing that was retained, and the rollback never removes a record that does not exist |
+| the engine identity on a failure | the identity was written into the membership filter **inside** the aggregation, so a failed transaction marked an uncommitted counter domain as previously observed | the identity is remembered when the transaction **commits**. The counter domain of a failed transaction stays uncommitted, and the engine's next observation is a first observation again |
+| the retained size | the record was measured **before** the sequence field was inserted, so the store's byte accounting was short by the field it had just added | the retained size is the **exact** size of the document that is kept - the UTF-8 serialized representation, sequence field included. The sequence's own width is part of it (9 -> 10 and 99 -> 100 cost one byte each) |
+| a record that is committed twice | the same measurement could be committed again, and counted again | a record that is already committed is **not committed again**: it is recognized by its own content, so the measurements, the histograms and the population are counted exactly once. The committed identities are bounded |
+
+The witnesses are `serve/test_telemetry_store_commit.py`, the reversals are
+`tools/test_telemetry_store_commit_mutations.py`.
+
 ## See also
 
 * [docs/DETAILS.md](DETAILS.md) - the engine's own workings.
