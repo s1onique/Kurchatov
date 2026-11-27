@@ -4,7 +4,9 @@
 ACT_ID: ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01
 ENTRY_HEAD: 586a720781b990c5801b346653b1887525ca1009
 TESTED_CODE_HEAD: c02dc33d6d454fc310348b8e3d29a26742218fed
-FINAL_HEAD: c02dc33d6d454fc310348b8e3d29a26742218fed
+FINAL_HEAD: c02dc33d6d454fc310348b8e3d29a26742218fed   (the commit that follows it adds ONLY this evidence
+  package - the source paths are byte-identical: `git diff --stat c02dc33..<evidence commit> -- serve tools
+  docs/telemetry docs/TELEMETRY.md` is empty)
 
 C1_WRITER_ACCEPTANCE: CORRECTED - the acceptance boundary is the ENQUEUE; every acceptance condition is
   revalidated under the enqueue lock.  The raced write is refused: write_result false, accepted_records 0,
