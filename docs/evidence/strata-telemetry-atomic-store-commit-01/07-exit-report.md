@@ -81,3 +81,23 @@ FINAL_DISPOSITION: SOURCE_ACCEPTANCE_READY
   accepted F2-F5 corrections.
 * The historical evidence of the earlier segments: only the correction of the stale `TESTED_CODE_HEAD` was
   appended to the predecessor's exit report.
+
+## SUCCESSOR RECEIPT (ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01-CORRECTION-01)
+
+This report is superseded by the segment `strata-telemetry-atomic-store-commit-01-correction-01`.  One defect of
+`TelemetryStore.add()` was closed there: a failed aggregation resolves the dispatched population of its record as
+MISSING evidence, and a retry of that record through the store's own API accounted the SAME invocation a second
+time (dispatched 1, accounted 1, missing 1).  The terminal aggregation is now ONE-SHOT, the store OWNS the records
+it aggregated (a record of another store is refused, and this store never returns another store's committed
+receipt), and the bound of the content-based deduplication is stated.
+
+The witnesses of R1-R5 above are preserved unchanged and still pass.  Nothing above is rewritten; this receipt
+only names the successor.
+
+```yaml
+SEGMENT: strata-telemetry-atomic-store-commit-01-correction-01
+ENTRY_HEAD: 76d44be439aac8474d150e16ac76830900b2c1cf
+TESTED_CODE_HEAD: 2b8fb59b4287023b130cc3bac3d3d9f60c6fbd02
+EVIDENCE_LOCATION: docs/evidence/strata-telemetry-atomic-store-commit-01-correction-01/
+FULL_SUITE: FAIL_BASELINE_EQUIVALENT (1271 tests, the failure set identical to the ENTRY_HEAD baseline)
+```

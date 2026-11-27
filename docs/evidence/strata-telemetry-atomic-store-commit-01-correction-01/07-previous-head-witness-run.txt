@@ -1,0 +1,57 @@
+test_the_committed_identities_are_bounded (serve.test_telemetry_store_commit_correction.BoundedDeduplication.test_the_committed_identities_are_bounded)
+BOUNDED_DEDUPLICATION_WITNESS: the store's own state does not grow without limit. ... ok
+test_the_deduplication_is_per_store (serve.test_telemetry_store_commit_correction.BoundedDeduplication.test_the_deduplication_is_per_store)
+The deduplication belongs to the store that committed: another store has its own. ... ok
+test_a_record_of_another_store_is_refused (serve.test_telemetry_store_commit_correction.StoreOwnership.test_a_record_of_another_store_is_refused)
+STORE_OWNERSHIP_WITNESS: another store's committed record is refused, not returned. ... FAIL
+test_the_failed_record_of_another_store_is_refused (serve.test_telemetry_store_commit_correction.StoreOwnership.test_the_failed_record_of_another_store_is_refused)
+A record whose terminal aggregation failed elsewhere is refused here too. ... FAIL
+test_the_owning_store_keeps_its_own_receipt (serve.test_telemetry_store_commit_correction.StoreOwnership.test_the_owning_store_keeps_its_own_receipt)
+The store that committed the record returns the SAME receipt, and counts nothing twice. ... ok
+test_a_record_that_never_reached_the_aggregation_may_be_aggregated (serve.test_telemetry_store_commit_correction.TerminalAggregationIsOneShot.test_a_record_that_never_reached_the_aggregation_may_be_aggregated)
+A record whose terminal aggregation never RAN is not refused: it never resolved anything. ... ok
+test_the_failed_aggregation_is_not_aggregated_again (serve.test_telemetry_store_commit_correction.TerminalAggregationIsOneShot.test_the_failed_aggregation_is_not_aggregated_again)
+ONE_SHOT_AGGREGATION_WITNESS: the retry of a failed aggregation is refused. ... FAIL
+test_the_refused_retry_changes_nothing_at_all (serve.test_telemetry_store_commit_correction.TerminalAggregationIsOneShot.test_the_refused_retry_changes_nothing_at_all)
+The refused retry does not move a single counter. ... FAIL
+
+======================================================================
+FAIL: test_a_record_of_another_store_is_refused (serve.test_telemetry_store_commit_correction.StoreOwnership.test_a_record_of_another_store_is_refused)
+STORE_OWNERSHIP_WITNESS: another store's committed record is refused, not returned.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-prev/serve/test_telemetry_store_commit_correction.py", line 135, in test_a_record_of_another_store_is_refused
+    with self.assertRaises(ValueError):
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_the_failed_record_of_another_store_is_refused (serve.test_telemetry_store_commit_correction.StoreOwnership.test_the_failed_record_of_another_store_is_refused)
+A record whose terminal aggregation failed elsewhere is refused here too.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-prev/serve/test_telemetry_store_commit_correction.py", line 166, in test_the_failed_record_of_another_store_is_refused
+    with self.assertRaises(ValueError):
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_the_failed_aggregation_is_not_aggregated_again (serve.test_telemetry_store_commit_correction.TerminalAggregationIsOneShot.test_the_failed_aggregation_is_not_aggregated_again)
+ONE_SHOT_AGGREGATION_WITNESS: the retry of a failed aggregation is refused.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-prev/serve/test_telemetry_store_commit_correction.py", line 82, in test_the_failed_aggregation_is_not_aggregated_again
+    with self.assertRaises(ValueError):
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_the_refused_retry_changes_nothing_at_all (serve.test_telemetry_store_commit_correction.TerminalAggregationIsOneShot.test_the_refused_retry_changes_nothing_at_all)
+The refused retry does not move a single counter.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-prev/serve/test_telemetry_store_commit_correction.py", line 109, in test_the_refused_retry_changes_nothing_at_all
+    with self.assertRaises(ValueError):
+AssertionError: ValueError not raised
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.083s
+
+FAILED (failures=4)
