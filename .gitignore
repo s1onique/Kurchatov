@@ -74,3 +74,6 @@ build-vision-cuda12.bat
 
 # local Windows HIP packaging output
 dist-hip/
+
+# Local ACT execution artifacts
+/.kurchatov-acts/
