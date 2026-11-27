@@ -55,3 +55,22 @@ browser's rendering runs the ACTUAL page function against a stub DOM, not a re-i
 
 SOURCE_ACCEPTANCE_READY.  The five corrections are closed and witnessed.  CUDA compilation, the native live
 qualification and the performance parity remain independent qualifications and are not claimed here.
+
+## CORRECTION (ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01)
+
+The `TESTED_CODE_HEAD` of this report was stale.  It named `4b788abcb0694435c9ad3ddde99f3bf0716167de`, which is
+the code head of the PREVIOUS segment (the A1-A6 corrections), and not the code that was tested in this segment.
+
+The code that was tested here - the F1-F5 corrections, the witnesses they brought and the reversal suite - is the
+commit `f1a7233bdd36f3c9b7b83fde158be8657eac7f7c`, which is also this segment's `FINAL_HEAD`.  The commit
+`0d57d20be3c29b07a469e672214066499c71493f` added only the evidence documents; it changed no source file.
+
+```yaml
+ENTRY_HEAD: 3769eed7bc82784ce9d06be78a553b2620b38329
+TESTED_CODE_HEAD: f1a7233bdd36f3c9b7b83fde158be8657eac7f7c
+FINAL_HEAD: f1a7233bdd36f3c9b7b83fde158be8657eac7f7c
+EVIDENCE_HEAD: 0d57d20be3c29b07a469e672214066499c71493f
+```
+
+The witnesses, the suites and the numbers of the report above are unchanged: they were run against the tree of
+`f1a7233b`.  Nothing above is rewritten; this correction only names the revision that was tested.

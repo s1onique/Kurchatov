@@ -1,0 +1,122 @@
+test_the_retained_bytes_are_the_exact_serialized_size (serve.test_telemetry_store_commit.ExactRetainedBytes.test_the_retained_bytes_are_the_exact_serialized_size)
+RETAINED_BYTES_WITNESS: the store's byte accounting is the size of the documents it keeps. ... FAIL
+test_the_sequence_width_is_accounted (serve.test_telemetry_store_commit.ExactRetainedBytes.test_the_sequence_width_is_accounted)
+The sequence's own width is part of the size: 9 -> 10 and 99 -> 100. ... ERROR
+test_the_stored_records_account_for_their_own_width (serve.test_telemetry_store_commit.ExactRetainedBytes.test_the_stored_records_account_for_their_own_width)
+The transition happens in the store itself: the record 10 is one byte larger than the record 9. ... FAIL
+test_the_failed_transaction_does_not_mark_the_engine_as_seen (serve.test_telemetry_store_commit.MembershipFilterRollback.test_the_failed_transaction_does_not_mark_the_engine_as_seen)
+MEMBERSHIP_FILTER_ROLLBACK_WITNESS: the counter domain of a failed transaction stays uncommitted. ... FAIL
+test_the_original_exception_survives_an_oversized_receipt (serve.test_telemetry_store_commit.OversizedReceiptRollback.test_the_original_exception_survives_an_oversized_receipt)
+OVERSIZED_ROLLBACK_WITNESS: the failure is the failure, and nothing was touched. ... ERROR
+test_the_previously_retained_records_are_unchanged (serve.test_telemetry_store_commit.OversizedReceiptRollback.test_the_previously_retained_records_are_unchanged)
+The records that were already retained survive the failed oversized receipt. ... ERROR
+test_the_successful_oversized_receipt_keeps_the_retention_policy (serve.test_telemetry_store_commit.OversizedReceiptRollback.test_the_successful_oversized_receipt_keeps_the_retention_policy)
+The documented retention policy of an oversized receipt is unchanged. ... ok
+test_the_existing_evidence_survives_a_failed_aggregation (serve.test_telemetry_store_commit.RetentionRollback.test_the_existing_evidence_survives_a_failed_aggregation)
+RETENTION_ROLLBACK_WITNESS: the record that was already kept is kept, and unchanged. ... FAIL
+test_the_failed_transaction_keeps_the_sequence_and_the_bytes (serve.test_telemetry_store_commit.RetentionRollback.test_the_failed_transaction_keeps_the_sequence_and_the_bytes)
+The sequence state and the byte accounting survive a failed transaction. ... ok
+test_a_different_record_is_still_committed (serve.test_telemetry_store_commit.StoreCommitIdempotency.test_a_different_record_is_still_committed)
+The idempotency is about the SAME record: a different one is committed as usual. ... ok
+test_the_same_committed_record_is_not_committed_twice (serve.test_telemetry_store_commit.StoreCommitIdempotency.test_the_same_committed_record_is_not_committed_twice)
+STORE_COMMIT_IDEMPOTENCY_WITNESS: the same measurement is counted exactly once. ... FAIL
+
+======================================================================
+ERROR: test_the_sequence_width_is_accounted (serve.test_telemetry_store_commit.ExactRetainedBytes.test_the_sequence_width_is_accounted)
+The sequence's own width is part of the size: 9 -> 10 and 99 -> 100.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 272, in test_the_sequence_width_is_accounted
+    kept = TelemetryStore._kept_size(payload, seq)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: type object 'TelemetryStore' has no attribute '_kept_size'
+
+======================================================================
+ERROR: test_the_original_exception_survives_an_oversized_receipt (serve.test_telemetry_store_commit.OversizedReceiptRollback.test_the_original_exception_survives_an_oversized_receipt)
+OVERSIZED_ROLLBACK_WITNESS: the failure is the failure, and nothing was touched.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/reqtelemetry/store.py", line 246, in add
+    self._count_locked(data)
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 55, in _failing
+    raise RuntimeError(self.error)
+RuntimeError: the aggregation failed
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 163, in test_the_original_exception_survives_an_oversized_receipt
+    store.add(record)
+  File "/private/tmp/kurchatov-entry/serve/reqtelemetry/store.py", line 261, in add
+    self.records.pop()
+IndexError: pop from empty list
+
+======================================================================
+ERROR: test_the_previously_retained_records_are_unchanged (serve.test_telemetry_store_commit.OversizedReceiptRollback.test_the_previously_retained_records_are_unchanged)
+The records that were already retained survive the failed oversized receipt.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/reqtelemetry/store.py", line 246, in add
+    self._count_locked(data)
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 55, in _failing
+    raise RuntimeError(self.error)
+RuntimeError: the aggregation failed
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 190, in test_the_previously_retained_records_are_unchanged
+    store.add(record)
+  File "/private/tmp/kurchatov-entry/serve/reqtelemetry/store.py", line 261, in add
+    self.records.pop()
+IndexError: pop from empty list
+
+======================================================================
+FAIL: test_the_retained_bytes_are_the_exact_serialized_size (serve.test_telemetry_store_commit.ExactRetainedBytes.test_the_retained_bytes_are_the_exact_serialized_size)
+RETAINED_BYTES_WITNESS: the store's byte accounting is the size of the documents it keeps.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 260, in test_the_retained_bytes_are_the_exact_serialized_size
+    self.assertEqual(size, exact, f"the retained size of the record {seq} is not its exact size")
+AssertionError: 1992 != 2002 : the retained size of the record 1 is not its exact size
+
+======================================================================
+FAIL: test_the_stored_records_account_for_their_own_width (serve.test_telemetry_store_commit.ExactRetainedBytes.test_the_stored_records_account_for_their_own_width)
+The transition happens in the store itself: the record 10 is one byte larger than the record 9.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 295, in test_the_stored_records_account_for_their_own_width
+    self.assertEqual(sizes[10] - sizes[9], 1)
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_the_failed_transaction_does_not_mark_the_engine_as_seen (serve.test_telemetry_store_commit.MembershipFilterRollback.test_the_failed_transaction_does_not_mark_the_engine_as_seen)
+MEMBERSHIP_FILTER_ROLLBACK_WITNESS: the counter domain of a failed transaction stays uncommitted.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 234, in test_the_failed_transaction_does_not_mark_the_engine_as_seen
+    self.assertNotIn("engine-x", store._seen_engines)
+AssertionError: 'engine-x' unexpectedly found in <serve.reqtelemetry.store._SeenEngines object at 0x104d30450>
+
+======================================================================
+FAIL: test_the_existing_evidence_survives_a_failed_aggregation (serve.test_telemetry_store_commit.RetentionRollback.test_the_existing_evidence_survives_a_failed_aggregation)
+RETENTION_ROLLBACK_WITNESS: the record that was already kept is kept, and unchanged.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 95, in test_the_existing_evidence_survives_a_failed_aggregation
+    self.assertEqual(len(store.records), 1, "the retained evidence was lost")
+AssertionError: 0 != 1 : the retained evidence was lost
+
+======================================================================
+FAIL: test_the_same_committed_record_is_not_committed_twice (serve.test_telemetry_store_commit.StoreCommitIdempotency.test_the_same_committed_record_is_not_committed_twice)
+STORE_COMMIT_IDEMPOTENCY_WITNESS: the same measurement is counted exactly once.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/kurchatov-entry/serve/test_telemetry_store_commit.py", line 324, in test_the_same_committed_record_is_not_committed_twice
+    self.assertEqual(after["cache_reuse"]["eligible_requests"], 1)
+AssertionError: 2 != 1
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.013s
+
+FAILED (failures=5, errors=3)
