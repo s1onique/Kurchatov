@@ -108,6 +108,9 @@ UNRESOLVED_DEFECTS: none of A1-A7. Two notes for the reviewer:
      measured exactly (several dispatches of its own prompt, or an unnamed prompt domain) is no longer counted
      as "with complete accounting". The predecessor's witnesses that relied on the length fallback were updated
      to name the prompt domain at the dispatch boundary, as the production path does.
+MODULARITY_DEBT: serve/reqtelemetry/record.py and serve/reqtelemetry/store.py still carry several
+  responsibilities each. The debt is TRACKED SEPARATELY: this correction did not split them, and no unrelated
+  refactoring was done.
 EVIDENCE_LOCATION: docs/evidence/strata-request-causal-telemetry-01-closure-01-amendment-01/
   05-resume-report.md (this report), 05-resume-source-only.diff (RESUME_ENTRY_HEAD..TESTED_CODE_HEAD),
   06-complete-amendment-range.diff (the complete amendment range, the evidence directories excluded)
