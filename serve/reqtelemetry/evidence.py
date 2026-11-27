@@ -132,7 +132,13 @@ class EvidenceLog:
                 self.dropped += 1
                 return False
         try:
-            line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5a): the STRICT JSON boundary at
+            # the actual evidence-writing boundary.  `allow_nan=False` makes the serialization of a record that
+            # carries a NaN or an infinity FAIL, so such a record is refused through the existing
+            # serialization-refusal domain (the counters below) instead of being written as `NaN`, `Infinity`
+            # or `-Infinity` - tokens that are NOT JSON and that no strict reader accepts.  The refusals are
+            # counted exactly like any other serialization refusal: the record never reaches the disk.
+            line = (json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
         except (TypeError, ValueError):
             with self.lock:
                 self.pending -= 1
