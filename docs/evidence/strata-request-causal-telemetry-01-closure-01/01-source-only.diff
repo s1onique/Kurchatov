@@ -1,3 +1,361 @@
+diff --git a/serve/reqtelemetry/accounting.py b/serve/reqtelemetry/accounting.py
+index 1baf3135..87a883f8 100644
+--- a/serve/reqtelemetry/accounting.py
++++ b/serve/reqtelemetry/accounting.py
+@@ -8,9 +8,11 @@ has an UNKNOWN disposition - not a match without usable state and not a cold mis
+ """
+ from __future__ import annotations
+ 
++import math
++
+ from serve.reqtelemetry.vocabulary import (DISPOSITION_COLD_MISS, DISPOSITION_FULL_HIT,
+                                         DISPOSITION_MATCH_WITHOUT_STATE, DISPOSITION_PARTIAL_HIT,
+-                                        DISPOSITION_UNKNOWN)
++                                        DISPOSITION_UNKNOWN, INSTRUMENTATION_ERROR)
+ 
+ def derive_disposition(record):
+     """The cache disposition, from the evidence and nothing else.
+@@ -51,6 +53,13 @@ def derive_disposition(record):
+ TOKEN_FIELDS = ("rendered_tokens", "submitted_tokens", "matched_prefix_tokens", "reused_prefix_tokens",
+                 "evaluated_tokens", "replayed_tokens", "non_prefix_reused_tokens", "evaluation_work_tokens")
+ 
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the GENERATION counters and the CUMULATIVE native
++# counters are counts too - a whole, non-negative integer.  They are validated here, so a record that carries an
++# invalid one says so instead of publishing it.
++GENERATION_FIELDS = ("requested_max_output_tokens", "effective_max_output_tokens", "generated_tokens",
++                     "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens")
++CUMULATIVE_FIELDS = ("cache_invalidations", "cache_evictions", "first_divergent_token_index")
++
+ # the fields the NATIVE ENGINE measures.  They are admitted only when the receipt is correlated to this request.
+ NATIVE_TOKEN_FIELDS = ("matched_prefix_tokens", "reused_prefix_tokens", "evaluated_tokens", "replayed_tokens",
+                        "evaluation_work_tokens")
+@@ -69,6 +78,69 @@ def valid_token_count(value) -> bool:
+     return value >= 0
+ 
+ 
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the TYPED measurement admission, shared by the record
++# and the invocation receipt.
++#
++# The predecessor's `_num` accepted anything that was a number, so a negative duration, a NaN and a fractional
++# token count all reached the published record - and the aggregate exporter then excluded them, so the record and
++# the totals disagreed.  The rules are here, in ONE place:
++#
++#   * a COUNT (token counts, generation counts, cumulative event counters) is a whole, non-negative integer; a
++#     bool is not a count;
++#   * a DURATION (milliseconds) is a FINITE, non-negative number;
++#   * an invalid value is REFUSED: it is never clamped, rounded or coerced into a valid one.  The field stays
++#     null, the receipt says why, and the measurement is marked invalid so it cannot enter a total.
++#
++# The native sentinels keep their own documented meanings (the engine writes -1 for "not measured" and leaves
++# the key out entirely), so they are handled where the figures are parsed, not here.
++def valid_count(value) -> bool:
++    """A count is a WHOLE, non-negative integer.  A bool, a fraction, a negative and a string are not counts."""
++    return valid_token_count(value)
++
++
++def valid_duration(value) -> bool:
++    """A duration in milliseconds is a FINITE, non-negative number.  NaN and infinity are not durations."""
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return False
++    if not math.isfinite(float(value)):
++        return False
++    return float(value) >= 0.0
++
++
++def admit_count(target, name, value, field=None):
++    """ONE count, at the admission boundary.  The value or None.
++
++    An invalid count is refused, never repaired: the field stays null, the target says why, and the target is
++    marked as carrying an invalid measurement (so it does not enter the authoritative aggregates).
++    """
++    if value is None:
++        return None
++    if valid_count(value):
++        return value
++    target.measurements_invalid = True
++    target.mark_unavailable(field or name,
++                            f"the {name} that was reported is not a whole, non-negative count",
++                            INSTRUMENTATION_ERROR)
++    return None
++
++
++def admit_duration(target, name, value, field=None):
++    """ONE duration, at the admission boundary.  The value or None.
++
++    A duration that is negative, NaN or infinite is refused, never repaired: it is never published, and it never
++    reaches the histogram as a measured zero.
++    """
++    if value is None:
++        return None
++    if valid_duration(value):
++        return float(value)
++    target.measurements_invalid = True
++    target.mark_unavailable(field or name,
++                            f"the {name} that was reported is not a finite, non-negative duration",
++                            INSTRUMENTATION_ERROR)
++    return None
++
++
+ def validate_measurements(record) -> list:
+     """The problems with the record's own numbers, whatever the accounting says.
+ 
+@@ -89,6 +161,20 @@ def validate_measurements(record) -> list:
+             problems.append(f"{name} is not a whole token count")
+         elif value < 0:
+             problems.append(f"{name} is negative")
++    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the generation counters and the cumulative native
++    # counters are counts as well: a fraction, a bool and a negative are not counts.
++    for name in GENERATION_FIELDS + CUMULATIVE_FIELDS:
++        value = getattr(record, name, None)
++        if value is None:
++            continue
++        if isinstance(value, bool) or not isinstance(value, int):
++            problems.append(f"{name} is not a whole count")
++        elif value < 0:
++            problems.append(f"{name} is negative")
++    # the durations: a NaN or an infinity is not a measurement either
++    for name, value in (getattr(record, "timing", None) or {}).items():
++        if not valid_duration(value):
++            problems.append(f"timing_ms.{name} is not a finite, non-negative duration")
+     return problems
+ 
+ 
+@@ -97,6 +183,32 @@ def measurement_valid(record) -> bool:
+     return not validate_measurements(record)
+ 
+ 
++# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the validity is CLASS-AWARE.  An invalid DURATION does
++# not invalidate the valid token counts, and an invalid count does not invalidate the valid durations: the
++# measurement classes are independent, and each one is admitted (or refused) on its own terms.  The overall
++# `measurement_valid` still says that SOMETHING in the record is not a measurement.
++def counts_valid(record) -> bool:
++    """Whether the record's own COUNTS are measurements: whole, non-negative integers."""
++    for name in TOKEN_FIELDS + GENERATION_FIELDS + CUMULATIVE_FIELDS:
++        value = getattr(record, name, None)
++        if value is None:
++            continue
++        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++            return False
++    return True
++
++
++def durations_valid(record) -> bool:
++    """Whether the record's own DURATIONS are measurements: finite and non-negative."""
++    for name, value in (getattr(record, "timing", None) or {}).items():
++        if not valid_duration(value):
++            return False
++    restore_ms = getattr(record, "cache_restore_ms", None)
++    if restore_ms is not None and not valid_duration(restore_ms):
++        return False
++    return True
++
++
+ def correlation_state(record) -> str:
+     """How well the engine's receipt is tied to this request: verified, unavailable or rejected."""
+     return correlation_of(record)
+@@ -123,16 +235,25 @@ def aggregate_eligible(record) -> bool:
+       * the ACCOUNTING must not be violated (a broken identity is not published as a total);
+       * the native measurements must be CORRELATED (a receipt that could not be tied to this request says nothing
+         about it - an older engine leaves the correlation unavailable, never an asserted join).
++    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the field is DEPRECATED as a gate - the PER-CLASS
++    admission (`measurement_quality.admission`) is the authority - but it is kept for the operator and it is now
++    CONSISTENT with it: it is true when the record is admitted for the native classes it carries.  A record whose
++    native classes are all refused (a foreign receipt, or a request that dispatched more than one invocation and
++    therefore has no unambiguous native scalars) is not eligible, even when its HTTP-owned numbers are fine.
+     """
+     if not measurement_valid(record):
+         return False
+     if record.accounting_state()["state"] == "violated":
+         return False
+-    if correlation_state(record) not in (CORRELATION_VERIFIED, CORRELATION_NOT_APPLICABLE):
+-        return False
+     if getattr(record, "native_partial", False):
+         return False        # the native figures cover one segment of the invocation only (A9)
+-    return True
++    classes = (METRIC_NATIVE_PROMPT_POSITION, METRIC_NATIVE_EXECUTION_WORK, METRIC_NATIVE_DURATION,
++               METRIC_CACHE_RESTORE, METRIC_NATIVE_GENERATION)
++    admitted = [metric for metric in classes if record.metric_admission(metric)]
++    if admitted:
++        return True
++    # a request that holds no invocation receipt at all carries no native measurement: only its HTTP-owned numbers
++    return not getattr(record, "invocations", None)
+ 
+ 
+ def field_eligible(record, name: str) -> bool:
+@@ -140,16 +261,13 @@ def field_eligible(record, name: str) -> bool:
+ 
+     A measurement the SERVER owns stays eligible even when the engine's receipt could not be correlated: the
+     request's own numbers are still the request's own numbers.
++
++    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D3): the legacy helper is now a THIN wrapper around the
++    metric-specific admission, so it cannot contradict it: a native field is admitted by the NATIVE PROMPT
++    POSITION class, a server-owned field by the HTTP class.
+     """
+-    value = getattr(record, name, None)
+-    if value is None:
+-        return False
+-    if not valid_token_count(value):
+-        return False
+-    if name in NATIVE_TOKEN_FIELDS:
+-        return aggregate_eligible(record)
+-    # a server-owned measurement: it needs valid numbers, and the record's accounting must not be violated
+-    return measurement_valid(record) and record.accounting_state()["state"] != "violated"
++    metric = METRIC_NATIVE_PROMPT_POSITION if name in NATIVE_TOKEN_FIELDS else METRIC_HTTP
++    return field_admission(record, name, metric)
+ 
+ 
+ def conservation(record) -> list:
+@@ -273,23 +391,27 @@ def invocation_admission(inv, metric: str) -> bool:
+     if metric == METRIC_PARTIAL_DIAGNOSTIC:
+         return True
+     verified = correlation_of(inv) == CORRELATION_VERIFIED
+-    valid = measurement_valid(inv)
++    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the validity is CLASS-AWARE: an invalid duration
++    # does not exclude the valid token counts, and an invalid count does not exclude the valid durations.  The
++    # measurement classes are independent.
++    counts = counts_valid(inv)
++    durations = durations_valid(inv)
+     partial = bool(getattr(inv, "native_partial", False))
+     state = inv.accounting_state()["state"]
+     if metric == METRIC_HTTP:
+         return True
+     if metric == METRIC_NATIVE_PROMPT_POSITION:
+-        return verified and valid and not partial and state != "violated"
++        return verified and counts and not partial and state != "violated"
+     if metric == METRIC_NATIVE_EXECUTION_WORK:
+-        return verified and valid and not partial and state != "violated"
++        return verified and counts and not partial and state != "violated"
+     if metric == METRIC_NATIVE_DURATION:
+-        return verified and not partial
++        return verified and durations and not partial
+     if metric == METRIC_CACHE_RESTORE:
+-        return verified and valid and not partial
++        return verified and counts and durations and not partial
+     if metric == METRIC_NATIVE_GENERATION:
+-        return verified and valid and not partial
++        return verified and counts and not partial
+     if metric == METRIC_COMPLETE_CACHE_RATIO:
+-        return verified and valid and not partial and state == "satisfied"
++        return verified and counts and not partial and state == "satisfied"
+     return False
+ 
+ 
+diff --git a/serve/reqtelemetry/correlation.py b/serve/reqtelemetry/correlation.py
+index 57c8bbb5..cd2268ba 100644
+--- a/serve/reqtelemetry/correlation.py
++++ b/serve/reqtelemetry/correlation.py
+@@ -73,6 +73,22 @@ def _admit(target, name, value):
+     return value
+ 
+ 
++def _counter(value):
++    """A native CUMULATIVE counter, with the engine's own sentinel for "not measured".
++
++    The engine writes -1 for a counter it did not measure (include/strata/program/reqtelemetry.hpp) and leaves the
++    key out of the DONE line entirely; the key=value reader here keeps whatever was on the line, so a -1 can
++    reach this point.  It means "not measured" - it is NOT a negative count and NOT an invalid measurement: the
++    field stays null and the receipt says it was not measured.  Every other value goes through the shared typed
++    admission (a negative, a fraction and a bool are refused there).
++    """
++    if value is None:
++        return None
++    if isinstance(value, int) and not isinstance(value, bool) and value == -1:
++        return None
++    return value
++
++
+ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocation_id: str | None = None,
+                  receipt=None, terminal_state: str = "completed", native_segment_only: bool = False):
+     """The engine's own measurements for ONE native invocation, into ITS receipt (AMENDMENT-03, G1).
+@@ -98,12 +114,35 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
+         expected = record.engine_invocation_id
+     if expected is None:
+         expected = record.request_id
+-    # the receipt this evidence belongs to: the one the server bound before the dispatch, or a new one for a
+-    # caller that did not bind it (the predecessor's path).
++    # the receipt this evidence belongs to: the one the server bound before the dispatch.
++    #
++    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): the terminal evidence may NOT create a dispatch.
++    # The predecessor called `record.begin_invocation(expected)` here, so a receipt of an invocation this request
++    # never dispatched - or of one whose receipt had already been dropped - produced a NEW dispatch: the
++    # dispatched population grew and the retained population changed.  Now:
++    #
++    #   * the receipt of an invocation this request DISPATCHED is used, even when its measurements are already
++    #     there (an identical duplicate is ignored, a conflicting one is reported);
++    #   * a receipt of an invocation this request did NOT dispatch is refused: it is not attached to anything,
++    #     it does not create a dispatch and it does not resurrect a dropped receipt;
++    #   * the compatibility path (a caller that never went through the dispatch boundary) is EXPLICIT:
++    #     `adopt_legacy_invocation` - it does not count as a dispatch.
+     if receipt is None:
+         receipt = record.invocation_for(expected)
+     if receipt is None:
+-        receipt = record.begin_invocation(expected)
++        if expected is not None and (record.invocations or record.dispatched(expected)):
++            # the receipt of an invocation this request dispatched (and whose receipt was dropped) or of one it
++            # never dispatched: the evidence belongs to nobody.  It is not attached to anything, it does not
++            # create a dispatch and it does not resurrect a dropped receipt.
++            record.mark_unavailable("engine_telemetry",
++                                    "the engine's receipt carried the id of a native invocation whose receipt "
++                                    "this request does not hold: its measurements were not attached",
++                                    INSTRUMENTATION_ERROR)
++            record.native_correlation = record.aggregate_correlation()
++            record._sync_parent()
++            return {"correlation": CORRELATION_REJECTED, "admitted": False}
++        # the compatibility path: a caller that never went through the dispatch boundary
++        receipt = record.adopt_legacy_invocation(expected)
+     if not figures:
+         receipt.correlation = CORRELATION_UNAVAILABLE
+         receipt.mark_unavailable("cache", "the engine reported no cache measurements for this invocation")
+@@ -154,6 +193,25 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
+     replayed = _admit(receipt, "replayed_tokens", figures.get("replayed"))
+     work = _admit(receipt, "evaluation_work_tokens", figures.get("work"))
+ 
++    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): an ALREADY ACCEPTED terminal receipt is never
++    # silently overwritten.  A duplicate that carries the SAME measurements is ignored (idempotently): it does
++    # not cause additional work accounting.  A duplicate that carries DIFFERENT measurements is a CONFLICT: the
++    # receipt keeps its accepted measurements, and the conflict is reported as explicit instrumentation evidence.
++    if receipt.terminal_accepted:
++        if receipt.same_measurements(matched, reused, evaluated, replayed, work):
++            return {"correlation": receipt.correlation, "admitted": receipt.correlation == CORRELATION_VERIFIED,
++                    "duplicate": True}
++        receipt.mark_unavailable("engine_telemetry",
++                                 "a second terminal receipt for this invocation carried DIFFERENT measurements: "
++                                 "the accepted ones were kept and the conflict is reported",
++                                 INSTRUMENTATION_ERROR)
++        record.mark_unavailable("engine_telemetry",
++                                "a second terminal receipt for this invocation carried DIFFERENT measurements: "
++                                "the accepted ones were kept and the conflict is reported", INSTRUMENTATION_ERROR)
++        record.native_correlation = record.aggregate_correlation()
++        record._sync_parent()
++        return {"correlation": receipt.correlation, "admitted": False, "conflict": True}
++
+     # The engine writes the divergent index as: a position (0 or more), -1 for "the sequences agree throughout"
+     # and -2 for "not measured".  The receipt's field is null in both of those cases - there is no mismatch to
+     # report - and the reason says which of the two it was.
+@@ -175,8 +233,11 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
+         restore_attempted=(figures.get("restore") != "none") if "restore" in figures else None,
+         restore_succeeded=(figures.get("restore") == "succeeded") if "restore" in figures else None,
+         restore_ms=figures.get("restore_ms"),
+-        invalidations=figures.get("invalidations"), evictions=figures.get("evictions"))
++        invalidations=_counter(figures.get("invalidations")),
++        evictions=_counter(figures.get("evictions")))
+     # the engine's own durations: the lookup and the restoration it measured
++    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): a duration that is negative, NaN or infinite is
++    # REFUSED by the shared typed rule - it is never published and never a measured zero.  The receipt says why.
+     if figures.get("lookup_ms") is not None:
+         receipt.set_timing("cache_lookup", figures["lookup_ms"], "native_engine")
+     if figures.get("restore_ms") is not None:
+@@ -204,6 +265,10 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
+                                  "the engine's batch slot reported only its admission segment: the native "
+                                  "accounting is not the whole invocation")
+     receipt.seal()
++    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): this invocation's terminal evidence is now
++    # ACCEPTED.  A second terminal receipt for it is a duplicate: the same one is ignored, a conflicting one is
++    # reported as explicit instrumentation evidence, and neither overwrites these measurements.
++    receipt.terminal_accepted = True
+     # the parent's fields are the single invocation's; with more than one invocation they stay null (ambiguous)
+     record.native_correlation = record.aggregate_correlation()
+     record._sync_parent()
 diff --git a/serve/reqtelemetry/evidence.py b/serve/reqtelemetry/evidence.py
 index 278c693b..606352a3 100644
 --- a/serve/reqtelemetry/evidence.py
@@ -104,11 +462,1236 @@ index 278c693b..606352a3 100644
                      "initialization_failures": self.init_failures,
                      "serialization_refusals": self.serialization_refusals,
                      "capacity_refusals": self.capacity_refusals,
+diff --git a/serve/reqtelemetry/invocation.py b/serve/reqtelemetry/invocation.py
+index dd958d30..1153ff78 100644
+--- a/serve/reqtelemetry/invocation.py
++++ b/serve/reqtelemetry/invocation.py
+@@ -57,12 +57,20 @@ class InvocationReceipt:
+         self.correlation = "not_applicable"
+         # the invocation's own terminal state: "running" until its terminal evidence arrives
+         self.state = "running"
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): the terminal evidence of this invocation has
++        # been ACCEPTED.  A second terminal receipt is then a duplicate: the same one is ignored, a conflicting one
++        # is reported - and the accepted measurements are never overwritten.
++        self.terminal_accepted = False
+         # the engine sent a measurement that is not a measurement (AMENDMENT-02, G1)
+         self.measurements_invalid = False
+         # the native figures cover one segment of the invocation only (AMENDMENT-02, A9)
+         self.native_partial = False
+         # the prompt this dispatch gave the engine (the invocation's OWN prompt domain)
+         self.submitted_tokens = None
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the NAME of the prompt domain this dispatch
++        # carried - "request", "continuation" or "other".  It is a word, not a hash and not content: the prompt's
++        # LENGTH is not its identity.
++        self.prompt_domain = None
+         self.rendered_tokens = None
+         self.slot_id = None
+         self.matched_prefix_tokens = None
+@@ -111,8 +119,14 @@ class InvocationReceipt:
+             self.quality = PARTIAL
+ 
+     def set_timing(self, name, ms, authority):
+-        """A duration in milliseconds, from a monotonic clock, with the authority that measured it."""
+-        value = _num(ms)
++        """A duration in milliseconds, from a monotonic clock, with the authority that measured it.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the duration is admitted by the SHARED typed
++        rule: a negative, a NaN and an infinity are refused (never published, never a measured zero), and the
++        receipt says why.
++        """
++        from serve.reqtelemetry import accounting
++        value = accounting.admit_duration(self, name, ms, field=f"timing_ms.{name}")
+         if value is None:
+             return
+         self.timing[name] = round(float(value), 3)
+@@ -123,21 +137,35 @@ class InvocationReceipt:
+                          source=None, disposition=None, reason_code=None, restore_attempted=None,
+                          restore_succeeded=None, restore_ms=None, recurrent_state=None, attention_state=None,
+                          checkpoint_state=None, invalidations=None, evictions=None):
+-        """What the NATIVE ENGINE measured about the cache and the prompt, for THIS invocation."""
++        """What the NATIVE ENGINE measured about the cache and the prompt, for THIS invocation.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): every count and every duration goes through the
++        SHARED typed admission.  An invalid value is refused (the field stays null and the receipt says why) - it
++        is never clamped, rounded or coerced into a valid one.
++        """
++        from serve.reqtelemetry import accounting
+         if matched_prefix is not None:
+-            self.matched_prefix_tokens = _num(matched_prefix)
++            self.matched_prefix_tokens = accounting.admit_count(
++                self, "matched_prefix_tokens", matched_prefix, field="prompt.matched_prefix_tokens")
+         if reused_prefix is not None:
+-            self.reused_prefix_tokens = _num(reused_prefix)
++            self.reused_prefix_tokens = accounting.admit_count(
++                self, "reused_prefix_tokens", reused_prefix, field="prompt.reused_prefix_tokens")
+         if evaluated is not None:
+-            self.evaluated_tokens = _num(evaluated)
++            self.evaluated_tokens = accounting.admit_count(
++                self, "evaluated_tokens", evaluated, field="prompt.evaluated_tokens")
+         if replayed is not None:
+-            self.replayed_tokens = _num(replayed)
++            self.replayed_tokens = accounting.admit_count(
++                self, "replayed_tokens", replayed, field="prompt.replayed_tokens")
+         if non_prefix_reused is not None:
+-            self.non_prefix_reused_tokens = _num(non_prefix_reused)
++            self.non_prefix_reused_tokens = accounting.admit_count(
++                self, "non_prefix_reused_tokens", non_prefix_reused, field="prompt.non_prefix_reused_tokens")
+         if evaluation_work is not None:
+-            self.evaluation_work_tokens = _num(evaluation_work)
++            self.evaluation_work_tokens = accounting.admit_count(
++                self, "evaluation_work_tokens", evaluation_work, field="prompt.evaluation_work_tokens")
+         if first_divergent is not None:
+-            self.first_divergent_token_index = _num(first_divergent)
++            self.first_divergent_token_index = accounting.admit_count(
++                self, "first_divergent_token_index", first_divergent,
++                field="prompt.first_divergent_token_index")
+         if source is not None:
+             self.cache_source = source
+         if disposition is not None:
+@@ -149,7 +177,8 @@ class InvocationReceipt:
+         if restore_succeeded is not None:
+             self.cache_restore_succeeded = restore_succeeded
+         if restore_ms is not None:
+-            self.cache_restore_ms = _num(restore_ms)
++            self.cache_restore_ms = accounting.admit_duration(
++                self, "restore_ms", restore_ms, field="cache.restore_ms")
+         if recurrent_state is not None:
+             self.cache_recurrent_state = recurrent_state
+         if attention_state is not None:
+@@ -157,35 +186,57 @@ class InvocationReceipt:
+         if checkpoint_state is not None:
+             self.cache_checkpoint_state = checkpoint_state
+         if invalidations is not None:
+-            self.cache_invalidations = _num(invalidations)
++            self.cache_invalidations = accounting.admit_count(
++                self, "invalidations", invalidations, field="cache.invalidations")
+         if evictions is not None:
+-            self.cache_evictions = _num(evictions)
++            self.cache_evictions = accounting.admit_count(
++                self, "evictions", evictions, field="cache.evictions")
+ 
+     def set_generation(self, *, requested_max=None, effective_max=None, generated=None, emitted=None,
+                        draft_tokens=None, accepted_tokens=None, finish_reason=None):
+-        """What this invocation generated."""
++        """What this invocation generated.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the generation counters are COUNTS: a whole,
++        non-negative integer.  A negative, a fraction and a bool are refused - never rounded into a valid count.
++        """
++        from serve.reqtelemetry import accounting
+         if requested_max is not None:
+-            self.requested_max_output_tokens = _num(requested_max)
++            self.requested_max_output_tokens = accounting.admit_count(
++                self, "requested_max_output_tokens", requested_max,
++                field="generation.requested_max_output_tokens")
+         if effective_max is not None:
+-            self.effective_max_output_tokens = _num(effective_max)
++            self.effective_max_output_tokens = accounting.admit_count(
++                self, "effective_max_output_tokens", effective_max,
++                field="generation.effective_max_output_tokens")
+         if generated is not None:
+-            self.generated_tokens = _num(generated)
++            self.generated_tokens = accounting.admit_count(
++                self, "generated_tokens", generated, field="generation.generated_tokens")
+         if emitted is not None:
+-            self.emitted_tokens = _num(emitted)
++            self.emitted_tokens = accounting.admit_count(
++                self, "emitted_tokens", emitted, field="generation.emitted_tokens")
+         if draft_tokens is not None:
+-            self.speculative_draft_tokens = _num(draft_tokens)
++            self.speculative_draft_tokens = accounting.admit_count(
++                self, "speculative_draft_tokens", draft_tokens,
++                field="generation.speculative_draft_tokens")
+         if accepted_tokens is not None:
+-            self.speculative_accepted_tokens = _num(accepted_tokens)
++            self.speculative_accepted_tokens = accounting.admit_count(
++                self, "speculative_accepted_tokens", accepted_tokens,
++                field="generation.speculative_accepted_tokens")
+         if finish_reason is not None:
+             self.finish_reason = finish_reason
+ 
+     # ------------------------------------------------------------------ the accounting rules
+     def seal(self):
+         """Close the receipt: the structural zero of the reuse outside the prefix, and its own accounting state."""
++        from serve.reqtelemetry import accounting
+         if self.non_prefix_reused_tokens is None and self.reused_prefix_tokens is not None:
+             # Strata's execution path reuses a CONTIGUOUS prefix only, so the reuse outside the prefix is a
+             # STRUCTURAL ZERO, not an unmeasured value (include/strata/program/reqtelemetry.hpp).
+             self.non_prefix_reused_tokens = 0
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the invocation's OWN disposition, derived from
++        # the SAME rules as the record's - from the evidence and nothing else.  An invocation whose reuse was not
++        # measured has an unknown disposition, not a match without usable state and not a cold miss.
++        self.cache_disposition = accounting.derive_disposition(self)
+         self.accounting = self.accounting_state()
+         if self.accounting["state"] == "violated" and self.quality == COMPLETE:
+             self.quality = PARTIAL
+@@ -219,6 +270,9 @@ class InvocationReceipt:
+             "prompt": {
+                 "rendered_tokens": self.rendered_tokens,
+                 "submitted_tokens": self.submitted_tokens,
++                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the prompt DOMAIN of this dispatch.
++                # It is a word - never a hash and never content.
++                "domain": self.prompt_domain,
+                 "matched_prefix_tokens": self.matched_prefix_tokens,
+                 "reused_prefix_tokens": self.reused_prefix_tokens,
+                 "evaluated_tokens": self.evaluated_tokens,
+@@ -248,6 +302,10 @@ class InvocationReceipt:
+                 "emitted_tokens": self.emitted_tokens,
+                 "speculative_draft_tokens": self.speculative_draft_tokens,
+                 "speculative_accepted_tokens": self.speculative_accepted_tokens,
++                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the NATIVE invocation's finish reason.
++                # It is not the physical HTTP request's finish reason: an invocation that exhausted its output
++                # budget may be followed by a successful continuation.
++                "finish_reason": self.finish_reason,
+             },
+             "measurement_quality": {
+                 "state": self.quality,
+@@ -271,6 +329,19 @@ class InvocationReceipt:
+         from serve.reqtelemetry import accounting
+         return accounting.accounting_state(self)
+ 
++    def same_measurements(self, matched, reused, evaluated, replayed, work) -> bool:
++        """Whether these prompt measurements are the ones this receipt already accepted.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): it is the DUPLICATE test.  A duplicate that
++        carries the same numbers is the same evidence seen twice; a duplicate that carries different numbers is a
++        conflict, and it is reported instead of overwriting the accepted measurements.
++        """
++        return (self.matched_prefix_tokens == matched
++                and self.reused_prefix_tokens == reused
++                and self.evaluated_tokens == evaluated
++                and self.replayed_tokens == replayed
++                and self.evaluation_work_tokens == work)
++
+     def measurement_valid(self) -> bool:
+         """Whether this receipt's own numbers are measurements at all."""
+         from serve.reqtelemetry import accounting
+diff --git a/serve/reqtelemetry/record.py b/serve/reqtelemetry/record.py
+index 668704d2..a512fdcf 100644
+--- a/serve/reqtelemetry/record.py
++++ b/serve/reqtelemetry/record.py
+@@ -37,13 +37,17 @@ from serve.reqtelemetry.vocabulary import (CLIENT_ID_ALLOWED, CLIENT_ID_MAX, COM
+                                          SOURCE_RESTORED_CHECKPOINT, SOURCE_UNKNOWN, STATES, UNSUPPORTED)
+ 
+ 
+-def _receipt_size(receipt) -> int:
+-    """The UTF-8 BYTES of one invocation receipt: the bound of the per-request invocation history is a byte
+-    budget, and a character count is not a byte count."""
++def _receipt_size(receipt):
++    """The UTF-8 BYTES of one invocation receipt, or None when it cannot be serialized.
++
++    The bound of the per-request invocation history is a byte budget, and a character count is not a byte count.
++    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): a receipt that cannot be serialized has an UNKNOWN
++    size - it is not a zero-byte receipt, and it is never admitted as if it were free.
++    """
+     try:
+-        return len(json.dumps(receipt.to_dict(), ensure_ascii=False).encode("utf-8"))
++        return len(json.dumps(receipt.to_dict(), ensure_ascii=False, allow_nan=False).encode("utf-8"))
+     except (TypeError, ValueError):
+-        return 0
++        return None
+ 
+ def valid_client_request_id(value) -> bool:
+     """True when a client-supplied request id may be kept: printable ASCII, bounded, no whitespace or control
+@@ -114,6 +118,25 @@ def decode_cursor(cursor: str, server_instance_id: str | None = None, max_age_s:
+     return seq
+ 
+ 
++class _Omitted:
++    """The sentinel for an argument that was NOT given at all.
++
++    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2a): it is not None.  An argument that is not given
++    falls back to the record's own identity; an argument that is given as None means "this identity was not
++    available", and the two must not be confused.
++    """
++
++    def __repr__(self):
++        return "<omitted>"
++
++
++OMITTED = _Omitted()
++
++# how many dispatched invocation ids a record remembers (the bounded evidence that a receipt belongs to a
++# dispatch of THIS request)
++MAX_DISPATCHED_IDS = 64
++
++
+ def _num(value):
+     """A number or None: 0 stays 0 (a measured zero), anything that is not a number becomes null."""
+     if isinstance(value, bool) or not isinstance(value, (int, float)):
+@@ -152,6 +175,9 @@ class RequestRecord:
+         # counted as a loss, never dropped silently.
+         self.invocations = []
+         self.invocations_total = 0            # how many native invocations this request dispatched
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): the ids this request DISPATCHED (bounded).
++        # The dispatch boundary is the only authority that may create a dispatch; the terminal evidence may not.
++        self.dispatched_ids = []
+         self.invocations_bytes = 0
+         self.invocations_dropped = 0
+         self.invocations_dropped_bytes = 0
+@@ -222,8 +248,13 @@ class RequestRecord:
+             self.quality = PARTIAL
+ 
+     def set_timing(self, name, ms, authority):
+-        """A duration in milliseconds, from a monotonic clock, with the authority that measured it."""
+-        value = _num(ms)
++        """A duration in milliseconds, from a monotonic clock, with the authority that measured it.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the SHARED typed rule admits it: a negative, a
++        NaN and an infinity are refused, never published.
++        """
++        from serve.reqtelemetry import accounting
++        value = accounting.admit_duration(self, name, ms, field=f"timing_ms.{name}")
+         if value is None:
+             return
+         self.timing[name] = round(float(value), 3)
+@@ -233,9 +264,13 @@ class RequestRecord:
+         """The prompt's token counts.  `rendered` is the count after the template render and the tokenization;
+         `submitted` is what the engine was actually given (the two differ when the server truncates)."""
+         if rendered is not None:
+-            self.rendered_tokens = _num(rendered)
++            from serve.reqtelemetry import accounting
++            self.rendered_tokens = accounting.admit_count(
++                self, "rendered_tokens", rendered, field="prompt.rendered_tokens")
+         if submitted is not None:
+-            self.submitted_tokens = _num(submitted)
++            from serve.reqtelemetry import accounting
++            self.submitted_tokens = accounting.admit_count(
++                self, "submitted_tokens", submitted, field="prompt.submitted_tokens")
+ 
+     def set_native_cache(self, *, matched_prefix=None, reused_prefix=None, evaluated=None, replayed=None,
+                          non_prefix_reused=None, evaluation_work=None, first_divergent=None,
+@@ -250,20 +285,29 @@ class RequestRecord:
+         distinct prompt positions the engine evaluated; `evaluation_work` is the executed prompt-token evaluations
+         (repeated work counts again).
+         """
++        from serve.reqtelemetry import accounting
+         if matched_prefix is not None:
+-            self.matched_prefix_tokens = _num(matched_prefix)
++            self.matched_prefix_tokens = accounting.admit_count(
++                self, "matched_prefix_tokens", matched_prefix, field="prompt.matched_prefix_tokens")
+         if reused_prefix is not None:
+-            self.reused_prefix_tokens = _num(reused_prefix)
++            self.reused_prefix_tokens = accounting.admit_count(
++                self, "reused_prefix_tokens", reused_prefix, field="prompt.reused_prefix_tokens")
+         if evaluated is not None:
+-            self.evaluated_tokens = _num(evaluated)
++            self.evaluated_tokens = accounting.admit_count(
++                self, "evaluated_tokens", evaluated, field="prompt.evaluated_tokens")
+         if replayed is not None:
+-            self.replayed_tokens = _num(replayed)
++            self.replayed_tokens = accounting.admit_count(
++                self, "replayed_tokens", replayed, field="prompt.replayed_tokens")
+         if non_prefix_reused is not None:
+-            self.non_prefix_reused_tokens = _num(non_prefix_reused)
++            self.non_prefix_reused_tokens = accounting.admit_count(
++                self, "non_prefix_reused_tokens", non_prefix_reused, field="prompt.non_prefix_reused_tokens")
+         if evaluation_work is not None:
+-            self.evaluation_work_tokens = _num(evaluation_work)
++            self.evaluation_work_tokens = accounting.admit_count(
++                self, "evaluation_work_tokens", evaluation_work, field="prompt.evaluation_work_tokens")
+         if first_divergent is not None:
+-            self.first_divergent_token_index = _num(first_divergent)
++            self.first_divergent_token_index = accounting.admit_count(
++                self, "first_divergent_token_index", first_divergent,
++                field="prompt.first_divergent_token_index")
+         if source is not None:
+             self.cache_source = source
+         if disposition is not None:
+@@ -275,7 +319,9 @@ class RequestRecord:
+         if restore_succeeded is not None:
+             self.cache_restore_succeeded = restore_succeeded
+         if restore_ms is not None:
+-            self.cache_restore_ms = _num(restore_ms)
++            from serve.reqtelemetry import accounting
++            self.cache_restore_ms = accounting.admit_duration(
++                self, "restore_ms", restore_ms, field="cache.restore_ms")
+         if recurrent_state is not None:
+             self.cache_recurrent_state = recurrent_state
+         if attention_state is not None:
+@@ -283,38 +329,58 @@ class RequestRecord:
+         if checkpoint_state is not None:
+             self.cache_checkpoint_state = checkpoint_state
+         if invalidations is not None:
+-            self.cache_invalidations = _num(invalidations)
++            from serve.reqtelemetry import accounting
++            self.cache_invalidations = accounting.admit_count(
++                self, "invalidations", invalidations, field="cache.invalidations")
+         if evictions is not None:
+-            self.cache_evictions = _num(evictions)
++            from serve.reqtelemetry import accounting
++            self.cache_evictions = accounting.admit_count(
++                self, "evictions", evictions, field="cache.evictions")
+ 
+     def set_generation(self, *, requested_max=None, effective_max=None, generated=None, emitted=None,
+                        draft_tokens=None, accepted_tokens=None, finish_reason=None):
+         """What was generated.  `requested_max` is what the client asked for; `effective_max` is what the server
+         actually allowed (the context's room, a budget).  They are kept apart on purpose."""
++        from serve.reqtelemetry import accounting
+         if requested_max is not None:
+-            self.requested_max_output_tokens = _num(requested_max)
++            self.requested_max_output_tokens = accounting.admit_count(
++                self, "requested_max_output_tokens", requested_max,
++                field="generation.requested_max_output_tokens")
+         if effective_max is not None:
+-            self.effective_max_output_tokens = _num(effective_max)
++            self.effective_max_output_tokens = accounting.admit_count(
++                self, "effective_max_output_tokens", effective_max,
++                field="generation.effective_max_output_tokens")
+         if generated is not None:
+-            self.generated_tokens = _num(generated)
++            self.generated_tokens = accounting.admit_count(
++                self, "generated_tokens", generated, field="generation.generated_tokens")
+         if emitted is not None:
+-            self.emitted_tokens = _num(emitted)
++            self.emitted_tokens = accounting.admit_count(
++                self, "emitted_tokens", emitted, field="generation.emitted_tokens")
+         if draft_tokens is not None:
+-            self.speculative_draft_tokens = _num(draft_tokens)
++            self.speculative_draft_tokens = accounting.admit_count(
++                self, "speculative_draft_tokens", draft_tokens,
++                field="generation.speculative_draft_tokens")
+         if accepted_tokens is not None:
+-            self.speculative_accepted_tokens = _num(accepted_tokens)
++            self.speculative_accepted_tokens = accounting.admit_count(
++                self, "speculative_accepted_tokens", accepted_tokens,
++                field="generation.speculative_accepted_tokens")
+         if finish_reason is not None:
+             self.finish_reason = finish_reason
+ 
+     # ------------------------------------------------------------------ the native invocations (G1)
+-    def begin_invocation(self, invocation_id, ordinal=None, engine_instance_id=None, model_id=None,
+-                         build_revision=None):
++    def begin_invocation(self, invocation_id, ordinal=None, engine_instance_id=OMITTED, model_id=OMITTED,
++                         build_revision=OMITTED):
+         """The measurement receipt of ONE native dispatch (AMENDMENT-03, G1).
+ 
+         The receipt is bound to the invocation id, the ordinal, the engine instance, the model and the build
+         identity IMMEDIATELY BEFORE the dispatch, so the terminal evidence can be validated against exactly that
+         identity - and against nothing else.  The receipt is created empty: a measurement that the invocation
+         does not report stays null in it, and it never inherits a value from another invocation.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2a): the identity arguments distinguish OMITTED from
++        EXPLICITLY UNKNOWN.  An argument that is not given at all falls back to the record's own identity (the
++        compatibility path); an argument that is given as None means "this identity was NOT AVAILABLE at the
++        dispatch" - and it stays unavailable.  The preparation-time identity is never substituted for it.
+         """
+         if invocation_id is None:
+             return None
+@@ -323,12 +389,41 @@ class RequestRecord:
+             return existing
+         receipt = InvocationReceipt(invocation_id,
+                                     int(ordinal) if ordinal else len(self.invocations) + 1,
+-                                    engine_instance_id=engine_instance_id if engine_instance_id is not None
+-                                    else self.engine_instance_id,
+-                                    model_id=model_id if model_id is not None else self.model_id,
+-                                    build_revision=build_revision if build_revision is not None
+-                                    else self.build_revision)
++                                    engine_instance_id=self.engine_instance_id if engine_instance_id is OMITTED
++                                    else engine_instance_id,
++                                    model_id=self.model_id if model_id is OMITTED else model_id,
++                                    build_revision=self.build_revision if build_revision is OMITTED
++                                    else build_revision)
+         self.invocations_total += 1
++        self.dispatched_ids.append(invocation_id)
++        if len(self.dispatched_ids) > MAX_DISPATCHED_IDS:
++            del self.dispatched_ids[:-MAX_DISPATCHED_IDS]
++        self._add_receipt(receipt)
++        return receipt
++
++    def dispatched(self, invocation_id) -> bool:
++        """Whether THIS request dispatched that invocation id (the dispatch boundary is the only authority)."""
++        return invocation_id is not None and invocation_id in self.dispatched_ids
++
++    def adopt_legacy_invocation(self, invocation_id, ordinal=None):
++        """The COMPATIBILITY path: a receipt for an invocation id this request never dispatched.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): this operation is EXPLICIT and it is NOT a
++        dispatch: the dispatch counter is not incremented and the id is not remembered as dispatched.  It exists
++        for the callers that apply engine figures to a request that never went through the dispatch boundary (the
++        predecessor's path); the production terminal path never uses it, so terminal evidence can never create a
++        dispatch or resurrect a dropped receipt.
++        """
++        if invocation_id is None:
++            return None
++        existing = self.invocation_for(invocation_id)
++        if existing is not None:
++            return existing
++        receipt = InvocationReceipt(invocation_id,
++                                    int(ordinal) if ordinal else len(self.invocations) + 1,
++                                    engine_instance_id=self.engine_instance_id,
++                                    model_id=self.model_id,
++                                    build_revision=self.build_revision)
+         self._add_receipt(receipt)
+         return receipt
+ 
+@@ -342,9 +437,26 @@ class RequestRecord:
+         return None
+ 
+     def _add_receipt(self, receipt):
+-        """Keep the receipt inside the documented bounds; a receipt that does not fit is COUNTED as a loss."""
++        """Keep the receipt inside the documented bounds; a receipt that does not fit is COUNTED as a loss.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): a receipt that cannot fit within the byte budget
++        ON ITS OWN is refused: the predecessor admitted it when the history was empty, so one oversized receipt
++        could exceed the whole budget.  The size is the receipt's ACTUAL serialized UTF-8 size; a receipt that
++        cannot be serialized at all is refused too - a serialization failure is NOT a zero-byte receipt.
++        """
+         size = _receipt_size(receipt)
++        if size is None:
++            # the receipt cannot be serialized: its size is UNKNOWN, not zero.  It is refused and counted.
++            self.invocations_dropped += 1
++            self._note_drop()
++            return
+         receipt._size = size
++        if size > MAX_INVOCATION_BYTES:
++            # it cannot fit within the budget, not even alone: refused and counted as a loss
++            self.invocations_dropped += 1
++            self.invocations_dropped_bytes += size
++            self._note_drop()
++            return
+         while self.invocations and (len(self.invocations) >= MAX_INVOCATION_RECORDS
+                                     or self.invocations_bytes + size > MAX_INVOCATION_BYTES):
+             dropped = self.invocations.pop(0)
+@@ -356,12 +468,51 @@ class RequestRecord:
+         self.invocations_bytes += size
+         self._sync_parent()
+         self._merge_unavailable()
++        self._note_drop()
++
++    def _note_drop(self):
++        """Publish the loss of a receipt: a dropped receipt is visible, never silent."""
++        self._merge_unavailable()
+         if self.invocations_dropped:
+             self.mark_unavailable("invocations",
+                                   f"{self.invocations_dropped} native invocation receipt(s) did not fit in the "
+                                   f"record's bounds ({MAX_INVOCATION_RECORDS} receipts, {MAX_INVOCATION_BYTES} bytes) "
+                                   f"and were dropped: the record does not show them")
+ 
++    def revalidate_invocation_bytes(self):
++        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5b, D5): the byte bound is re-checked AFTER the
++        terminal measurements have been added.
++
++        The receipt's size is measured when it is admitted - but the receipt grows afterwards: the terminal
++        measurements (the durations, the generation counters, the reason) are added to it later.  The bound is
++        therefore checked again here, on the receipts as they are published.
++        """
++        for receipt in list(self.invocations):
++            size = _receipt_size(receipt)
++            if size is None:
++                # it cannot be serialized: it is not a zero-byte receipt, it is an unusable one
++                self.invocations.remove(receipt)
++                self.invocations_bytes -= getattr(receipt, "_size", 0)
++                self.invocations_dropped += 1
++                continue
++            previous = getattr(receipt, "_size", 0)
++            receipt._size = size
++            self.invocations_bytes += size - previous
++        # the oldest receipts go until the collection is inside the byte budget again
++        while self.invocations and self.invocations_bytes > MAX_INVOCATION_BYTES:
++            dropped = self.invocations.pop(0)
++            self.invocations_bytes -= getattr(dropped, "_size", 0)
++            self.invocations_dropped += 1
++            self.invocations_dropped_bytes += getattr(dropped, "_size", 0)
++        # a receipt that alone exceeds the budget does not fit either
++        while self.invocations and getattr(self.invocations[0], "_size", 0) > MAX_INVOCATION_BYTES:
++            dropped = self.invocations.pop(0)
++            self.invocations_bytes -= getattr(dropped, "_size", 0)
++            self.invocations_dropped += 1
++            self.invocations_dropped_bytes += getattr(dropped, "_size", 0)
++        self._sync_parent()
++        self._note_drop()
++
+     def _sync_parent(self):
+         """The parent's native scalars describe ONE invocation - and only when that is unambiguous (G1).
+ 
+@@ -468,6 +619,17 @@ class RequestRecord:
+         # parent's native scalars are the single invocation's, or null when the request dispatched more than one.
+         for receipt in self.invocations:
+             receipt.seal()
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): an invocation whose terminal evidence never
++            # arrived is NOT presented as running.  The request is over, so nothing is still executing: the state
++            # says "unknown" and the receipt says why.  Missing telemetry is not a failure of the inference.
++            if receipt.state == "running":
++                receipt.state = "unknown"
++                receipt.mark_unavailable("terminal_evidence",
++                                        "the native invocation's terminal evidence never arrived: its outcome is "
++                                        "unknown", INSTRUMENTATION_ERROR)
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5b, D5): the receipts have just received their
++        # terminal measurements, so their serialized size is re-checked against the byte budget NOW.
++        self.revalidate_invocation_bytes()
+         self._sync_parent()
+         self.cache_disposition = self.derive_disposition()
+         if self.state in ("cancelled", "failed", "rejected") and self.quality == COMPLETE:
+@@ -578,6 +740,11 @@ class RequestRecord:
+                 # and why not when they may not.  The three decisions stay apart: the measurements are valid, the
+                 # accounting is not violated, and the engine's receipt is correlated to this request.
+                 "native_correlation": self.aggregate_correlation(),
++                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the correlation of the RETAINED
++                # evidence and the correlation of the WHOLE dispatched population are different claims.  A receipt
++                # that was dropped means the request's evidence is incomplete, even when every receipt that
++                # survived is verified.
++                "native_correlation_complete": self.correlation_complete(),
+                 "native_partial": self.native_partial,
+                 "measurement_valid": self.measurement_valid(),
+                 "aggregate_eligible": self.aggregate_eligible(),
+@@ -592,6 +759,9 @@ class RequestRecord:
+                 "invocation_count": len(self.invocations),
+                 "invocations_dispatched": self.invocations_total,
+                 "invocations_dropped": self.invocations_dropped,
++                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): the bytes of the dropped receipts are
++                # published beside the count: a lost receipt is visible in both.
++                "invocation_dropped_bytes": self.invocations_dropped_bytes,
+                 "invocation_bytes": self.invocations_bytes,
+             },
+         }
+@@ -612,6 +782,19 @@ class RequestRecord:
+             return CORRELATION_VERIFIED
+         return CORRELATION_UNAVAILABLE
+ 
++    def correlation_complete(self) -> bool:
++        """Whether the native correlation covers the WHOLE dispatched population (D6).
++
++        The RETAINED evidence may be fully verified while the request's evidence is incomplete: a receipt that
++        did not fit the bounds was dropped, and the evidence of that invocation is lost.  The record then says so
++        instead of claiming a complete request-level native correlation.
++        """
++        if self.invocations_dropped:
++            return False
++        if self.invocations_total != len(self.invocations):
++            return False
++        return self.aggregate_correlation() == CORRELATION_VERIFIED
++
+     def metric_admission(self, metric: str) -> bool:
+         """Whether this RECORD's own measurements of one metric class may enter an authoritative aggregate.
+ 
+diff --git a/serve/reqtelemetry/schema.py b/serve/reqtelemetry/schema.py
+index fb58783d..6986c941 100644
+--- a/serve/reqtelemetry/schema.py
++++ b/serve/reqtelemetry/schema.py
+@@ -134,6 +134,10 @@ SCHEMA = {
+                 # AMENDMENT-02 (G1): how the engine's receipt was tied to this request, whether the numbers are
+                 # measurements at all, and whether the record may enter the authoritative aggregates
+                 "native_correlation": {"enum": ["verified", "unavailable", "rejected", "not_applicable"]},
++                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): whether the correlation covers the WHOLE
++                # dispatched population - the retained evidence may be verified while the request's evidence is
++                # incomplete (a receipt was dropped).
++                "native_correlation_complete": {"type": "boolean"},
+                 # AMENDMENT-02 (A9): the native figures cover one segment of the invocation only
+                 "native_partial": {"type": "boolean"},
+                 "measurement_valid": {"type": "boolean"},
+@@ -144,6 +148,8 @@ SCHEMA = {
+                 "invocation_count": {"type": "integer", "minimum": 0},
+                 "invocations_dispatched": {"type": "integer", "minimum": 0},
+                 "invocations_dropped": {"type": "integer", "minimum": 0},
++                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): the bytes of the dropped receipts
++                "invocation_dropped_bytes": {"type": "integer", "minimum": 0},
+                 "invocation_bytes": {"type": "integer", "minimum": 0},
+                 "accounting": {
+                     "type": "object",
+@@ -184,11 +190,53 @@ SCHEMA["properties"]["invocations"] = {
+                     "slot_id": {"type": ["integer", "null"], "minimum": 0},
+                 },
+             },
+-            "state": {"enum": ["running", "completed", "cancelled", "failed", "rejected"]},
+-            "prompt": SCHEMA["properties"]["prompt"],
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): "unknown" is the state of an invocation
++            # whose terminal evidence never arrived - it is NOT presented as running, and it is not a failure of
++            # the inference either.
++            "state": {"enum": ["running", "completed", "cancelled", "failed", "rejected", "unknown"]},
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the invocation's prompt section carries the
++            # DOMAIN of its dispatch - a word, never a hash and never content.  The prompt's length is not its
++            # identity.
++            "prompt": {
++                "type": "object",
++                "required": ["rendered_tokens", "submitted_tokens", "domain", "matched_prefix_tokens",
++                             "reused_prefix_tokens", "evaluated_tokens", "replayed_tokens",
++                             "non_prefix_reused_tokens", "evaluation_work_tokens", "first_divergent_token_index"],
++                "additionalProperties": False,
++                "properties": {
++                    "rendered_tokens": _int_or_null(),
++                    "submitted_tokens": _int_or_null(),
++                    "domain": {"type": ["string", "null"]},
++                    "matched_prefix_tokens": _int_or_null(),
++                    "reused_prefix_tokens": _int_or_null(),
++                    "evaluated_tokens": _int_or_null(),
++                    "replayed_tokens": _int_or_null(),
++                    "non_prefix_reused_tokens": _int_or_null(),
++                    "evaluation_work_tokens": _int_or_null(),
++                    "first_divergent_token_index": _int_or_null(),
++                },
++            },
+             "cache": SCHEMA["properties"]["cache"],
+             "timing_ms": SCHEMA["properties"]["timing_ms"],
+-            "generation": SCHEMA["properties"]["generation"],
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the invocation's OWN generation section.  It
++            # carries the native finish reason as well - the physical HTTP finish reason is not the native
++            # invocation's finish reason, so the two are kept apart.
++            "generation": {
++                "type": "object",
++                "required": ["requested_max_output_tokens", "effective_max_output_tokens", "generated_tokens",
++                             "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens",
++                             "finish_reason"],
++                "additionalProperties": False,
++                "properties": {
++                    "requested_max_output_tokens": _int_or_null(),
++                    "effective_max_output_tokens": _int_or_null(),
++                    "generated_tokens": _int_or_null(),
++                    "emitted_tokens": _int_or_null(),
++                    "speculative_draft_tokens": _int_or_null(),
++                    "speculative_accepted_tokens": _int_or_null(),
++                    "finish_reason": _str_or_null(),
++                },
++            },
+             "measurement_quality": {
+                 "type": "object",
+                 "required": ["state", "unavailable_fields", "timing_authority", "native_correlation",
+diff --git a/serve/reqtelemetry/server.py b/serve/reqtelemetry/server.py
+index fcaf57a9..e2c74e9a 100644
+--- a/serve/reqtelemetry/server.py
++++ b/serve/reqtelemetry/server.py
+@@ -74,7 +74,9 @@ class ServerTelemetry:
+                 return None                 # already finished: a terminal receipt is finalized AT MOST ONCE
+             del self._records[record.request_id]
+         # the terminal outcome first: it does not depend on the receipt
+-        self.store.end_request(state)
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the record is passed, so the outcome is counted
++        # exactly once - the store's own `add` does not count it again.
++        self.store.end_request(state, record)
+         try:
+             record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
+             data = self.store.add(record)
+diff --git a/serve/reqtelemetry/store.py b/serve/reqtelemetry/store.py
+index 794d4174..002ba9c0 100644
+--- a/serve/reqtelemetry/store.py
++++ b/serve/reqtelemetry/store.py
+@@ -63,6 +63,9 @@ class TelemetryStore:
+             # INVOCATION: a receipt that never arrived is in the missing population, so a lost receipt lowers the
+             # coverage instead of silently improving it.
+             "native_invocations": 0, "native_invocations_accounted": 0, "native_invocations_missing": 0,
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the receipts that did not fit the bounds.
++            # They are missing EVIDENCE: the invocation happened, its receipt did not survive.
++            "native_invocations_dropped": 0,
+             "requests_with_complete_accounting": 0,
+             # the positions of the invocations whose prompt domain is NOT the request's own prompt domain (a
+             # recovery dispatch that sent another prompt): they are work, never the request's prompt coverage
+@@ -70,10 +73,20 @@ class TelemetryStore:
+             "native_positions_evaluated_total": 0,
+             # the evictions of an engine whose identity is unknown: they cannot be attributed to a domain
+             "cache_evictions_unattributed": 0,
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5a): the observations that were REFUSED from
++            # the authoritative total because their engine's retired reading was gone - the attribution was
++            # unavailable, and the work was not counted twice.
++            "cache_evictions_attribution_unavailable": 0,
+         }
+         # the engine's own eviction counter, per engine instance: it restarts with the engine, and a counter that
+         # falls would be a counter that lies (G6)
+         self._evictions_by_engine = {}
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5a): the RETIRED engines' last readings.  They are
++        # kept (bounded) so that a DELAYED observation of a retired engine is compared with its own last reading
++        # instead of being counted again from zero.  The engines whose reading is gone are remembered as
++        # unattributable, so their later observations are refused rather than counted twice.
++        self._retired_evictions = {}
++        self._unattributable_engines = set()
+         # The duration histograms, in SECONDS: name -> {"sum": seconds, "n": count, "buckets": [cumulative counts]}.
+         # The record keeps its timings in milliseconds (the record's own unit is named in the section), and the store
+         # converts them ONCE, here, when it observes them.  Everything downstream of this line is seconds.
+@@ -89,14 +102,22 @@ class TelemetryStore:
+         with self.lock:
+             self.counters["requests_accepted"] += 1
+ 
+-    def end_request(self, state):
+-        """Count ONE terminal outcome for an accepted request (AMENDMENT-02, A4)."""
++    def end_request(self, state, record=None):
++        """Count ONE terminal outcome for an accepted request (AMENDMENT-02, A4).
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the terminal outcome is counted BEFORE the
++        receipt is sealed and stored, so a request whose terminal receipt is lost still counts in the physical
++        request's own population.  The record is marked, so the outcome is counted exactly ONCE (the store's own
++        `add` does not count it a second time).
++        """
+         key = {"completed": "requests_terminal_completed", "cancelled": "requests_terminal_cancelled",
+                "failed": "requests_terminal_failed", "rejected": "requests_terminal_rejected"}.get(state)
+         if key is None:
+             return
+         with self.lock:
+             self.counters[key] += 1
++        if record is not None:
++            record._terminal_counted = True
+ 
+     def receipt_failed(self):
+         """A terminal receipt that could not be delivered (sealing, storing or writing it failed)."""
+@@ -121,6 +142,16 @@ class TelemetryStore:
+             self.bytes += size
+             self._evict_locked()
+             self.counters["receipts_created"] += 1
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the physical request's own population is the
++            # requests that reached a terminal outcome.  A record that arrives WITHOUT its terminal outcome having
++            # been counted (a caller that stores the receipt itself) counts it here - exactly once.
++            if not getattr(record, "_terminal_counted", False):
++                key = {"completed": "requests_terminal_completed", "cancelled": "requests_terminal_cancelled",
++                       "failed": "requests_terminal_failed", "rejected": "requests_terminal_rejected"}.get(
++                           data["lifecycle"]["state"])
++                if key is not None:
++                    self.counters[key] += 1
++                    record._terminal_counted = True
+             self._count_locked(data)
+         return data
+ 
+@@ -154,23 +185,36 @@ class TelemetryStore:
+             c["requests_failed"] += 1
+         quality = data["measurement_quality"]
+         prompt, gen = data["prompt"], data["generation"]
+-        accounting_state = (quality.get("accounting") or {}).get("state")
+-        # the HTTP-owned measurements: the server's own numbers.  They do not depend on the engine's receipt,
+-        # but they do depend on the token accounting not being broken (the identity involves the submitted
+-        # prompt, which the server measured).
+-        if accounting_state != "violated":
+-            submitted = prompt.get("submitted_tokens")
+-            if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0:
+-                c["prompt_tokens_submitted"] += submitted
+-            emitted = gen.get("emitted_tokens")
+-            if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
+-                c["emitted_tokens"] += emitted
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D3): the HTTP-owned measurements are admitted on
++        # THEIR OWN terms.  The server measured them itself; the native token accounting says nothing about them,
++        # so a broken NATIVE accounting never suppresses the HTTP counter (and the record's own admission
++        # decision - METRIC_HTTP is always admitted - agrees with what the store does).
++        submitted = prompt.get("submitted_tokens")
++        if isinstance(submitted, int) and not isinstance(submitted, bool) and submitted >= 0:
++            c["prompt_tokens_submitted"] += submitted
++        emitted = gen.get("emitted_tokens")
++        if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
++            c["emitted_tokens"] += emitted
+         # the native measurements: every invocation's own receipt decides for itself
+         request_submitted = prompt.get("submitted_tokens")
+         accounted_request = False
+         for invocation in data.get("invocations") or []:
+             if self._count_invocation_locked(c, invocation, request_submitted):
+                 accounted_request = True
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the invocation denominator is the DISPATCHED
++        # population, not the retained one.  A receipt that was dropped is a MISSING invocation: the coverage falls,
++        # it never improves.  The dispatched count comes from the record's own dispatch accounting, so it is
++        # independent of the receipts that survived.
++        dispatched = int(quality.get("invocations_dispatched") or 0)
++        retained = len(data.get("invocations") or [])
++        dropped = max(0, dispatched - retained)
++        if dropped:
++            # the receipts that did not fit: they are in the missing population, never in the accounted one
++            c["native_invocations_missing"] += dropped
++            c["native_invocations_dropped"] += dropped
++        # the invocation population: every native invocation this request performed, whether its receipt survived
++        # or not.  It is counted from the DISPATCH accounting, never from the retained receipts alone.
++        c["native_invocations"] += retained + dropped
+         if accounted_request:
+             c["requests_with_complete_accounting"] += 1
+         if quality.get("state") == INSTRUMENTATION_ERROR:
+@@ -192,18 +236,27 @@ class TelemetryStore:
+         iprompt = invocation.get("prompt") or {}
+         icache = invocation.get("cache") or {}
+         igen = invocation.get("generation") or {}
+-        c["native_invocations"] += 1
+-        # the eligible and the missing populations of the accounting coverage (G2c)
++        # the eligible and the missing populations of the accounting coverage (G2c).  The POPULATION itself is
++        # counted by the caller, from the dispatch accounting (C2): a dropped receipt is missing evidence, not a
++        # smaller population.
+         eligible = bool(admission.get(ACCOUNTING.METRIC_COMPLETE_CACHE_RATIO))
+         if eligible:
+             c["native_invocations_accounted"] += 1
+         else:
+             c["native_invocations_missing"] += 1
+         # the prompt positions: the REQUEST's own prompt domain only.  An invocation that worked on another
+-        # prompt (a recovery dispatch) is work, never this prompt's coverage.  An invocation whose own prompt
+-        # length was not measured cannot be a different domain: it stays in the request's domain.
+-        same_domain = (request_submitted is None or iprompt.get("submitted_tokens") is None
+-                       or iprompt.get("submitted_tokens") == request_submitted)
++        # prompt (a recovery dispatch) is work, never this prompt's coverage.
++        #
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the domain is the NAME the dispatch boundary
++        # gave it, NOT the prompt's length.  Two different prompts of the same length are two domains, and two
++        # invocations of the SAME prompt are one domain.  An invocation whose domain was not named (an older
++        # caller) falls back to the length comparison.
++        domain = iprompt.get("domain")
++        if domain is None:
++            same_domain = (request_submitted is None or iprompt.get("submitted_tokens") is None
++                           or iprompt.get("submitted_tokens") == request_submitted)
++        else:
++            same_domain = domain == "request"
+         if admission.get(ACCOUNTING.METRIC_NATIVE_PROMPT_POSITION):
+             for key, counter, total in (("matched_prefix_tokens", "prompt_tokens_matched",
+                                          "native_positions_matched_total"),
+@@ -261,17 +314,51 @@ class TelemetryStore:
+         attributed to an engine process, so it is published as unattributed instead of pretending that two
+         different engines are one.  The retired instances' state is BOUNDED: the oldest mark goes when the bound
+         is reached, so a long run does not grow the state without limit.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C5a): retiring an engine's mark must not FORGET its
++        counter domain.  The predecessor deleted the mark when the bound was reached, so a LATE observation of
++        that engine looked like a first observation and its whole cumulative counter was counted again - the same
++        work was counted twice.  Now a retired engine's last reading is kept in a SEPARATE, equally bounded map
++        of RETIRED domains: a late observation of a retired engine is compared against that reading and only its
++        DELTA is counted.  The retired map is bounded too, and when a retired reading is dropped from it the
++        domain is remembered as UNATTRIBUTABLE: a later observation of that engine is then refused from the
++        authoritative total and counted as an unavailable attribution - never counted again as if it were new.
+         """
+         if not instance:
+             c["cache_evictions_unattributed"] += evictions
+             return
+-        previous = self._evictions_by_engine.get(instance, 0)
+-        if evictions >= previous:
+-            c["cache_evictions"] += evictions - previous
++        if instance in self._evictions_by_engine:
++            previous = self._evictions_by_engine[instance]
++            if evictions >= previous:
++                c["cache_evictions"] += evictions - previous
++                self._evictions_by_engine[instance] = evictions
++        elif instance in self._retired_evictions:
++            # a DELAYED observation of a retired engine: only the increase since its last reading is new work
++            previous = self._retired_evictions[instance]
++            if evictions >= previous:
++                c["cache_evictions"] += evictions - previous
++                self._retired_evictions[instance] = evictions
++        elif instance in self._unattributable_engines:
++            # the retired reading of this engine is gone: its exact delta cannot be recovered, so the
++            # observation is REFUSED from the authoritative total and the attribution is counted as unavailable
++            c["cache_evictions_unattributed"] += evictions
++            c["cache_evictions_attribution_unavailable"] += 1
++            return
++        else:
++            # a first observation of this engine: its whole counter is new work
++            c["cache_evictions"] += evictions
+             self._evictions_by_engine[instance] = evictions
+         while len(self._evictions_by_engine) > MAX_ENGINE_INSTANCES:
+             oldest = next(iter(self._evictions_by_engine))
+-            del self._evictions_by_engine[oldest]
++            self._retired_evictions[oldest] = self._evictions_by_engine.pop(oldest)
++            while len(self._retired_evictions) > MAX_ENGINE_INSTANCES:
++                # the retired reading goes: the engine's counter domain is no longer recoverable, so it is
++                # remembered as unattributable (a BOUNDED set, not unbounded tombstone storage)
++                gone = next(iter(self._retired_evictions))
++                del self._retired_evictions[gone]
++                self._unattributable_engines.add(gone)
++                while len(self._unattributable_engines) > MAX_ENGINE_INSTANCES:
++                    self._unattributable_engines.pop()
+ 
+ 
+     def _observe_locked(self, data):
+@@ -365,6 +452,13 @@ class TelemetryStore:
+             submitted = self.counters["prompt_tokens_submitted_eligible"]
+             reused = self.counters["prompt_tokens_reused_eligible"]
+             total = self.counters["requests_total"]
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the requests that reached a TERMINAL
++            # OUTCOME.  This is the physical request's own denominator: it is independent of the receipts that were
++            # stored, so a lost terminal receipt lowers the coverage instead of shrinking the population.
++            terminal = (self.counters["requests_terminal_completed"]
++                        + self.counters["requests_terminal_cancelled"]
++                        + self.counters["requests_terminal_failed"]
++                        + self.counters["requests_terminal_rejected"])
+             return {
+                 "counters": dict(self.counters),
+                 # AMENDMENT-02 (A4): the lifecycle accounting, independent of the records' own insertion.  At
+@@ -388,13 +482,19 @@ class TelemetryStore:
+                                 "eligible_invocations": self.counters["native_invocations_accounted"],
+                                 "missing_invocations": self.counters["native_invocations_missing"],
+                                 "invocations": self.counters["native_invocations"],
++                                "dropped_invocations": self.counters["native_invocations_dropped"],
+                                 "requests_with_complete_accounting":
+                                     self.counters["requests_with_complete_accounting"],
+                                 "coverage": round(self.counters["native_invocations_accounted"]
+                                                   / self.counters["native_invocations"], 6)
+                                 if self.counters["native_invocations"] else None,
++                                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the physical request's own
++                                # coverage is measured against the requests that REACHED A TERMINAL OUTCOME, not
++                                # against the receipts that were stored: a request whose terminal receipt was lost
++                                # lowers the coverage instead of disappearing from the denominator.  A request that
++                                # is still running is not in the population - its outcome is not known yet.
+                                 "request_coverage": round(self.counters["requests_with_complete_accounting"]
+-                                                          / total, 6) if total else None},
++                                                          / terminal, 6) if terminal else None},
+                 "histograms": {k: {"sum": v["sum"], "count": v["n"],
+                                    "buckets": {str(edge): v["buckets"][i]
+                                                for i, edge in enumerate(DURATION_BUCKETS)}}
+diff --git a/serve/server.py b/serve/server.py
+index fa92c432..8662b4f7 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -4676,7 +4676,8 @@ class Service:
+         return f"pid-{proc.pid}-gen-{getattr(self.engine, 'gen', 0)}"
+ 
+     def _finish_telemetry(self, tele, last, seen, submitted, generated, finish, started, emitted=None,
+-                          queue_s=None, first_token_s=None, invocations=1, segments=None):
++                          queue_s=None, first_token_s=None, invocations=1, segments=None,
++                          segment_invocations=None):
+         """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's MEASUREMENTS.
+ 
+         The engine's own figures (the cache state, the tokens it evaluated, its prefill and decode time) come from
+@@ -4688,74 +4689,97 @@ class Service:
+         that (Service._seal_telemetry): a request whose response is still being written is never reported as
+         finished, and a request that was refused, cancelled while queued or disconnected still gets exactly ONE
+         terminal receipt.
++
++        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): there is ONE authoritative terminalization
++        path for every native dispatch, and it runs over the SEGMENTS - each segment carries the id of the
++        dispatch that produced it, so every invocation is terminalized on its OWN evidence: its cache
++        measurements, its prefill and decode time, its generated count, its speculative counters, its native
++        finish reason, its terminal state and its partial-segment classification.  The predecessor applied the
++        telemetry suffix of the earlier segments but the POSITIONAL DONE fields only from the last one, so the
++        earlier invocations' work was lost.
+         """
+         if tele is None:
+             return None
+         from serve import reqtelemetry as rt
+         try:
+             engine_figures = (last or {}).get("telemetry") or {}
+-            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): EVERY native invocation's evidence goes
+-            # into ITS OWN receipt.  A DONE line that carries an invocation's id is applied to that invocation's
+-            # receipt; a DONE line without an id (an older engine) goes to the invocation that is running now,
+-            # with the correlation left unavailable - never an asserted join.  A DONE line of an invocation this
+-            # request did not dispatch (a stale one) is refused: it contributes nothing.
+-            if tele is not None and segments:
+-                from serve import reqtelemetry as rt
+-                for segment in list(segments)[:-1]:
+-                    figures = (segment or {}).get("telemetry") or {}
+-                    if not figures:
+-                        continue
+-                    rid = figures.get("rid")
+-                    receipt = tele.invocation_for(rid) if rid else None
+-                    if rid and receipt is None:
+-                        # a receipt of an invocation this request did not dispatch (or of one that is already
+-                        # gone): it is not attached to anything
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): the per-invocation terminalization.
++            # Every segment is terminalized against ITS OWN dispatch: the expected identity comes from the
++            # dispatch boundary (never from the id the engine echoed back), and the receipt is the one that
++            # dispatch bound.  The predecessor applied the telemetry suffix of the earlier segments but the
++            # POSITIONAL DONE fields only from the last one, so the earlier invocations' work was lost.
++            admitted = False
++            receipt = None
++            if segments:
++                pairs = list(zip(list(segments), list(segment_invocations or [])))
++                for index, (segment, dispatched_id) in enumerate(pairs):
++                    segment = segment or {}
++                    figures = segment.get("telemetry") or {}
++                    own = tele.invocation_for(dispatched_id)
++                    if own is None:
++                        # the receipt of that dispatch was dropped: its evidence belongs to nobody and is not
++                        # attached to another invocation's receipt
+                         tele.mark_unavailable("engine_telemetry",
+-                                              "the engine's receipt carried the id of a native invocation this "
+-                                              "request did not dispatch: its measurements were not attached")
++                                              "the native evidence of one of this request's invocations could "
++                                              "not be attached: its receipt is no longer retained")
+                         continue
+-                    rt.apply_engine(tele, figures, receipt=receipt,
+-                                    expected_invocation_id=rid or tele.engine_invocation_id,
+-                                    native_segment_only=bool((segment or {}).get("native_segment_only")))
++                    verdict = rt.apply_engine(tele, figures, receipt=own,
++                                              expected_invocation_id=dispatched_id,
++                                              native_segment_only=bool(segment.get("native_segment_only")))
++                    if verdict.get("admitted"):
++                        admitted = True
++                        # the positional DONE fields belong to THIS invocation (C3): the prefill and the decode
++                        # it measured, the tokens it generated and the drafts it offered and accepted
++                        if segment.get("prompt_ms") is not None:
++                            own.set_timing("prefill_wall", float(segment["prompt_ms"]), "native_engine")
++                        if segment.get("decode_ms") is not None:
++                            own.set_timing("decode_wall", float(segment["decode_ms"]), "native_engine")
++                        own.set_generation(generated=segment.get("generated"),
++                                           draft_tokens=segment.get("drafts_offered"),
++                                           accepted_tokens=segment.get("drafts_accepted"))
++                    # the NATIVE finish reason of this invocation (D4): it is not the physical HTTP finish reason
++                    if segment.get("finish") is not None:
++                        own.set_generation(finish_reason=str(segment["finish"]))
++                    # the invocation's own terminal state (D4): the last dispatch of the request ends with the
++                    # request's own outcome; an earlier one ended because it was continued.
++                    own.state = "completed" if index < len(pairs) - 1 else _native_terminal_state(finish)
++                    if segment.get("native_segment_only"):
++                        own.native_partial = True
++                    own.seal()
++                    receipt = own
++                    tele._sync_parent()
+             # AMENDMENT-02 (G2/A2): the receipt is bound to the native INVOCATION.  When it does not match the
+             # invocation this request dispatched, NOT ONE of its numbers is applied - not even the positional DONE
+             # fields outside the telemetry suffix - and the request says it had an instrumentation error.
+-            verdict = rt.apply_engine(tele, engine_figures, expected_invocation_id=tele.engine_invocation_id,
+-                                      native_segment_only=bool((last or {}).get("native_segment_only")))
+-            admitted = bool(verdict.get("admitted"))
+-            if admitted and (last or {}).get("native_segment_only"):
+-                # the receipt of this invocation is the partial one (A9); the record says so too
+-                tele.mark_unavailable("cache",
+-                                      "the engine's batch slot reported only its admission segment: the native "
+-                                      "accounting is not the whole invocation")
+-            # the engine's own clock: the prefill and the decode it measured
+-            # AMENDMENT-03 (G1): they belong to the INVOCATION that measured them.
+-            receipt = tele.invocation_for(tele.engine_invocation_id)
+-            if receipt is None and tele.invocations:
+-                receipt = tele.invocations[-1]
+-            if admitted and last and last.get("prompt_ms") is not None:
+-                if receipt is not None:
+-                    receipt.set_timing("prefill_wall", float(last["prompt_ms"]), "native_engine")
+-                else:
++            if not segments:
++                verdict = rt.apply_engine(tele, engine_figures, expected_invocation_id=tele.engine_invocation_id,
++                                          native_segment_only=bool((last or {}).get("native_segment_only")))
++                admitted = bool(verdict.get("admitted"))
++                if admitted and (last or {}).get("native_segment_only"):
++                    # the receipt of this invocation is the partial one (A9); the record says so too
++                    tele.mark_unavailable("cache",
++                                          "the engine's batch slot reported only its admission segment: the native "
++                                          "accounting is not the whole invocation")
++            # the receipt of the LAST dispatch: the one the request's own outcome belongs to
++            if receipt is None:
++                receipt = tele.invocation_for(tele.engine_invocation_id)
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): there is NO fallback to the last retained
++            # receipt.  The receipt of THIS invocation is the one the dispatch bound; if it is not there (it was
++            # dropped), the measurement belongs to nobody and stays unapplied - it is never attributed to
++            # another invocation's receipt.
++            #
++            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3): the positional DONE fields were already
++            # applied to EACH invocation's own receipt above.  What is left here is the REQUEST's own fallback
++            # for the case where no invocation owns the evidence at all (an engine that echoed no id).
++            if admitted and receipt is None and last:
++                if last.get("prompt_ms") is not None:
+                     tele.set_timing("prefill_wall", float(last["prompt_ms"]), "native_engine")
+-            if admitted and last and last.get("decode_ms") is not None:
+-                if receipt is not None:
+-                    receipt.set_timing("decode_wall", float(last["decode_ms"]), "native_engine")
+-                else:
++                if last.get("decode_ms") is not None:
+                     tele.set_timing("decode_wall", float(last["decode_ms"]), "native_engine")
+             # the prompt: what the engine was given.  The RENDERED count was measured where the template was
+             # rendered (Service.prepare) - it is a different number and it is not copied from this one.
+             if submitted is not None:
+                 tele.set_prompt_tokens(submitted=submitted)
+-            # the generation: the engine's own count and what the client actually received - two different numbers
+-            engine_generated = last.get("generated") if (last and admitted) else None
+-            drafts_offered = last.get("drafts_offered") if (last and admitted) else None
+-            drafts_accepted = last.get("drafts_accepted") if (last and admitted) else None
+-            # AMENDMENT-03 (G1): the engine's generation counters belong to the INVOCATION that produced them.
+-            if receipt is not None:
+-                receipt.set_generation(generated=engine_generated, draft_tokens=drafts_offered,
+-                                       accepted_tokens=drafts_accepted)
+-                tele._sync_parent()
+             tele.set_generation(finish_reason=finish)
+             # AMENDMENT-02 (A3): the EMITTED tokens are not the generated ones.  The generation loop counts the
+             # tokens the engine produced; the response is transformed (the reasoning, the tool calls and the stop
+@@ -5523,6 +5547,10 @@ class Service:
+         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
+         # so the generated reasoning must not become this request's cached input (#615).
+         segments = []
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): the invocation id each segment belongs to.
++        # The segment is bound to the dispatch that produced it - the DISPATCH boundary is the authority, never
++        # the id the engine echoed back - so every native invocation is terminalized on its own.
++        segment_invocations = []
+         trace = getattr(self.request_trace, "record", None)
+         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01: this request's telemetry record.  The HTTP layer made it (it knows
+         # the API and the client's own request id); this thread picks it up.  A request that did not come through the
+@@ -5649,6 +5677,17 @@ class Service:
+                             receipt = tele.invocation_for(invocation_id)
+                             if receipt is not None:
+                                 receipt.submitted_tokens = len(prompt)
++                                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the DOMAIN is not the
++                                # prompt's LENGTH - two different prompts of the same length are different domains,
++                                # and two invocations of the SAME prompt are the same domain.  The dispatch boundary
++                                # knows which: the first dispatch carries the request's own prompt, a continuation
++                                # carries the request's prompt plus what was generated, and a recovery carries
++                                # another prompt.  The domain is NAMED here (no prompt content, no prompt hash) and
++                                # it is what the coverage is computed from.
++                                receipt.prompt_domain = _prompt_domain(prompt, ids)
++                                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the effective output
++                                # budget of THIS dispatch is the budget the dispatch was given, not the request's.
++                                receipt.set_generation(requested_max=max_new, effective_max=max(0, max_new - n))
+                             dispatch_ordinal += 1
+                         if hasattr(self.engine, "set_request_id"):
+                             # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G6): with the telemetry off the
+@@ -5775,6 +5814,8 @@ class Service:
+                             segment_done = getattr(self.engine, "last", None)
+                             if segment_done is not None and segment_done is not segment_before:
+                                 segments.append(dict(segment_done))
++                                # the segment belongs to the dispatch that produced it
++                                segment_invocations.append(invocation_id)
+                         if nonfinite and not cancel.is_set():
+                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
+                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
+@@ -5909,7 +5950,8 @@ class Service:
+                             # passing it here would overwrite the real measurement with the whole request time.
+                             self._finish_telemetry(tele, last, seen, len(ids), n, finish, started,
+                                                    first_token_s=first_token_s, invocations=len(segments),
+-                                                   segments=segments)
++                                                   segments=segments,
++                                                   segment_invocations=segment_invocations)
+                             self.history.append({
+                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
+                                 if loaded else None,
+@@ -6051,6 +6093,48 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
+                if last.get("drafts_offered") is not None else {})}
+ 
+ 
++def _prompt_domain(prompt, request_ids):
++    """The NAME of the prompt domain this dispatch carried (C4).
++
++    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the prompt's LENGTH is not its identity - two
++    different prompts of the same length are two domains, and the same prompt dispatched twice is ONE domain.
++    The dispatch boundary is the authority: it knows whether the prompt it sends is the request's own prompt, a
++    CONTINUATION of it (the request's prompt plus what the engine already generated) or a RECOVERY prompt (a
++    different prompt the server built).
++
++    No prompt content and no prompt hash is used or published: only a WORD.  The domain of the request's own
++    prompt is named by the request's own id - so two invocations of the SAME prompt share it, and a continuation
++    or a recovery carries its own name.
++    """
++    ids = request_ids or []
++    if not ids:
++        return "unknown"
++    if len(prompt) == len(ids) and list(prompt[:len(ids)]) == list(ids):
++        return "request"
++    # a continuation: the request's prompt plus what was generated
++    if len(prompt) > len(ids) and list(prompt[:len(ids)]) == list(ids):
++        return "continuation"
++    # a recovery prompt (or any other prompt the server built): its own domain
++    return "other"
++
++
++def _native_terminal_state(finish):
++    """The terminal state of the LAST native invocation of a request, from the request's own outcome.
++
++    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D4): the invocation's terminal state is not invented: it
++    follows the outcome the request really had.  A request that was cancelled, disconnected or that failed ends
++    its last invocation the same way - and an invocation whose telemetry never arrived is NOT presented as
++    running.
++    """
++    if finish in (None, "completed", "stop", "length"):
++        return "completed"
++    if finish in ("cancel", "cancelled", "disconnect"):
++        return "cancelled"
++    if finish in ("error", "failed"):
++        return "failed"
++    return "completed"
++
++
+ def request_stats(segments: list[dict]) -> dict:
+     """Keep input/cache accounting at the original API boundary and total native work across continuations."""
+     if not segments:
 diff --git a/serve/test_reqtelemetry.py b/serve/test_reqtelemetry.py
-index f92b7995..e73bd9c5 100644
+index f92b7995..d0400e8a 100644
 --- a/serve/test_reqtelemetry.py
 +++ b/serve/test_reqtelemetry.py
-@@ -433,6 +433,207 @@ class Evidence(unittest.TestCase):
+@@ -424,15 +424,222 @@ class Evidence(unittest.TestCase):
+                        "emitted_tokens", "speculative_draft_tokens", "speculative_accepted_tokens",
+                        "unavailable_fields", "timing_authority", "first_token_includes_reasoning",
+                        "native_correlation", "native_partial", "measurement_valid", "aggregate_eligible",
++                       # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the completeness of the correlation
++                       "native_correlation_complete",
+                        "accounting", "schema_version", "seq",
+                        # AMENDMENT-03 (G1, G2): the per-invocation receipts and the per-metric admission
+                        "invocation_id", "ordinal", "invocations", "admission", "invocation_count",
+-                       "invocations_dispatched", "invocations_dropped", "invocation_bytes"}
++                       "invocations_dispatched", "invocations_dropped", "invocation_bytes",
++                       # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D5): the dropped bytes
++                       "invocation_dropped_bytes",
++                       # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the prompt DOMAIN of a dispatch
++                       "domain"}
+             for section in record.values():
+                 if isinstance(section, dict):
                      for key in section:
                          self.assertIn(key, allowed)
  
@@ -316,3 +1899,289 @@ index f92b7995..e73bd9c5 100644
      def test_the_queue_is_bounded_and_drops_are_counted(self):
          import tempfile
          with tempfile.TemporaryDirectory() as folder:
+diff --git a/serve/test_telemetry_amendment03.py b/serve/test_telemetry_amendment03.py
+index 23afe5c0..3f8672d7 100644
+--- a/serve/test_telemetry_amendment03.py
++++ b/serve/test_telemetry_amendment03.py
+@@ -320,9 +320,12 @@ class MetricAdmission(unittest.TestCase):
+         invocation = new_invocation_id()
+         record.begin_invocation(invocation, ordinal=1)
+         record.invocation_for(invocation).submitted_tokens = 100
+-        # the engine did not echo the id: the correlation is unavailable, never an asserted join
++        # the engine did not echo the id: the correlation is unavailable, never an asserted join.
++        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): the receipt is the one this request
++        # DISPATCHED - the terminal evidence never creates a dispatch, so the uncorrelated duration is measured
++        # on a receipt that really exists, and it must still not be observed.
+         apply_engine(record, {"matched": 90, "reused": 90, "evaluated": 10, "lookup_ms": 1234.0},
+-                     expected_invocation_id=new_invocation_id())
++                     expected_invocation_id=invocation)
+         store.add(record.seal("completed", 200))
+         histograms = store.summary()["histograms"]
+         self.assertEqual(histograms.get("cache_lookup_duration", {}).get("count", 0), 0)
+diff --git a/serve/web/telemetry.html b/serve/web/telemetry.html
+index dfe1667e..8c284ea3 100644
+--- a/serve/web/telemetry.html
++++ b/serve/web/telemetry.html
+@@ -36,7 +36,7 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
+ <input id="filter-client" aria-label="Client request id" placeholder="Client request id">
+ <button id="more" hidden>Older</button></div></div>
+ <div class="workspace"><div class="table-wrap"><table class="st-table">
+-<thead><tr><th>Received</th><th>Request</th><th>Status</th><th>Model</th><th class="num">Slot</th><th class="num" title="Prompt tokens rendered and submitted">Rendered</th><th class="num" title="Prompt tokens submitted to the engine">Submitted</th><th class="num" title="The contiguous token prefix that matched a cached sequence">Matched</th><th class="num" title="The prefix whose execution state was really reused">Reused</th><th class="num" title="Prompt positions the engine evaluated">Evaluated</th><th class="num" title="Evaluated positions that were previously processed material">Replayed</th><th>Cache</th><th class="num" title="How long the engine read the prompt">Prefill</th><th class="num" title="Prefill throughput: the prompt positions the engine evaluated per second of prefill time">Prefill t/s</th><th class="num" title="Time to the first token the client saw">TTFT</th><th class="num">Decode t/s</th><th>Finish</th></tr></thead>
++<thead><tr><th>Received</th><th>Request</th><th>Status</th><th>Model</th><th class="num">Slot</th><th class="num" title="Prompt tokens rendered and submitted">Rendered</th><th class="num" title="Prompt tokens submitted to the engine">Submitted</th><th class="num" title="The contiguous token prefix that matched a cached sequence">Matched</th><th class="num" title="The prefix whose execution state was really reused">Reused</th><th class="num" title="Prompt positions the engine evaluated">Evaluated</th><th class="num" title="Evaluated positions that were previously processed material">Replayed</th><th>Cache</th><th class="num" title="How long the engine read the prompt">Prefill</th><th class="num" title="Prefill throughput: the prompt positions the engine evaluated per second of prefill time">Prefill t/s</th><th class="num" title="The time to the first content written to the client, measured at the HTTP write boundary (the server cannot know when the client received the bytes)">TTFT</th><th class="num">Decode t/s</th><th>Finish</th></tr></thead>
+ <tbody id="req-body"><tr><td colspan="17" class="muted">No requests yet</td></tr></tbody></table></div>
+ <div class="detail"><div id="no-selection" class="empty"><strong>Inspect a request</strong>Select a request to see its accounting, its cache attribution and its timings.</div>
+ <div id="selection" hidden><div class="detail-title" id="detail-title"></div><div class="muted small" id="detail-sub"></div>
+diff --git a/serve/web/telemetry.js b/serve/web/telemetry.js
+index 03b40ad9..54998757 100644
+--- a/serve/web/telemetry.js
++++ b/serve/web/telemetry.js
+@@ -200,6 +200,12 @@ function renderDetail() {
+   if (!record.identity.engine_instance_id && !record.identity.engine_invocation_id) {
+     add("The engine reported no telemetry for this request: the native figures are unavailable.");
+   }
++  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the loss of an invocation receipt is visible here:
++  // the request's native evidence is incomplete, even when every receipt that survived is verified.
++  const droppedInvocations = (quality.invocations_dropped || 0);
++  if (droppedInvocations) {
++    add(`${droppedInvocations} native invocation receipt(s) did not fit the record's bounds: the request's native evidence is incomplete.`, true);
++  }
+   if (list.children.length) warnings.append(list);
+ 
+   const facts = $("detail-facts");
+@@ -225,6 +231,31 @@ function renderDetail() {
+     ["First divergent token", prompt.first_divergent_token_index === null || prompt.first_divergent_token_index === undefined ? "—" : String(prompt.first_divergent_token_index)],
+   ]) facts.append(fact(label, value));
+ 
++  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the INVOCATION-level evidence is exposed through the
++  // EXISTING inspector - the same facts list, no new page and no new feature.  Every native dispatch of this
++  // request has its own receipt, with its own measurements, its own prompt domain and its own outcome.
++  const invocations = record.invococations || [];
++  for (const invocation of invocations) {
++    const iidentity = invocation.identity || {};
++    const iprompt = invocation.prompt || {};
++    const icache = invocation.cache || {};
++    const igen = invocation.generation || {};
++    const itiming = invocation.timing_ms || {};
++    for (const [label, value] of [
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} state`, invocation.state || "—"],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} id`, iidentity.engine_invocation_id || "—"],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} prompt domain`, iprompt.domain || "—"],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} cache`, icache.disposition || "—"],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} matched`, num(iprompt.matched_prefix_tokens)],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} reused`, num(iprompt.reused_prefix_tokens)],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} evaluated`, num(iprompt.evaluated_tokens)],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} generated`, num(igen.generated_tokens)],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} native finish`, igen.finish_reason || "—"],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} prefill`, ms(itiming.prefill_wall)],
++      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} decode`, ms(itiming.decode_wall)],
++    ]) facts.append(fact(label, value));
++  }
++
+   // The token accounting bar: the reused prefix, the evaluated positions and the replayed part of them.
+   // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G7): a measurement that was NOT taken is not a zero.
+   // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-02 (A7): the arithmetic is in ONE pure function
+diff --git a/tools/test_telemetry_closure01_mutations.py b/tools/test_telemetry_closure01_mutations.py
+new file mode 100644
+index 00000000..0f10e08c
+--- /dev/null
++++ b/tools/test_telemetry_closure01_mutations.py
+@@ -0,0 +1,199 @@
++#!/usr/bin/env python3
++"""tools/test_telemetry_closure01_mutations.py - the non-vacuity witnesses of
++ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C6, D8).
++
++Each witness here reverses ONE correction, IN MEMORY ONLY, and shows that the witness that guards it FAILS
++without the correction.  Nothing is written to the repository's files: the reversal is a patch of the running
++process, and it is undone when the test ends.  No mutation code is left in the production tree.
++
++    python tools/test_telemetry_closure01_mutations.py
++"""
++from __future__ import annotations
++
++import contextlib
++import sys
++import unittest
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from serve.reqtelemetry import accounting, correlation, record, store  # noqa: E402
++from serve.reqtelemetry import invocation as invocation_module  # noqa: E402
++from serve import test_telemetry_closure01 as witnesses  # noqa: E402
++
++
++@contextlib.contextmanager
++def patched(obj, name, replacement):
++    """Replace one attribute for the duration of the block, and put it back afterwards."""
++    old = getattr(obj, name)
++    setattr(obj, name, replacement)
++    try:
++        yield
++    finally:
++        setattr(obj, name, old)
++
++
++def _run_witness(case, name):
++    """Run ONE witness of the closure-01 suite and let its assertion failure through."""
++    case.setUp()
++    try:
++        getattr(case, name)()
++    finally:
++        case.tearDown()
++
++
++class Mutations(unittest.TestCase):
++    """Every witness fails when its correction is reversed."""
++
++    def test_an_invalid_duration_is_not_published(self):
++        """INVALID_DURATION_PUBLISHED: the receipt publishes a duration that is not a duration."""
++
++        def publishing(self, name, ms, authority):
++            value = accounting.admit_duration(self, name, ms, field=f"timing_ms.{name}")
++            if value is None:
++                # the reversal: the invalid value is published anyway
++                self.timing[name] = float(ms)
++                self.timing_authority[name] = authority
++                return
++            self.timing[name] = round(float(value), 3)
++            self.timing_authority[name] = authority
++
++        with patched(invocation_module.InvocationReceipt, "set_timing", publishing):
++            case = witnesses.TypedAdmission("test_a_negative_native_duration_is_not_published")
++            with self.assertRaises(AssertionError, msg="the published duration passes the witness"):
++                _run_witness(case, "test_a_negative_native_duration_is_not_published")
++
++    def test_an_invalid_generation_count_is_not_published(self):
++        """INVALID_GENERATION_COUNT_PUBLISHED: the receipt publishes a count that is not a count."""
++
++        def publishing(self, *, requested_max=None, effective_max=None, generated=None, emitted=None,
++                       draft_tokens=None, accepted_tokens=None, finish_reason=None):
++            if generated is not None:
++                self.generated_tokens = generated            # the reversal: no typed admission
++            if finish_reason is not None:
++                self.finish_reason = finish_reason
++
++        with patched(invocation_module.InvocationReceipt, "set_generation", publishing):
++            case = witnesses.TypedAdmission("test_a_negative_generation_count_is_not_published")
++            with self.assertRaises(AssertionError, msg="the published count passes the witness"):
++                _run_witness(case, "test_a_negative_generation_count_is_not_published")
++
++    def test_an_explicitly_unknown_identity_is_not_inherited(self):
++        """EXPLICIT_UNKNOWN_IDENTITY_INHERITED: the preparation identity is substituted for the unknown one."""
++        real = record.RequestRecord.begin_invocation
++
++        def inheriting(self, invocation_id, ordinal=None, engine_instance_id=record.OMITTED, model_id=record.OMITTED,
++                       build_revision=record.OMITTED):
++            # the reversal: an explicitly unknown identity inherits the record's own
++            return real(self, invocation_id, ordinal=ordinal,
++                        engine_instance_id=self.engine_instance_id if engine_instance_id is None else engine_instance_id,
++                        model_id=self.model_id if model_id is None else model_id,
++                        build_revision=self.build_revision if build_revision is None else build_revision)
++
++        with patched(record.RequestRecord, "begin_invocation", inheriting):
++            case = witnesses.DispatchIdentity("test_an_explicitly_unknown_engine_identity_is_not_inherited")
++            with self.assertRaises(AssertionError, msg="the inherited identity passes the witness"):
++                _run_witness(case, "test_an_explicitly_unknown_engine_identity_is_not_inherited")
++
++    def test_the_terminal_evidence_creates_no_dispatch(self):
++        """TERMINAL_RECEIPT_CREATES_DISPATCH: the terminal path creates a dispatch."""
++        real = correlation.apply_engine
++
++        def creating(record_, figures, expected_invocation_id=None, receipt=None, terminal_state="completed",
++                     native_segment_only=False):
++            if receipt is None:
++                receipt = record_.invocation_for(expected_invocation_id)
++            if receipt is None:
++                # the reversal: a new dispatch is created
++                receipt = record_.begin_invocation(expected_invocation_id)
++            return real(record_, figures, expected_invocation_id=expected_invocation_id, receipt=receipt,
++                        terminal_state=terminal_state, native_segment_only=native_segment_only)
++
++        with patched(witnesses, "apply_engine", creating):
++            case = witnesses.DispatchIdentity(
++                "test_the_terminal_evidence_of_an_evicted_invocation_resurrects_nothing")
++            with self.assertRaises(AssertionError, msg="the resurrected receipt passes the witness"):
++                _run_witness(case, "test_the_terminal_evidence_of_an_evicted_invocation_resurrects_nothing")
++
++    def test_a_conflicting_duplicate_is_reported(self):
++        """CONFLICTING_DUPLICATE_TERMINAL_RECEIPT_ACCEPTED: the conflict overwrites the measurements."""
++
++        def always_same(self, matched, reused, evaluated, replayed, work):
++            return True                                    # the reversal: every duplicate looks the same
++
++        with patched(invocation_module.InvocationReceipt, "same_measurements", always_same):
++            case = witnesses.TerminalDuplicates(
++                "test_a_conflicting_duplicate_is_reported_and_keeps_the_accepted_measurements")
++            with self.assertRaises(AssertionError, msg="the accepted conflict passes the witness"):
++                _run_witness(case,
++                             "test_a_conflicting_duplicate_is_reported_and_keeps_the_accepted_measurements")
++
++    def test_the_http_counter_is_not_suppressed(self):
++        """HTTP_COUNTER_SUPPRESSED_BY_NATIVE_ACCOUNTING: the native accounting suppresses the HTTP counter."""
++        real = store.TelemetryStore._count_locked
++
++        def suppressing(self, data):
++            # the reversal: the HTTP counters are counted only when the native accounting is not violated
++            quality = data["measurement_quality"]
++            if (quality.get("accounting") or {}).get("state") == "violated":
++                return
++            return real(self, data)
++
++        with patched(store.TelemetryStore, "_count_locked", suppressing):
++            case = witnesses.HttpAuthority("test_a_broken_native_accounting_does_not_suppress_the_http_counter")
++            with self.assertRaises(AssertionError, msg="the suppressed counter passes the witness"):
++                _run_witness(case, "test_a_broken_native_accounting_does_not_suppress_the_http_counter")
++
++    def test_a_retired_engine_is_not_counted_again(self):
++        """RETIRED_ENGINE_COUNTER_COUNTED_AGAIN: the retired engine's counter domain is forgotten."""
++
++        def forgetting(self, c, instance, evictions):
++            # the reversal: the retired mark is deleted, so the late observation looks like a first one
++            if not instance:
++                c["cache_evictions_unattributed"] += evictions
++                return
++            previous = self._evictions_by_engine.get(instance, 0)
++            if evictions >= previous:
++                c["cache_evictions"] += evictions - previous
++                self._evictions_by_engine[instance] = evictions
++            while len(self._evictions_by_engine) > 64:
++                oldest = next(iter(self._evictions_by_engine))
++                del self._evictions_by_engine[oldest]
++
++        with patched(store.TelemetryStore, "_count_evictions_locked", forgetting):
++            case = witnesses.BoundedAccounting("test_a_retired_engine_is_not_counted_again")
++            with self.assertRaises(AssertionError, msg="the counted-again engine passes the witness"):
++                _run_witness(case, "test_a_retired_engine_is_not_counted_again")
++
++    def test_the_invocation_bytes_are_revalidated(self):
++        """INVOCATION_BYTES_NOT_REVALIDATED: the byte bound is not checked after the terminal measurements."""
++
++        def not_revalidating(self):
++            return                                     # the reversal: the bound is never checked again
++
++        with patched(record.RequestRecord, "revalidate_invocation_bytes", not_revalidating):
++            case = witnesses.BoundedAccounting("test_the_retained_bytes_stay_inside_the_budget")
++            with self.assertRaises(AssertionError, msg="the unbounded receipts pass the witness"):
++                _run_witness(case, "test_the_retained_bytes_stay_inside_the_budget")
++
++    def test_the_dropped_receipts_lower_the_coverage(self):
++        """DROPPED_INVOCATIONS_EXCLUDED_FROM_DENOMINATOR: the dropped receipts are not in the population."""
++        real = store.TelemetryStore._count_locked
++
++        def excluding(self, data):
++            # the reversal: the population is the RETAINED receipts only
++            real(self, data)
++            self.counters["native_invocations_missing"] -= max(
++                0, int((data["measurement_quality"] or {}).get("invocations_dispatched") or 0)
++                - len(data.get("invocations") or []))
++
++        with patched(store.TelemetryStore, "_count_locked", excluding):
++            case = witnesses.Coverage("test_a_dropped_receipt_lowers_the_coverage")
++            with self.assertRaises(AssertionError, msg="the excluded receipts pass the witness"):
++                _run_witness(case, "test_a_dropped_receipt_lowers_the_coverage")
++
++
++if __name__ == "__main__":
++    unittest.main()

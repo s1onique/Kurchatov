@@ -158,3 +158,17 @@ The AMENDMENT-03 architecture, the InvocationReceipt abstraction, the metric-spe
 implementation and the native restoration correction are preserved.  The production semantics, the cache policy
 and the model execution are untouched, and the historical acceptance reports were not rewritten - this package
 is a successor reference to them.
+
+## The review payload
+
+`01-source-only.diff` is the diff the ACT asks for:
+
+```bash
+git diff "$ENTRY_HEAD"..HEAD -- \
+  serve/reqtelemetry serve/server.py serve/prometheus.py serve/web \
+  serve/test_reqtelemetry.py serve/test_telemetry_amendment03.py tools
+```
+
+The new witness file `serve/test_telemetry_closure01.py` lies OUTSIDE those paths, so its diff is published
+beside it as `05-witness-files.diff` (together with the reversals in `tools/`, which are inside the payload
+already).  The historical evidence documents are not in the payload.

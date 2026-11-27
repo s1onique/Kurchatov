@@ -245,12 +245,13 @@ class Mutations(unittest.TestCase):
         real = server_module.Service._finish_telemetry
 
         def overwriting(self, tele, last, seen, submitted, generated, finish, started, emitted=None,
-                        queue_s=None, first_token_s=None, invocations=1, segments=None):
+                        queue_s=None, first_token_s=None, invocations=1, segments=None, **kw):
             if tele is not None:
                 # the defect: the queue wait becomes the time the request spent running
                 tele.set_timing("queue", (_time.perf_counter() - tele.clock) * 1000.0, "http_server")
             return real(self, tele, last, seen, submitted, generated, finish, started, emitted=emitted,
-                        queue_s=queue_s, first_token_s=first_token_s, invocations=invocations, segments=segments)
+                        queue_s=queue_s, first_token_s=first_token_s, invocations=invocations, segments=segments,
+                        **kw)
 
         with patched(server_module.Service, "_finish_telemetry", overwriting):
             case = HttpWitnesses("test_the_queue_wait_is_the_wait_and_not_the_whole_request")
@@ -265,12 +266,13 @@ class Mutations(unittest.TestCase):
         real = server_module.Service._finish_telemetry
 
         def misattributing(self, tele, last, seen, submitted, generated, finish, started, emitted=None,
-                           queue_s=None, first_token_s=None, invocations=1, segments=None):
+                           queue_s=None, first_token_s=None, invocations=1, segments=None, **kw):
             if tele is not None and first_token_s is not None:
                 # the defect: the service's observation is published as the HTTP first-content time
                 tele.set_timing("http_first_token", float(first_token_s) * 1000.0, "http_server")
             return real(self, tele, last, seen, submitted, generated, finish, started, emitted=emitted,
-                        queue_s=queue_s, first_token_s=first_token_s, invocations=invocations, segments=segments)
+                        queue_s=queue_s, first_token_s=first_token_s, invocations=invocations, segments=segments,
+                        **kw)
 
         with patched(server_module.Service, "_finish_telemetry", misattributing):
             case = HttpWitnesses("test_the_first_content_is_timed_at_the_write_boundary")
