@@ -8,7 +8,12 @@ from __future__ import annotations
 # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the record contract changed INCOMPATIBLY - the
 # per-invocation receipts are a new section and the parent's native scalars are null when the request dispatched
 # more than one native invocation - so the contract is versioned up.
-SCHEMA_VERSION = "strata.request-telemetry/2"
+#
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5c): the corrections made it incompatible
+# AGAIN - the per-invocation receipts gained required fields and the record gained two - so the contract is
+# versioned up once more.  The historical strata.request-telemetry/2 contract is preserved (serve/reqtelemetry/
+# schema.py: SCHEMA_V2, docs/telemetry/strata-request-telemetry-2.schema.json).
+SCHEMA_VERSION = "strata.request-telemetry/3"
 
 # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-03 (G1): the bounds of the per-invocation history.  They are
 # a COUNT and a BYTE budget, and a receipt that does not fit is counted as a loss - never dropped silently.

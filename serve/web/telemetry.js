@@ -96,12 +96,11 @@ function renderStatus(status, summary) {
   // ACT-...-AMENDMENT-03 (G2c): the coverage names the population it covers.  The accounting's population is the
   // NATIVE INVOCATION whose accounting closed; the physical HTTP request's own coverage is published beside it.
   const reuse = summary.cache_reuse || {};
-  const ratio = reuse.ratio;
-  $("reuse-ratio").textContent = typeof ratio === "number" ? `${(ratio * 100).toFixed(1)}%` : "—";
-  const coverage = typeof reuse.coverage === "number" ? `${(reuse.coverage * 100).toFixed(0)}%` : "—";
-  $("reuse-detail").textContent = ratio === null || ratio === undefined
-    ? "no request has a complete reuse accounting yet"
-    : `${num(reuse.reused_tokens)} of ${num(reuse.submitted_tokens)} tokens reused · ${num(reuse.eligible_invocations)} of ${num(reuse.invocations)} native invocations accounted for (${coverage}) · ${num(reuse.requests_with_complete_accounting)} of ${num(reuse.requests)} requests`;
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A6): the coverage line is built by the PURE
+  // function of serve/web/telemetry_accounting.js, so the page and its witness cannot drift apart.  The
+  // populations it names are the corrected ones (A1): the dispatched native invocations and the physical
+  // requests that reached a terminal outcome.
+  $("#reuse-detail").textContent = reuseCoverageLine(reuse);
 }
 
 function renderTable() {
@@ -234,27 +233,11 @@ function renderDetail() {
   // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D6): the INVOCATION-level evidence is exposed through the
   // EXISTING inspector - the same facts list, no new page and no new feature.  Every native dispatch of this
   // request has its own receipt, with its own measurements, its own prompt domain and its own outcome.
-  const invocations = record.invococations || [];
-  for (const invocation of invocations) {
-    const iidentity = invocation.identity || {};
-    const iprompt = invocation.prompt || {};
-    const icache = invocation.cache || {};
-    const igen = invocation.generation || {};
-    const itiming = invocation.timing_ms || {};
-    for (const [label, value] of [
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} state`, invocation.state || "—"],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} id`, iidentity.engine_invocation_id || "—"],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} prompt domain`, iprompt.domain || "—"],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} cache`, icache.disposition || "—"],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} matched`, num(iprompt.matched_prefix_tokens)],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} reused`, num(iprompt.reused_prefix_tokens)],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} evaluated`, num(iprompt.evaluated_tokens)],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} generated`, num(igen.generated_tokens)],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} native finish`, igen.finish_reason || "—"],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} prefill`, ms(itiming.prefill_wall)],
-      [`Invocation ${iidentity.ordinal === null || iidentity.ordinal === undefined ? "?" : iidentity.ordinal} decode`, ms(itiming.decode_wall)],
-    ]) facts.append(fact(label, value));
-  }
+  //
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A6): the facts are built by the PURE function
+  // of serve/web/telemetry_accounting.js, so the inspector and its witness cannot drift apart.  The record property
+  // is the invocations array - the receipts of the native dispatches of this request.
+  for (const [label, value] of invocationFacts(record)) facts.append(fact(label, value));
 
   // The token accounting bar: the reused prefix, the evaluated positions and the replayed part of them.
   // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-AMENDMENT-01 (G7): a measurement that was NOT taken is not a zero.

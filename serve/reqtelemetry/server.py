@@ -77,11 +77,23 @@ class ServerTelemetry:
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the record is passed, so the outcome is counted
         # exactly once - the store's own `add` does not count it again.
         self.store.end_request(state, record)
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A1): the native DISPATCH population is
+        # counted HERE, at the terminal boundary and BEFORE the receipt is sealed.  The population of the native
+        # invocations is the number of dispatches, and it must not depend on the receipt's storage: a request whose
+        # terminal receipt is lost (a failed seal, a failed serialization, a failed store) keeps its dispatches in
+        # the population, so the coverage falls instead of the population shrinking.
+        dispatched = self.store.count_dispatch_population(record)
+        counted_before = self.store.native_counters_snapshot()
         try:
             record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
             data = self.store.add(record)
         except Exception:                   # noqa: BLE001 - a receipt that cannot be sealed is a lost receipt, not a
-            self.store.receipt_failed()      # lost request: the terminal outcome above still stands
+            # lost request: the terminal outcome above still stands.  The dispatches of this request are still
+            # real work: they stay in the population and they are counted as MISSING evidence (A1).
+            accounted, missing = self.store.native_counters_snapshot()
+            already = (accounted - counted_before[0]) + (missing - counted_before[1])
+            self.store.count_unaccounted_dispatches(max(0, dispatched - already))
+            self.store.receipt_failed()
             raise
         if self.evidence is not None:
             # AMENDMENT-03 (G5): the loss of the evidence delivery is visible on its own: the receipt is in the

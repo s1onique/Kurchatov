@@ -61,6 +61,14 @@ class InvocationReceipt:
         # been ACCEPTED.  A second terminal receipt is then a duplicate: the same one is ignored, a conflicting one
         # is reported - and the accepted measurements are never overwritten.
         self.terminal_accepted = False
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): the ACCEPTED terminal evidence, as
+        # it arrived.  It is the snapshot a second terminal receipt is compared with - the complete normalized
+        # evidence, not five prompt counters.  It is committed ONCE and never changed.
+        self.terminal_evidence = None
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3c): a COMPATIBILITY receipt - one that
+        # was constructed without a dispatch.  It is explicit, and it is outside the authoritative native admission:
+        # only an ACTUAL dispatch contributes to the dispatched population.
+        self.synthetic = False
         # the engine sent a measurement that is not a measurement (AMENDMENT-02, G1)
         self.measurements_invalid = False
         # the native figures cover one segment of the invocation only (AMENDMENT-02, A9)
@@ -313,6 +321,13 @@ class InvocationReceipt:
                 "timing_authority": dict(sorted(self.timing_authority.items())),
                 "native_correlation": self.correlation,
                 "native_partial": self.native_partial,
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): whether this invocation's
+                # terminal evidence was ACCEPTED.  A second terminal receipt is a duplicate against it.
+                "terminal_accepted": bool(self.terminal_accepted),
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3c): a compatibility receipt was
+                # constructed without a dispatch: it is not native evidence and it is not admitted to the native
+                # aggregates.
+                "compatibility_receipt": bool(self.synthetic),
                 "measurement_valid": self.measurement_valid(),
                 "accounting": {"state": self.accounting.get("state", "unevaluated"),
                                "valid": self.accounting.get("valid"),

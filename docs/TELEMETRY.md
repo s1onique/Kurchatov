@@ -23,7 +23,7 @@ One record per **physical request attempt**. Two requests that carry the same `X
 
 ```json
 {
-  "schema_version": "strata.request-telemetry/2",
+  "schema_version": "strata.request-telemetry/3",
   "identity": {
     "request_id": "9ca8c311a98448e5a10827dd9cac6b7b",
     "client_request_id": "my-trace-42",
@@ -65,7 +65,9 @@ One record per **physical request attempt**. Two requests that carry the same `X
 }
 ```
 
-The schema is [`docs/telemetry/strata-request-telemetry-2.schema.json`](telemetry/strata-request-telemetry-2.schema.json)
+The schema is [`docs/telemetry/strata-request-telemetry-3.schema.json`](telemetry/strata-request-telemetry-3.schema.json).
+The historical contract is kept beside it:
+[`docs/telemetry/strata-request-telemetry-2.schema.json`](telemetry/strata-request-telemetry-2.schema.json)
 (JSON Schema draft 2020-12). It is checked by an executable test, so the contract on the wire and the contract in
 the code cannot drift apart.
 
@@ -477,6 +479,30 @@ The second review found measurement and attribution defects, not an architecture
 | the native terminal error | a bare `ERR`, the evidence lost | the ERR line carries the telemetry the engine did measure, so the failed request keeps its correlated partial evidence |
 | the browser's bar | the denominator was `reused + evaluated`; an unknown replay became a zero | the denominator is the submitted prompt, the positions nobody accounted for are shown, an unknown replay is not a measured zero, and a broken accounting gets no bar |
 | the batch slot | the admission segment's figures were published as the invocation's | the record says the figures cover one segment, and they stay out of the authoritative totals |
+
+## The corrections of ACT-...-CLOSURE-01-AMENDMENT-01
+
+The review of the closure found population, attribution and evidence defects. What changed:
+
+| Where | Before | Now |
+|---|---|---|
+| the native dispatch population | it was counted from the receipts that were **stored**: a lost terminal receipt removed the whole invocation population | it is counted at the terminal boundary, **before** the receipt is sealed: a failed seal, a failed serialization or a failed store lowers the coverage instead of shrinking the population; a request that is still running is not in it yet |
+| the request's own prompt coverage | the positions of every invocation of the request's prompt domain were **summed** | the coverage is counted once: when several dispatches carried the request's own prompt, the request-level coverage is **unavailable** (the cumulative native work is counted instead, and the request says so) |
+| the unknown prompt domain | an unnamed domain was admitted as the request's own when the lengths agreed | the length fallback is gone: only the **dispatch boundary** names a domain, and an unnamed one is never the request's own |
+| the duplicate terminal receipt | five prompt counters were compared | the **complete** normalized terminal evidence is compared - the cache figures, the durations, the positional DONE fields, the generation counters, the partial classification, the native finish reason and the native terminal state |
+| the accepted terminal receipt | a foreign or a conflicting duplicate changed it | the snapshot is committed **once**; a duplicate never updates a measurement, and the conflict is reported beside it |
+| the native outcome | it was taken from the request's HTTP outcome | it is the **native dispatch's** own outcome: an invocation that failed stays failed when the request recovers, and one that completed stays completed when the HTTP delivery fails |
+| the compatibility receipt | a receipt built without a dispatch could enter the native coverage | it is explicit and outside the authoritative admission: only an **actual dispatch** contributes to the dispatched population |
+| the engine's eviction counter | a forgotten engine identity looked like a new one, and its whole counter was counted again | a bounded membership filter remembers that an identity was **ever** seen: a forgotten one is refused (its exact delta cannot be recovered) and the attribution loss is published |
+| the evidence writer | it wrote `{"x":NaN}` | it refuses a record JSON cannot represent, through the existing serialization-refusal domain |
+| the telemetry's HTTP boundary | it could write a bare `NaN` | the boundary is strict: a non-finite value is refused and the answer is a proper JSON error |
+| a discarded sole invocation | the parent kept the stale mirrored measurements | the parent's mirrored native fields are cleared; the HTTP-owned fields stay |
+| the wire contract | the incompatible corrections were published under the v2 identity | the historical `strata.request-telemetry/2` contract is preserved and the corrected one has its own identity: `strata.request-telemetry/3` |
+| the browser's inspector | the invocation facts were built inside the page | they are built by a pure function (`serve/web/telemetry_accounting.js`), so the inspector and its witness cannot drift apart |
+
+The witnesses are `serve/test_telemetry_amendment01.py`, the reversals are
+`tools/test_telemetry_amendment01_mutations.py`, and the browser's inspector is checked by
+`tools/test_telemetry_web_inspector.py`.
 
 ## See also
 

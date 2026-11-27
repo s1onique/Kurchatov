@@ -184,6 +184,7 @@ class InvocationOwnership(unittest.TestCase):
         record = RequestRecord("r1")
         invocation = new_invocation_id()
         record.begin_invocation(invocation, ordinal=1)
+        record.invocation_for(invocation).prompt_domain = "request"
         figures = {"rid": invocation, "matched": 40, "reused": 40, "evaluated": 60, "work": 60}
         apply_engine(record, figures, expected_invocation_id=invocation)
         apply_engine(record, figures, expected_invocation_id=invocation)      # the same receipt, twice
@@ -247,11 +248,15 @@ class InvocationOwnership(unittest.TestCase):
         first = new_invocation_id()
         record.begin_invocation(first, ordinal=1)
         record.invocation_for(first).submitted_tokens = 100
+        # the dispatch boundary names the domain: the first dispatch carried the request's own prompt
+        record.invocation_for(first).prompt_domain = "request"
         apply_engine(record, {"rid": first, "matched": 100, "reused": 100, "evaluated": 0, "work": 0},
                      expected_invocation_id=first)
         second = new_invocation_id()
         record.begin_invocation(second, ordinal=2)
         record.invocation_for(second).submitted_tokens = 40          # the recovery sent another prompt
+        # and the dispatch boundary names ITS domain: not the request's own prompt
+        record.invocation_for(second).prompt_domain = "other"
         apply_engine(record, {"rid": second, "matched": 40, "reused": 0, "evaluated": 40, "work": 40},
                      expected_invocation_id=second)
         store.add(record.seal("completed", 200))
@@ -284,6 +289,10 @@ class MetricAdmission(unittest.TestCase):
         invocation = new_invocation_id()
         record.begin_invocation(invocation, ordinal=1)
         record.invocation_for(invocation).submitted_tokens = submitted
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A2): the DISPATCH BOUNDARY names the
+        # prompt domain (a word, never a hash): without a name the invocation is not the request's own prompt
+        # domain and it does not enter the request's prompt coverage.
+        record.invocation_for(invocation).prompt_domain = "request"
         figures = dict(figures)
         figures["rid"] = invocation
         apply_engine(record, figures, expected_invocation_id=invocation, **kw)
@@ -403,6 +412,9 @@ class MetricAdmission(unittest.TestCase):
         invocation = new_invocation_id()
         record.begin_invocation(invocation, ordinal=1)
         record.invocation_for(invocation).submitted_tokens = 100
+        # ACT-...-AMENDMENT-01 (A2): the dispatch boundary names the prompt domain.  Without a name the
+        # invocation is not the request's own prompt domain, and the request-level coverage is unavailable.
+        record.invocation_for(invocation).prompt_domain = "request"
         apply_engine(record, {"rid": invocation, "matched": 90, "reused": 90, "evaluated": 10},
                      expected_invocation_id=invocation)
         store.add(record.seal("completed", 200))

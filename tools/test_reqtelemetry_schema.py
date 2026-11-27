@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from serve.reqtelemetry import SCHEMA, RequestRecord, ServerTelemetry, validate  # noqa: E402
+from serve.reqtelemetry.schema import SCHEMA_V2, SCHEMA_V3  # noqa: E402
 
 
 def main() -> int:
@@ -31,8 +32,19 @@ def main() -> int:
             failures.append(what)
 
     # 1. the schema on disk IS the schema in the code
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5c): BOTH contracts are on disk and both
+    # are the ones the code uses: the historical strata.request-telemetry/2 and the current
+    # strata.request-telemetry/3.  The historical one was restored: the incompatible corrections belong to the new
+    # identity, not to the old one.
     on_disk = json.loads((ROOT / "docs/telemetry/strata-request-telemetry-2.schema.json").read_text())
-    check(on_disk == SCHEMA, "the schema file and the code's schema are the same contract")
+    check(on_disk == SCHEMA_V2, "the historical v2 schema file and the code's v2 schema are the same contract")
+    on_disk_v3 = json.loads((ROOT / "docs/telemetry/strata-request-telemetry-3.schema.json").read_text())
+    check(on_disk_v3 == SCHEMA_V3, "the v3 schema file and the code's v3 schema are the same contract")
+    check(SCHEMA is SCHEMA_V3, "the default schema is the current (v3) contract")
+    check(SCHEMA_V2["properties"]["schema_version"] == {"const": "strata.request-telemetry/2"},
+          "the historical contract keeps its own identity")
+    check(SCHEMA_V3["properties"]["schema_version"] == {"const": "strata.request-telemetry/3"},
+          "the current contract has its own identity")
 
     # 2. a record the server produces validates
     tel = ServerTelemetry()
@@ -58,6 +70,17 @@ def main() -> int:
     broken = json.loads(json.dumps(data))
     broken["extra_section"] = {}
     check(validate(broken), "a record with an unknown section is rejected")
+
+    # 4. the HISTORICAL fixture validates against the historical contract (A5c), and NOT against the current one
+    fixture = ROOT / "serve/fixtures/telemetry/record-v2.json"
+    if fixture.exists():
+        historical = json.loads(fixture.read_text())
+        check(not validate(historical, SCHEMA_V2),
+              f"the historical record validates against the v2 contract: {validate(historical, SCHEMA_V2)}")
+        check(validate(historical, SCHEMA_V3),
+              "the historical record does NOT validate against the current contract: the versions are separate")
+    else:
+        check(False, "the historical fixture is missing")
 
     if failures:
         for what in failures:

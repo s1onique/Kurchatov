@@ -424,6 +424,13 @@ class RequestRecord:
                                     engine_instance_id=self.engine_instance_id,
                                     model_id=self.model_id,
                                     build_revision=self.build_revision)
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3c): the receipt is EXPLICITLY a
+        # compatibility receipt: it was constructed without a dispatch, so it is not native evidence, it does not
+        # enter the dispatched population and it is not admitted to the native aggregates.
+        receipt.synthetic = True
+        self.mark_unavailable("invocations",
+                              "a compatibility invocation receipt was constructed without a native dispatch: it "
+                              "is not native evidence and it does not enter the native coverage")
         self._add_receipt(receipt)
         return receipt
 
@@ -523,6 +530,13 @@ class RequestRecord:
         if self.invocations_total <= 1:
             if len(self.invocations) == 1:
                 self._mirror_receipt(self.invocations[0])
+            elif self.invocations_total == 1:
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5b): the request's SOLE
+                # invocation receipt was DISCARDED.  The parent's mirrored native measurements - the token
+                # positions, the cache disposition, the native durations and the native eligibility - are then
+                # STALE: they describe a receipt the record does not hold.  They are cleared.  The HTTP-owned
+                # fields (the submitted prompt, the queue wait, the total) are not the receipt's and they stay.
+                self._clear_native_fields()
             self._merge_unavailable()
             return
         self._clear_native_fields()

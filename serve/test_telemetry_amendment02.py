@@ -102,8 +102,15 @@ class Admission(unittest.TestCase):
         for reused in (0, 50, 100):
             record = RequestRecord(f"r{store.seq + 1}")
             record.set_prompt_tokens(rendered=100, submitted=100)
-            apply_engine(record, {"rid": record.request_id, "matched": reused, "reused": reused,
-                                  "evaluated": 100 - reused})
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3c): the PRODUCTION path - the
+            # request DISPATCHED the invocation, and the dispatch boundary named its prompt domain.  A
+            # compatibility receipt (one built without a dispatch) is not native evidence and it does not enter
+            # the native aggregates.
+            invocation = new_invocation_id()
+            record.begin_invocation(invocation, ordinal=1)
+            record.invocation_for(invocation).prompt_domain = "request"
+            apply_engine(record, {"rid": invocation, "matched": reused, "reused": reused,
+                                  "evaluated": 100 - reused}, expected_invocation_id=invocation)
             store.add(record.seal("completed", 200))
         reuse = store.summary()["cache_reuse"]
         self.assertGreaterEqual(reuse["ratio"], 0.0)
@@ -188,7 +195,12 @@ class Monotonicity(unittest.TestCase):
             # per instance; an engine whose identity is unknown is not merged into a domain (it is published as
             # unattributed instead - see test_telemetry_amendment03).
             record.engine_instance_id = "engine-a"
-            apply_engine(record, {"rid": record.request_id, "evictions": evictions})
+            # ACT-...-AMENDMENT-01 (A3c): the PRODUCTION dispatch boundary (a compatibility receipt is not native
+            # evidence and it does not enter the native aggregates).
+            invocation = new_invocation_id()
+            record.begin_invocation(invocation, ordinal=1)
+            apply_engine(record, {"rid": invocation, "evictions": evictions},
+                         expected_invocation_id=invocation)
             store.add(record.seal("completed", 200))
             seen.append(store.summary()["counters"]["cache_evictions"])
         self.assertEqual(seen, [10, 10, 11])
@@ -199,7 +211,11 @@ class Monotonicity(unittest.TestCase):
         for instance, evictions in (("engine-a", 10), ("engine-b", 3), ("engine-a", 12)):
             record = RequestRecord(f"r{store.seq + 1}")
             record.engine_instance_id = instance
-            apply_engine(record, {"rid": record.request_id, "evictions": evictions})
+            # ACT-...-AMENDMENT-01 (A3c): the PRODUCTION dispatch boundary.
+            invocation = new_invocation_id()
+            record.begin_invocation(invocation, ordinal=1)
+            apply_engine(record, {"rid": invocation, "evictions": evictions},
+                         expected_invocation_id=invocation)
             store.add(record.seal("completed", 200))
         self.assertEqual(store.summary()["counters"]["cache_evictions"], 15)
 

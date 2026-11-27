@@ -51,4 +51,57 @@ function accountingBarParts(prompt, quality) {
   }
   return { parts, notes, complete: true, state, total };
 }
-if (typeof module !== "undefined" && module.exports) module.exports = { accountingBarParts };
+// ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A6): the INVOCATION inspector's facts and the
+// coverage line are pure functions too, so a test can run them (tools/test_telemetry_web_inspector.py) and the
+// page and the test cannot drift apart.
+//
+// A measurement that was NOT taken is shown as unavailable ("—"), never as a zero: 0 is a measured zero.
+function telemetryNum(n) { return (typeof n === "number" && isFinite(n)) ? n.toLocaleString() : "—"; }
+function telemetryMs(n) {
+  return (typeof n === "number" && isFinite(n))
+    ? (n >= 1000 ? `${(n / 1000).toFixed(2)} s` : `${n.toFixed(0)} ms`) : "—";
+}
+
+// The per-invocation facts of ONE record: every native dispatch of the request, with its own identity, its own
+// prompt domain, its own cache attribution, its own native outcome and its own measurements.
+function invocationFacts(record) {
+  const facts = [];
+  const invocations = (record && record.invocations) || [];
+  for (const invocation of invocations) {
+    const iidentity = invocation.identity || {};
+    const iprompt = invocation.prompt || {};
+    const icache = invocation.cache || {};
+    const igen = invocation.generation || {};
+    const itiming = invocation.timing_ms || {};
+    const ordinal = (iidentity.ordinal === null || iidentity.ordinal === undefined) ? "?" : iidentity.ordinal;
+    facts.push([`Invocation ${ordinal} state`, invocation.state || "—"]);
+    facts.push([`Invocation ${ordinal} id`, iidentity.engine_invocation_id || "—"]);
+    facts.push([`Invocation ${ordinal} prompt domain`, iprompt.domain || "—"]);
+    facts.push([`Invocation ${ordinal} cache`, icache.disposition || "—"]);
+    facts.push([`Invocation ${ordinal} matched`, telemetryNum(iprompt.matched_prefix_tokens)]);
+    facts.push([`Invocation ${ordinal} reused`, telemetryNum(iprompt.reused_prefix_tokens)]);
+    facts.push([`Invocation ${ordinal} evaluated`, telemetryNum(iprompt.evaluated_tokens)]);
+    facts.push([`Invocation ${ordinal} generated`, telemetryNum(igen.generated_tokens)]);
+    facts.push([`Invocation ${ordinal} native finish`, igen.finish_reason || "—"]);
+    facts.push([`Invocation ${ordinal} prefill`, telemetryMs(itiming.prefill_wall)]);
+    facts.push([`Invocation ${ordinal} decode`, telemetryMs(itiming.decode_wall)]);
+  }
+  return facts;
+}
+
+// The coverage line of the summary.  ACT-...-AMENDMENT-01 (A1): the populations it names are the CORRECTED ones -
+// the dispatched native invocations (not the receipts that were kept) and the physical requests that reached a
+// terminal outcome (not the receipts that were stored).
+function reuseCoverageLine(reuse) {
+  const r = reuse || {};
+  const ratio = r.ratio;
+  if (ratio === null || ratio === undefined) return "no request has a complete reuse accounting yet";
+  const coverage = (typeof r.coverage === "number") ? `${(r.coverage * 100).toFixed(0)}%` : "—";
+  return `${telemetryNum(r.reused_tokens)} of ${telemetryNum(r.submitted_tokens)} tokens reused · `
+    + `${telemetryNum(r.eligible_invocations)} of ${telemetryNum(r.invocations)} native invocations accounted for (${coverage}) · `
+    + `${telemetryNum(r.requests_with_complete_accounting)} of ${telemetryNum(r.requests)} requests`;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { accountingBarParts, invocationFacts, reuseCoverageLine, telemetryNum, telemetryMs };
+}

@@ -2,11 +2,27 @@
 
 The schema on the wire and the schema in the code are the same contract: docs/telemetry/ holds the file, and
 tools/test_reqtelemetry_schema.py checks that the file and this SCHEMA are identical.
+
+ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5c): the CLOSURE-01 corrections made the wire
+contract INCOMPATIBLE - the per-invocation receipts gained required fields (the prompt's domain, the native finish
+reason, the "unknown" terminal state) and the record gained two fields - but they were published under the v2
+identity.  A historical v2 record would no longer validate against the v2 schema, and a current record would
+validate against a schema that had never described it.
+
+The historical contract is PRESERVED here as SCHEMA_V2 (it is still exported, still on disk and still checked),
+and the corrected contract has its OWN identity: strata.request-telemetry/3 (SCHEMA_V3, the default SCHEMA).  No
+migration framework and no new endpoint: a record says which contract it speaks.
 """
 from __future__ import annotations
 
+import copy
+
 from serve.reqtelemetry.vocabulary import (CLIENT_ID_MAX, COMPLETE, DISPOSITIONS, INSTRUMENTATION_ERROR, PARTIAL,
                                          SCHEMA_VERSION, SOURCES, STATES, UNSUPPORTED)
+
+# the HISTORICAL contract (strata.request-telemetry/2) and the CURRENT one (strata.request-telemetry/3)
+SCHEMA_VERSION_V2 = "strata.request-telemetry/2"
+SCHEMA_VERSION_V3 = "strata.request-telemetry/3"
 
 def _int_or_null():
     return {"type": ["integer", "null"], "minimum": 0}
@@ -248,6 +264,12 @@ SCHEMA["properties"]["invocations"] = {
                     "timing_authority": {"type": "object", "additionalProperties": {"type": "string"}},
                     "native_correlation": {"enum": ["verified", "unavailable", "rejected", "not_applicable"]},
                     "native_partial": {"type": "boolean"},
+                    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a, A3c): whether this
+                    # invocation's terminal evidence was ACCEPTED (a second terminal receipt is a duplicate against
+                    # it), and whether this receipt is a COMPATIBILITY receipt - one that was constructed without a
+                    # native dispatch, and that is therefore not native evidence.
+                    "terminal_accepted": {"type": "boolean"},
+                    "compatibility_receipt": {"type": "boolean"},
                     "measurement_valid": {"type": "boolean"},
                     "accounting": SCHEMA["properties"]["measurement_quality"]["properties"]["accounting"],
                     "admission": {"type": "object", "additionalProperties": {"type": "boolean"}},
@@ -256,6 +278,43 @@ SCHEMA["properties"]["invocations"] = {
         },
     },
 }
+
+
+# ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5c): the CURRENT contract is the corrected
+# one, and it has its OWN identity.  The historical v2 contract is preserved below, exactly as it was published.
+SCHEMA_V3 = SCHEMA
+SCHEMA = SCHEMA_V3
+
+
+def _historical_v2() -> dict:
+    """The HISTORICAL strata.request-telemetry/2 contract, exactly as it was published (A5c).
+
+    It is the schema of the records that were written before the incompatible corrections: the per-invocation
+    receipts had no prompt domain and no native finish reason, the invocation's state could not be "unknown", and
+    the record had no "native_correlation_complete" and no "invocation_dropped_bytes".  A historical record
+    validates against it; a current record does not - that is what a version is for.
+    """
+    schema = copy.deepcopy(SCHEMA_V3)
+    schema["$id"] = "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-2.json"
+    schema["properties"]["schema_version"] = {"const": SCHEMA_VERSION_V2}
+    quality = schema["properties"]["measurement_quality"]["properties"]
+    quality.pop("native_correlation_complete", None)
+    quality.pop("invocation_dropped_bytes", None)
+    invocation = schema["properties"]["invocations"]["items"]
+    invocation["properties"]["state"]["enum"] = ["running", "completed", "cancelled", "failed", "rejected"]
+    prompt = invocation["properties"]["prompt"]
+    prompt["required"] = [name for name in prompt["required"] if name != "domain"]
+    prompt["properties"].pop("domain", None)
+    generation = invocation["properties"]["generation"]
+    generation["required"] = [name for name in generation["required"] if name != "finish_reason"]
+    generation["properties"].pop("finish_reason", None)
+    invocation_quality = invocation["properties"]["measurement_quality"]["properties"]
+    invocation_quality.pop("terminal_accepted", None)
+    invocation_quality.pop("compatibility_receipt", None)
+    return schema
+
+
+SCHEMA_V2 = _historical_v2()
 
 
 def validate(record: dict, schema: dict | None = None) -> list:

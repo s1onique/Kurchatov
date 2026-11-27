@@ -95,6 +95,10 @@ def _record_with_evidence(invocation, figures, submitted=100, **kw):
     rec.set_prompt_tokens(rendered=submitted, submitted=submitted)
     rec.begin_invocation(invocation, ordinal=1)
     rec.invocation_for(invocation).submitted_tokens = submitted
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A2): the DISPATCH BOUNDARY names the prompt
+    # domain.  Without a name the invocation is not the request's own prompt domain, and it does not enter the
+    # request's prompt coverage.
+    rec.invocation_for(invocation).prompt_domain = "request"
     figures = dict(figures)
     figures["rid"] = invocation
     apply_engine(rec, figures, expected_invocation_id=invocation, **kw)
@@ -271,6 +275,7 @@ class TerminalDuplicates(unittest.TestCase):
         figures = {"rid": invocation_id, "matched": 40, "reused": 40, "evaluated": 60, "work": 60}
         rec = RequestRecord("r1")
         rec.begin_invocation(invocation_id, ordinal=1)
+        rec.invocation_for(invocation_id).prompt_domain = "request"
         apply_engine(rec, figures, expected_invocation_id=invocation_id)
         store = TelemetryStore()
         apply_engine(rec, dict(figures), expected_invocation_id=invocation_id)

@@ -1,0 +1,155 @@
+{
+  "schema_version": "strata.request-telemetry/2",
+  "identity": {
+    "request_id": "r1",
+    "client_request_id": "abc",
+    "engine_instance_id": null,
+    "server_instance_id": null,
+    "engine_invocation_id": "3e2a9fad9eb14298843b4ccec4ac3503",
+    "engine_invocation_ordinal": null,
+    "slot_id": null,
+    "model_id": "m",
+    "build_revision": "b"
+  },
+  "lifecycle": {
+    "state": "completed",
+    "api": "openai",
+    "received_at": 1795749372.259795,
+    "started_at": null,
+    "finished_at": 1795749372.2604392,
+    "http_status": 200,
+    "finish_reason": "stop",
+    "detail": null
+  },
+  "prompt": {
+    "rendered_tokens": 100,
+    "submitted_tokens": 100,
+    "matched_prefix_tokens": 40,
+    "reused_prefix_tokens": 40,
+    "evaluated_tokens": 60,
+    "replayed_tokens": null,
+    "non_prefix_reused_tokens": 0,
+    "evaluation_work_tokens": 60,
+    "first_divergent_token_index": null
+  },
+  "cache": {
+    "source": "unknown",
+    "disposition": "partial_hit",
+    "reason_code": "unknown",
+    "restore_attempted": null,
+    "restore_succeeded": null,
+    "restore_ms": null,
+    "recurrent_state": null,
+    "attention_state": null,
+    "checkpoint_state": null,
+    "invalidations": null,
+    "evictions": null
+  },
+  "timing_ms": {},
+  "invocations": [
+    {
+      "identity": {
+        "engine_invocation_id": "3e2a9fad9eb14298843b4ccec4ac3503",
+        "ordinal": 1,
+        "engine_instance_id": null,
+        "model_id": "m",
+        "build_revision": "b",
+        "slot_id": null
+      },
+      "state": "completed",
+      "prompt": {
+        "rendered_tokens": null,
+        "submitted_tokens": 100,
+        "matched_prefix_tokens": 40,
+        "reused_prefix_tokens": 40,
+        "evaluated_tokens": 60,
+        "replayed_tokens": null,
+        "non_prefix_reused_tokens": 0,
+        "evaluation_work_tokens": 60,
+        "first_divergent_token_index": null
+      },
+      "cache": {
+        "source": "unknown",
+        "disposition": "partial_hit",
+        "reason_code": "unknown",
+        "restore_attempted": null,
+        "restore_succeeded": null,
+        "restore_ms": null,
+        "recurrent_state": null,
+        "attention_state": null,
+        "checkpoint_state": null,
+        "invalidations": null,
+        "evictions": null
+      },
+      "timing_ms": {},
+      "generation": {
+        "requested_max_output_tokens": null,
+        "effective_max_output_tokens": null,
+        "generated_tokens": null,
+        "emitted_tokens": null,
+        "speculative_draft_tokens": null,
+        "speculative_accepted_tokens": null
+      },
+      "measurement_quality": {
+        "state": "complete",
+        "unavailable_fields": {},
+        "timing_authority": {},
+        "native_correlation": "verified",
+        "native_partial": false,
+        "measurement_valid": true,
+        "accounting": {
+          "state": "satisfied",
+          "valid": true,
+          "problems": []
+        },
+        "admission": {
+          "http": true,
+          "native_prompt_position": true,
+          "native_execution_work": true,
+          "native_duration": true,
+          "cache_restore": true,
+          "complete_cache_ratio": true,
+          "partial_diagnostic": true,
+          "native_generation": true
+        }
+      }
+    }
+  ],
+  "generation": {
+    "requested_max_output_tokens": null,
+    "effective_max_output_tokens": null,
+    "generated_tokens": null,
+    "emitted_tokens": null,
+    "speculative_draft_tokens": null,
+    "speculative_accepted_tokens": null
+  },
+  "measurement_quality": {
+    "state": "complete",
+    "unavailable_fields": {},
+    "timing_authority": {},
+    "first_token_includes_reasoning": null,
+    "native_correlation": "verified",
+    "native_partial": false,
+    "measurement_valid": true,
+    "aggregate_eligible": true,
+    "accounting": {
+      "state": "satisfied",
+      "valid": true,
+      "problems": []
+    },
+    "admission": {
+      "http": true,
+      "native_prompt_position": true,
+      "native_execution_work": true,
+      "native_duration": true,
+      "cache_restore": true,
+      "complete_cache_ratio": true,
+      "partial_diagnostic": true,
+      "native_generation": true
+    },
+    "invocation_count": 1,
+    "invocations_dispatched": 1,
+    "invocations_dropped": 0,
+    "invocation_bytes": 1548
+  }
+}

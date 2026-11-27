@@ -27,7 +27,7 @@ from pathlib import Path
 from serve.frontend import ChatTemplate
 from serve.reqtelemetry import (COMPLETE, DISPOSITION_COLD_MISS, DISPOSITION_FULL_HIT, DISPOSITION_PARTIAL_HIT,
                                 MAXIMUM_PAGE_SIZE, PARTIAL, RequestRecord, ServerTelemetry, TelemetryStore,
-                                apply_engine, new_request_id, validate, valid_client_request_id)
+                                apply_engine, new_invocation_id, new_request_id, validate, valid_client_request_id)
 from serve.server import ByteTokenizer, MockEngine, Service, serve
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -271,7 +271,14 @@ class Store(unittest.TestCase):
             r = RequestRecord(f"r{i}")
             # AMENDMENT-02 (G1): the engine's figures arrive through the PRODUCTION path (apply_engine), so the
             # measurements are correlated to the request and enter the authoritative totals.
-            apply_engine(r, {"rid": r.request_id, "matched": 1, "reused": 1, "evaluated": 1})
+            # ACT-...-AMENDMENT-01 (A3c): the request really DISPATCHED the invocation: a compatibility receipt
+            # (one built without a dispatch) is not native evidence and it does not enter the native aggregates.
+            invocation = new_invocation_id()
+            r.begin_invocation(invocation, ordinal=1)
+            # ACT-...-AMENDMENT-01 (A2): the dispatch boundary names the prompt domain.
+            r.invocation_for(invocation).prompt_domain = "request"
+            apply_engine(r, {"rid": invocation, "matched": 1, "reused": 1, "evaluated": 1},
+                         expected_invocation_id=invocation)
             r.seal("completed", 200)
             store.add(r)
         summary = store.summary()

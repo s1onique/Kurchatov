@@ -4725,27 +4725,18 @@ class Service:
                         continue
                     verdict = rt.apply_engine(tele, figures, receipt=own,
                                               expected_invocation_id=dispatched_id,
-                                              native_segment_only=bool(segment.get("native_segment_only")))
+                                              native_segment_only=bool(segment.get("native_segment_only")),
+                                              positional=segment,
+                                              native_state=rt.native_terminal_state(segment.get("finish")))
                     if verdict.get("admitted"):
                         admitted = True
-                        # the positional DONE fields belong to THIS invocation (C3): the prefill and the decode
-                        # it measured, the tokens it generated and the drafts it offered and accepted
-                        if segment.get("prompt_ms") is not None:
-                            own.set_timing("prefill_wall", float(segment["prompt_ms"]), "native_engine")
-                        if segment.get("decode_ms") is not None:
-                            own.set_timing("decode_wall", float(segment["decode_ms"]), "native_engine")
-                        own.set_generation(generated=segment.get("generated"),
-                                           draft_tokens=segment.get("drafts_offered"),
-                                           accepted_tokens=segment.get("drafts_accepted"))
-                    # the NATIVE finish reason of this invocation (D4): it is not the physical HTTP finish reason
-                    if segment.get("finish") is not None:
-                        own.set_generation(finish_reason=str(segment["finish"]))
-                    # the invocation's own terminal state (D4): the last dispatch of the request ends with the
-                    # request's own outcome; an earlier one ended because it was continued.
-                    own.state = "completed" if index < len(pairs) - 1 else _native_terminal_state(finish)
+                    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a, A3b): the positional
+                    # DONE fields, the native finish reason and the invocation's own terminal state are applied
+                    # INSIDE the terminal commit, once, and they are the NATIVE outcome of THIS dispatch.  An
+                    # earlier invocation that failed stays failed when the request recovers, and an invocation that
+                    # completed natively stays completed when the HTTP delivery fails afterwards.
                     if segment.get("native_segment_only"):
                         own.native_partial = True
-                    own.seal()
                     receipt = own
                     tele._sync_parent()
             # AMENDMENT-02 (G2/A2): the receipt is bound to the native INVOCATION.  When it does not match the
@@ -4753,7 +4744,9 @@ class Service:
             # fields outside the telemetry suffix - and the request says it had an instrumentation error.
             if not segments:
                 verdict = rt.apply_engine(tele, engine_figures, expected_invocation_id=tele.engine_invocation_id,
-                                          native_segment_only=bool((last or {}).get("native_segment_only")))
+                                          native_segment_only=bool((last or {}).get("native_segment_only")),
+                                          positional=last or {},
+                                          native_state=rt.native_terminal_state((last or {}).get("finish")))
                 admitted = bool(verdict.get("admitted"))
                 if admitted and (last or {}).get("native_segment_only"):
                     # the receipt of this invocation is the partial one (A9); the record says so too
@@ -5795,7 +5788,8 @@ class Service:
                                 if figures:
                                     from serve import reqtelemetry as rt
                                     rt.apply_engine(tele, figures,
-                                                    expected_invocation_id=tele.engine_invocation_id)
+                                                    expected_invocation_id=tele.engine_invocation_id,
+                                                    native_state="failed")
                             print(f"[strata] the engine reported an error: {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
@@ -6125,6 +6119,10 @@ def _native_terminal_state(finish):
     follows the outcome the request really had.  A request that was cancelled, disconnected or that failed ends
     its last invocation the same way - and an invocation whose telemetry never arrived is NOT presented as
     running.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3b): this helper is NOT the authority
+    anymore: the native outcome of a dispatch is the dispatch's OWN (serve/reqtelemetry/correlation.py:
+    native_terminal_state).  The function stays for the callers that ask about the REQUEST's outcome.
     """
     if finish in (None, "completed", "stop", "length"):
         return "completed"
@@ -6885,6 +6883,17 @@ def make_handler(svc: Service):
                     code, body = svc.telemetry_api(path, query)
                 except ValueError as e:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5a): the telemetry's HTTP
+                # boundary is STRICT.  A value JSON cannot represent (a NaN, an infinity) is REFUSED here, and
+                # the refusal is a proper JSON answer: the body never carries a bare NaN or Infinity, which no
+                # strict JSON reader accepts.
+                try:
+                    json.dumps(body, ensure_ascii=False, allow_nan=False)
+                except (TypeError, ValueError) as e:
+                    self._json(500, {"error": {"type": "telemetry_serialization_error",
+                                               "message": f"the telemetry cannot be written as JSON: {e}"}},
+                               headers={"Cache-Control": "no-store"})
                     return
                 # a request-level diagnostic must not be cached by a proxy or a browser
                 self._json(code, body, headers={"Cache-Control": "no-store"})

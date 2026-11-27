@@ -89,8 +89,85 @@ def _counter(value):
     return value
 
 
+def normalize_terminal_evidence(figures: dict | None, positional: dict | None = None) -> dict:
+    """The COMPLETE, NORMALIZED terminal evidence of ONE native dispatch (A3a).
+
+    It is the evidence AS IT ARRIVED - not as it was applied - so that a second terminal receipt can be compared
+    with the accepted one field by field.  It covers the cache figures, the durations, the POSITIONAL DONE fields,
+    the generation counters, the partial classification, the native finish reason, the native terminal state and
+    the id the engine echoed.  Five prompt counters are not a terminal evidence: a duplicate that changed a
+    duration, a generation count, the restoration's outcome or the native outcome is a CONFLICT.
+    """
+    figures = figures or {}
+    positional = positional or {}
+    return {
+        "rid": figures.get("rid"),
+        "cache": {key: figures.get(key) for key in
+                  ("matched", "reused", "evaluated", "replayed", "work", "divergent", "cache_source",
+                   "cache_reason", "restore", "restore_ms", "invalidations", "evictions", "slot")},
+        "timing_ms": {"cache_lookup": figures.get("lookup_ms"),
+                      "cache_restore": figures.get("restore_ms")},
+        "position": {"prompt_ms": positional.get("prompt_ms"),
+                     "decode_ms": positional.get("decode_ms")},
+        "generation": {"generated": positional.get("generated"),
+                       "drafts_offered": positional.get("drafts_offered"),
+                       "drafts_accepted": positional.get("drafts_accepted"),
+                       "finish_reason": positional.get("finish")},
+        "partial": bool(positional.get("native_segment_only")),
+        "state": positional.get("native_state"),
+    }
+
+
+def native_terminal_state(finish) -> str:
+    """The terminal outcome of ONE native dispatch, from ITS OWN evidence (A3b).
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3b): the native outcome is the NATIVE
+    dispatch's own, never the physical HTTP request's.  An invocation that failed stays failed when the request
+    recovers; an invocation that completed natively stays completed when the HTTP delivery fails afterwards.  An
+    outcome that is not known stays unknown - it is never taken from the request's outcome or from the position of
+    the dispatch in a list.
+    """
+    if finish is None:
+        return "unknown"
+    if finish in ("completed", "stop", "length"):
+        return "completed"
+    if finish in ("cancel", "cancelled", "disconnect"):
+        return "cancelled"
+    if finish in ("error", "failed", "nonfinite"):
+        return "failed"
+    return "unknown"
+
+
+def _duplicate_verdict(record: RequestRecord, receipt, incoming: dict, expected):
+    """A SECOND terminal receipt for an invocation whose terminal evidence was already ACCEPTED (A3a).
+
+    The accepted snapshot is NOT touched: no measurement is updated, the correlation is not changed and the
+    positional measurements are not reapplied.  An identical duplicate is ignored; a conflicting or a foreign one
+    is reported as explicit instrumentation evidence.
+    """
+    accepted = receipt.terminal_evidence or {}
+    if incoming == accepted:
+        # the SAME evidence, seen twice: nothing is updated, nothing is counted twice
+        return {"correlation": receipt.correlation, "admitted": receipt.correlation == CORRELATION_VERIFIED,
+                "duplicate": True}
+    rid = incoming.get("rid")
+    foreign = rid is not None and expected is not None and rid != expected
+    if foreign:
+        reason = ("a second terminal receipt for this invocation carried ANOTHER invocation's id: the accepted "
+                  "terminal evidence was kept and the foreign receipt was not attached")
+    else:
+        reason = ("a second terminal receipt for this invocation carried DIFFERENT terminal evidence: the "
+                  "accepted evidence was kept and the conflict is reported")
+    receipt.mark_unavailable("engine_telemetry", reason, INSTRUMENTATION_ERROR)
+    record.mark_unavailable("engine_telemetry", reason, INSTRUMENTATION_ERROR)
+    record.native_correlation = record.aggregate_correlation()
+    record._sync_parent()
+    return {"correlation": receipt.correlation, "admitted": False, "conflict": True, "foreign": foreign}
+
+
 def apply_engine(record: RequestRecord, figures: dict | None, expected_invocation_id: str | None = None,
-                 receipt=None, terminal_state: str = "completed", native_segment_only: bool = False):
+                 receipt=None, terminal_state: str = "completed", native_segment_only: bool = False,
+                 positional: dict | None = None, native_state: str | None = None):
     """The engine's own measurements for ONE native invocation, into ITS receipt (AMENDMENT-03, G1).
 
     `figures` is the `telemetry` part of the engine's DONE line: what the engine measured about the cache and about
@@ -143,6 +220,15 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
             return {"correlation": CORRELATION_REJECTED, "admitted": False}
         # the compatibility path: a caller that never went through the dispatch boundary
         receipt = record.adopt_legacy_invocation(expected)
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): the incoming evidence, normalized.
+    # It is built BEFORE anything is applied, so the comparison below cannot be influenced by an application.
+    incoming = normalize_terminal_evidence(figures, positional)
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): an ACCEPTED terminal receipt is never
+    # silently overwritten.  The comparison is the COMPLETE evidence, and it happens BEFORE any measurement is
+    # applied: an identical duplicate performs no update at all, a conflicting or a foreign one keeps the accepted
+    # snapshot and is reported.
+    if receipt.terminal_accepted:
+        return _duplicate_verdict(record, receipt, incoming, expected)
     if not figures:
         receipt.correlation = CORRELATION_UNAVAILABLE
         receipt.mark_unavailable("cache", "the engine reported no cache measurements for this invocation")
@@ -193,24 +279,9 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
     replayed = _admit(receipt, "replayed_tokens", figures.get("replayed"))
     work = _admit(receipt, "evaluation_work_tokens", figures.get("work"))
 
-    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C3, D4): an ALREADY ACCEPTED terminal receipt is never
-    # silently overwritten.  A duplicate that carries the SAME measurements is ignored (idempotently): it does
-    # not cause additional work accounting.  A duplicate that carries DIFFERENT measurements is a CONFLICT: the
-    # receipt keeps its accepted measurements, and the conflict is reported as explicit instrumentation evidence.
-    if receipt.terminal_accepted:
-        if receipt.same_measurements(matched, reused, evaluated, replayed, work):
-            return {"correlation": receipt.correlation, "admitted": receipt.correlation == CORRELATION_VERIFIED,
-                    "duplicate": True}
-        receipt.mark_unavailable("engine_telemetry",
-                                 "a second terminal receipt for this invocation carried DIFFERENT measurements: "
-                                 "the accepted ones were kept and the conflict is reported",
-                                 INSTRUMENTATION_ERROR)
-        record.mark_unavailable("engine_telemetry",
-                                "a second terminal receipt for this invocation carried DIFFERENT measurements: "
-                                "the accepted ones were kept and the conflict is reported", INSTRUMENTATION_ERROR)
-        record.native_correlation = record.aggregate_correlation()
-        record._sync_parent()
-        return {"correlation": receipt.correlation, "admitted": False, "conflict": True}
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): the duplicate comparison itself now
+    # happens ABOVE, before any measurement is applied - it compares the COMPLETE normalized terminal evidence
+    # with the accepted snapshot, not five prompt counters.
 
     # The engine writes the divergent index as: a position (0 or more), -1 for "the sequences agree throughout"
     # and -2 for "not measured".  The receipt's field is null in both of those cases - there is no mismatch to
@@ -257,8 +328,26 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
     # single-dispatch request.
     if receipt.submitted_tokens is None:
         receipt.submitted_tokens = record.submitted_tokens
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): the POSITIONAL DONE fields and the
+    # native finish reason are part of THIS terminal evidence, and they are applied inside the commit - once, and
+    # only when the receipt is correlated to this invocation.
+    if positional:
+        if receipt.correlation == CORRELATION_VERIFIED:
+            if positional.get("prompt_ms") is not None:
+                receipt.set_timing("prefill_wall", float(positional["prompt_ms"]), "native_engine")
+            if positional.get("decode_ms") is not None:
+                receipt.set_timing("decode_wall", float(positional["decode_ms"]), "native_engine")
+            receipt.set_generation(generated=positional.get("generated"),
+                                   draft_tokens=positional.get("drafts_offered"),
+                                   accepted_tokens=positional.get("drafts_accepted"))
+        if positional.get("finish") is not None:
+            receipt.set_generation(finish_reason=str(positional["finish"]))
     # AMENDMENT-03 (G1): the invocation's own terminal state, and its own partial flag
-    receipt.state = terminal_state
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3b): the state is the NATIVE outcome of
+    # THIS dispatch.  Uncorrelated evidence does not establish one: the receipt stays "running" and the record's
+    # seal turns it into "unknown" (never "completed", never "failed").
+    if receipt.correlation == CORRELATION_VERIFIED:
+        receipt.state = native_state if native_state is not None else terminal_state
     if native_segment_only:
         receipt.native_partial = True
         receipt.mark_unavailable("cache",
@@ -269,6 +358,9 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
     # ACCEPTED.  A second terminal receipt for it is a duplicate: the same one is ignored, a conflicting one is
     # reported as explicit instrumentation evidence, and neither overwrites these measurements.
     receipt.terminal_accepted = True
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): the IMMUTABLE snapshot.  It is
+    # committed once, here, and it is what a later duplicate is compared with.
+    receipt.terminal_evidence = incoming
     # the parent's fields are the single invocation's; with more than one invocation they stay null (ambiguous)
     record.native_correlation = record.aggregate_correlation()
     record._sync_parent()

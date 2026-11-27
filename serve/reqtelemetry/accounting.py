@@ -390,6 +390,11 @@ def invocation_admission(inv, metric: str) -> bool:
     """
     if metric == METRIC_PARTIAL_DIAGNOSTIC:
         return True
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3c): a COMPATIBILITY receipt - one that was
+    # constructed without a native dispatch - is not native evidence.  It is admitted to nothing: only an ACTUAL
+    # dispatch contributes to the dispatched population and to the native aggregates.
+    if getattr(inv, "synthetic", False):
+        return False
     verified = correlation_of(inv) == CORRELATION_VERIFIED
     # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D1): the validity is CLASS-AWARE: an invalid duration
     # does not exclude the valid token counts, and an invalid count does not exclude the valid durations.  The

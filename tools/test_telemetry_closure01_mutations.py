@@ -120,10 +120,11 @@ class Mutations(unittest.TestCase):
     def test_a_conflicting_duplicate_is_reported(self):
         """CONFLICTING_DUPLICATE_TERMINAL_RECEIPT_ACCEPTED: the conflict overwrites the measurements."""
 
-        def always_same(self, matched, reused, evaluated, replayed, work):
-            return True                                    # the reversal: every duplicate looks the same
+        def always_same(figures, positional=None):
+            # the reversal: every duplicate looks the same, so a conflicting one is never noticed
+            return {"the same": True}
 
-        with patched(invocation_module.InvocationReceipt, "same_measurements", always_same):
+        with patched(correlation, "normalize_terminal_evidence", always_same):
             case = witnesses.TerminalDuplicates(
                 "test_a_conflicting_duplicate_is_reported_and_keeps_the_accepted_measurements")
             with self.assertRaises(AssertionError, msg="the accepted conflict passes the witness"):

@@ -32,7 +32,7 @@ if str(ROOT) not in sys.path:
 from serve import prometheus  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.reqtelemetry import (DURATION_BUCKETS, INSTRUMENTATION_ERROR, PARTIAL, RequestRecord,  # noqa: E402
-                                ServerTelemetry, TelemetryStore, apply_engine, encode_cursor)
+                                ServerTelemetry, TelemetryStore, apply_engine, encode_cursor, new_invocation_id)
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 CTX = 4096
@@ -200,8 +200,14 @@ class HistogramIntegrity(unittest.TestCase):
         for reused, submitted in ((40, 100), (60, 100)):
             record = RequestRecord(f"r{store.seq + 1}")
             record.set_prompt_tokens(rendered=submitted, submitted=submitted)
-            apply_engine(record, {"rid": record.request_id, "matched": reused, "reused": reused,
-                                  "evaluated": submitted - reused, "work": submitted - reused})
+            # ACT-...-AMENDMENT-01 (A3c): the PRODUCTION dispatch boundary - a compatibility receipt is not native
+            # evidence and it does not enter the native aggregates.
+            invocation = new_invocation_id()
+            record.begin_invocation(invocation, ordinal=1)
+            record.invocation_for(invocation).prompt_domain = "request"
+            apply_engine(record, {"rid": invocation, "matched": reused, "reused": reused,
+                                  "evaluated": submitted - reused, "work": submitted - reused},
+                         expected_invocation_id=invocation)
             store.add(record.seal("completed", 200))
         summary = store.summary()
         reuse = summary["cache_reuse"]
