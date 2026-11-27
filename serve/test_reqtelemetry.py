@@ -433,6 +433,207 @@ class Evidence(unittest.TestCase):
                     for key in section:
                         self.assertIn(key, allowed)
 
+    def test_a_write_that_races_the_shutdown_is_refused_at_the_enqueue(self):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C1): the acceptance boundary is the ENQUEUE.
+
+        The record is serialized OUTSIDE the writer's lock, so a submission can be inside the serializer while
+        the writer is closed.  When the serialization is released, the record must be REFUSED at the enqueue - it
+        must never be accepted into a queue no worker writes any more.  The barriers are deterministic: no sleep.
+        """
+        import threading
+        import tempfile
+        from serve.reqtelemetry import evidence as evidence_module
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "evidence.jsonl"
+            log = evidence_module.EvidenceLog(path)
+
+            # the barrier: the record's serialization blocks until the test releases it
+            serializing = threading.Event()
+            release = threading.Event()
+            real_dumps = json.dumps
+
+            class _Json:
+                @staticmethod
+                def dumps(obj, *args, **kwargs):
+                    serializing.set()
+                    release.wait(10)
+                    return real_dumps(obj, *args, **kwargs)
+
+            result = {}
+
+            def produce():
+                result["write_result"] = log.write({"request_id": "r1", "note": "тест"})
+
+            original_json = evidence_module.json
+            evidence_module.json = _Json
+            try:
+                producer = threading.Thread(target=produce, name="telemetry-producer")
+                producer.start()
+                self.assertTrue(serializing.wait(10), "the serialization never started")
+                # the writer's own counters WHILE the serialization is in progress (D7): the submission has
+                # entered, it is neither accepted nor refused yet
+                during = log.counters()
+                self.assertEqual(during["submitted_records"], 1)
+                self.assertEqual(during["accepted_records"], 0)
+                self.assertEqual(during["refused_records"], 0)
+                # the writer is closed while the record is still being serialized
+                log.close()
+                self.assertIsNotNone(log._thread)
+                self.assertFalse(log._thread.is_alive(), "the worker did not terminate")
+                # now the serialization is released: the record reaches the enqueue
+                release.set()
+                producer.join(10)
+                self.assertFalse(producer.is_alive(), "the producer did not finish")
+            finally:
+                evidence_module.json = original_json
+                release.set()
+                log.close()
+
+            counters = log.counters()
+            self.assertFalse(result["write_result"], "the raced write was accepted")
+            self.assertEqual(counters["accepted_records"], 0)
+            self.assertEqual(counters["shutdown_refusals"], 1)
+            self.assertEqual(counters["outstanding_records"], 0)
+            self.assertEqual(counters["refused_records"], 1)
+            self.assertEqual(counters.get("pending_records", 0), 0)
+            self.assertEqual(counters["submitted_records"],
+                             counters["accepted_records"] + counters["refused_records"])
+            # nothing was written: the refused record never reached the disk
+            self.assertEqual(path.read_text().strip(), "")
+
+    def test_the_writer_counters_hold_while_a_serialization_is_in_progress(self):
+        """ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D7): the counter domains are exact.
+
+        A submission that is being serialized has ENTERED but is not RESOLVED: it is neither an accepted record
+        nor a refused one.  The published identity therefore is
+
+            submitted = accepted + refused + pending        (at every moment)
+            submitted = accepted + refused                  (at quiescence)
+
+        and the in-progress serialization is published as its own domain, apart from the accepted writer work.
+        """
+        import threading
+        import tempfile
+        from serve.reqtelemetry import evidence as evidence_module
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "evidence.jsonl"
+            log = evidence_module.EvidenceLog(path)
+            serializing = threading.Event()
+            release = threading.Event()
+            real_dumps = json.dumps
+
+            class _Json:
+                @staticmethod
+                def dumps(obj, *args, **kwargs):
+                    serializing.set()
+                    release.wait(10)
+                    return real_dumps(obj, *args, **kwargs)
+
+            original_json = evidence_module.json
+            evidence_module.json = _Json
+            try:
+                producer = threading.Thread(target=lambda: log.write({"a": 1}))
+                producer.start()
+                self.assertTrue(serializing.wait(10))
+                during = log.counters()
+                self.assertEqual(during["submitted_records"], 1)
+                self.assertEqual(during["pending_records"], 1)
+                self.assertEqual(during["accepted_records"], 0)
+                self.assertEqual(during["refused_records"], 0)
+                self.assertEqual(during["resolved_records"], 0)
+                self.assertEqual(during["outstanding_records"], 0)
+                self.assertEqual(during["submitted_records"],
+                                 during["accepted_records"] + during["refused_records"]
+                                 + during["pending_records"])
+                release.set()
+                producer.join(10)
+            finally:
+                evidence_module.json = original_json
+                release.set()
+                log.close()
+            after = log.counters()
+            self.assertEqual(after["pending_records"], 0)
+            self.assertEqual(after["accepted_records"], 1)
+            self.assertEqual(after["submitted_records"],
+                             after["accepted_records"] + after["refused_records"])
+            # the accepted-record write-failure counter is its own domain, not the legacy mixed one
+            self.assertIn("write_failures", after)
+            self.assertEqual(after["write_failures"], 0)
+
+    def test_the_shutdown_witness_fails_without_the_enqueue_recheck(self):
+        """C6: the same witness, with the enqueue-time recheck removed, must FAIL.
+
+        The reversal is in memory only (the production tree is untouched): the writer is patched so that the
+        enqueue does not revalidate the closed state, and the raced write is accepted - the witness above is
+        not vacuous.
+        """
+        import threading
+        import tempfile
+        from serve.reqtelemetry import evidence as evidence_module
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "evidence.jsonl"
+            log = evidence_module.EvidenceLog(path)
+            serializing = threading.Event()
+            release = threading.Event()
+            real_dumps = json.dumps
+
+            class _Json:
+                @staticmethod
+                def dumps(obj, *args, **kwargs):
+                    serializing.set()
+                    release.wait(10)
+                    return real_dumps(obj, *args, **kwargs)
+
+            # WRITER_CLOSE_RECHECK_REMOVED: the enqueue does not look at the closed state any more
+            def write_without_recheck(self, record):
+                with self.lock:
+                    self.submitted += 1
+                    self.pending += 1
+                try:
+                    # the patched module's serializer: it blocks on the same barrier
+                    line = (evidence_module.json.dumps(record, ensure_ascii=False,
+                                                       separators=(",", ":")) + "\n").encode("utf-8")
+                except (TypeError, ValueError):
+                    with self.lock:
+                        self.pending -= 1
+                        self.serialization_refusals += 1
+                        self.refused += 1
+                    return False
+                with self.lock:
+                    self.pending -= 1
+                    self.queue.append(line)
+                    self.queue_size_bytes += len(line)
+                    self.outstanding_records += 1
+                    self.outstanding_bytes += len(line)
+                    self.accepted += 1
+                return True
+
+            result = {}
+            original_json = evidence_module.json
+            original_write = evidence_module.EvidenceLog.write
+            evidence_module.json = _Json
+            evidence_module.EvidenceLog.write = write_without_recheck
+            try:
+                producer = threading.Thread(target=lambda: result.update(write_result=log.write({"a": 1})))
+                producer.start()
+                self.assertTrue(serializing.wait(10))
+                log.close()
+                release.set()
+                producer.join(10)
+            finally:
+                evidence_module.json = original_json
+                evidence_module.EvidenceLog.write = original_write
+                release.set()
+                log.close()
+            counters = log.counters()
+            # the reversed writer ACCEPTS the raced record: the witness is not vacuous
+            self.assertTrue(result["write_result"])
+            self.assertEqual(counters["accepted_records"], 1)
+            self.assertEqual(counters["shutdown_refusals"], 0)
+
     def test_the_queue_is_bounded_and_drops_are_counted(self):
         import tempfile
         with tempfile.TemporaryDirectory() as folder:

@@ -49,6 +49,10 @@ class EvidenceLog:
         # serialization, the capacity or the shutdown), never in the accepted one.  The outstanding records are
         # what the writer still holds: the QUEUED ones AND the ones it has DETACHED and is writing.
         self.submitted = 0
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D7): the submissions that have ENTERED but are not
+        # RESOLVED yet - the ones whose record is being serialized right now.  They are their own domain: they
+        # are neither accepted records nor refused ones, and they are not the writer's outstanding work either.
+        self.pending = 0
         self.accepted = 0
         self.written = 0
         self.failed = 0                  # accepted records that failed while they were written
@@ -92,10 +96,25 @@ class EvidenceLog:
         detached and is writing.  The old check (`len(queue) + writing`) left the detached records out, so the
         writer could hold more records than its own limit said.
         """
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C1, D7): the acceptance boundary is the ENQUEUE, not
+        # the first look at the state.  The check below is only the fast path: the record is serialized OUTSIDE
+        # the lock (a slow serializer must not block the worker), and the lock is taken AGAIN to enqueue.  Every
+        # acceptance condition is revalidated UNDER THAT SECOND LOCK, so a submission that raced the shutdown
+        # while it was being serialized is refused there - it is never accepted into a queue nobody writes any
+        # more.
+        #
+        # The counter domains follow from that: `submitted` counts the submissions that ENTERED, `pending` the
+        # ones that are being serialized right now, and `accepted` / `refused` the RESOLVED ones.  So
+        #
+        #     submitted = accepted + refused + pending        (at every moment)
+        #     submitted = accepted + refused                  (at quiescence)
+        #     accepted  = written + failed + outstanding      (at every moment)
         with self.lock:
             self.submitted += 1
+            self.pending += 1
             if self._handle is None:
                 # no handle: the record is REFUSED, and it is counted as such (AMENDMENT-02, A5)
+                self.pending -= 1
                 if self.closed:
                     self.shutdown_refusals += 1
                 else:
@@ -107,6 +126,7 @@ class EvidenceLog:
             if self.closed:
                 # the acceptance boundary is closed: a submission that races the shutdown is refused, never
                 # accepted and then abandoned
+                self.pending -= 1
                 self.shutdown_refusals += 1
                 self.refused += 1
                 self.dropped += 1
@@ -115,12 +135,31 @@ class EvidenceLog:
             line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         except (TypeError, ValueError):
             with self.lock:
+                self.pending -= 1
                 self.serialization_refusals += 1
                 self.refused += 1
                 self.dropped += 1
                 self.errors += 1
             return False
         with self.lock:
+            # THE ENQUEUE.  Every acceptance condition is revalidated here, under this lock: the boundary may
+            # have closed while the record was being serialized (C1), the handle may be gone, and the bound may
+            # have been reached by the records the worker took in the meantime.
+            self.pending -= 1
+            if self.closed:
+                # the writer was closed while this record was being serialized: it is REFUSED, and it is
+                # counted as a shutdown refusal - never accepted into a queue no worker will write.
+                self.shutdown_refusals += 1
+                self.refused += 1
+                self.dropped += 1
+                return False
+            if self._handle is None:
+                # the handle is gone (the writer was closed and reaped): refused, in its own domain
+                self.init_failures += 1
+                self.refused += 1
+                self.dropped += 1
+                self.errors += 1
+                return False
             # the bound counts what the writer HOLDS: the queued records AND the one being written right now
             if self.outstanding_records >= self.queue_size \
                     or self.outstanding_bytes + len(line) > self.queue_bytes:
@@ -177,7 +216,9 @@ class EvidenceLog:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.lock:
-                if self.outstanding_records == 0:
+                # the records the writer HOLDS and the ones it is still serializing: a flush that returned while
+                # a submission was in the serializer would report the evidence as durable when it is not
+                if self.outstanding_records == 0 and self.pending == 0:
                     return True
             time.sleep(0.01)
         with self.lock:
@@ -254,6 +295,13 @@ class EvidenceLog:
                     #     accepted  = written + failed + outstanding
                     # holds at every moment, and the refusals are told apart by their own cause.
                     "submitted_records": self.submitted, "refused_records": self.refused,
+                    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D7): the submissions that are being
+                    # serialized right now.  They are neither accepted nor refused yet, so the published identity
+                    #     submitted = accepted + refused + pending
+                    # holds at EVERY moment, and at quiescence (pending = 0) it is the plain
+                    #     submitted = accepted + refused
+                    "pending_records": self.pending,
+                    "resolved_records": self.accepted + self.refused,
                     "initialization_failures": self.init_failures,
                     "serialization_refusals": self.serialization_refusals,
                     "capacity_refusals": self.capacity_refusals,
