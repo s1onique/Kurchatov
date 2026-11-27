@@ -29,4 +29,3 @@ reproduced here: it is upstream's history, not this ACT's work.
 
 The full machine-readable list is the `git diff --name-status` against the pinned
 revision. The compact form, by path:
-
