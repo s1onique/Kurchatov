@@ -107,6 +107,7 @@ dist-hip/
 
 # Local ACT execution artifacts
 /.kurchatov-acts/
+/.act-worktrees/
 
 # Terminal / Desktop split: local venvs, build output and archives never enter git
 .terminal-venv/
