@@ -71,6 +71,15 @@ class TelemetryStore:
     The store is bounded by BOTH a record count and a byte budget: a very long request cannot push the store over
     its memory ceiling.  It is intentionally NOT durable: nothing is written to disk here, and a restart empties it.
     The counters live here and never fall when a record is evicted - they are the process-lifetime totals.
+
+    ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01-CORRECTION-01: the store OWNS the records it aggregated.  The
+    terminal aggregation of a record is ONE-SHOT - it either committed, or it failed and its dispatched population
+    was resolved as MISSING evidence - and a record that is aggregated again is refused.  A record that belongs to
+    ANOTHER store is refused as well: this store never returns another store's committed receipt.
+
+    The content-based deduplication of the committed records is BOUNDED (see COMMITTED_RECORDS_LIMIT) and it is PER
+    STORE.  It protects against the IMMEDIATE repeat of the same record; it is NOT a protection against an
+    indefinite historical replay, and it is not claimed as one.
     """
 
     def __init__(self, max_records=DEFAULT_RETENTION_RECORDS, max_bytes=DEFAULT_RETENTION_BYTES,
@@ -224,6 +233,12 @@ class TelemetryStore:
 
         ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): a record that is already committed is not committed
         again: the same measurement is never counted twice, and the population is never resolved twice.
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01-CORRECTION-01: the terminal aggregation is ONE-SHOT and it is
+        OWNED by ONE store.  A failed aggregation resolves the dispatched population of its record as MISSING
+        evidence, so aggregating that record again is REFUSED: it would account the same invocation a second
+        time.  A record that belongs to ANOTHER store is refused as well, and this store never returns another
+        store's committed receipt.
         """
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A1): the invocation POPULATION is
         # counted at the terminal boundary, before the receipt is sealed, so it does not depend on the
@@ -241,6 +256,11 @@ class TelemetryStore:
         # it back, and a DIFFERENT record is never mistaken for it.
         digest = hashlib.blake2b(payload, digest_size=16).digest()
         with self.lock:
+            # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01-CORRECTION-01: the terminal aggregation is ONE-SHOT
+            # and it is OWNED by ONE store.  A record whose terminal aggregation is already resolved is not
+            # aggregated again, and a record that belongs to ANOTHER store is REFUSED here: this store never
+            # returns another store's committed receipt, and it never aggregates a foreign record.
+            self._one_shot_locked(record)
             request_id = (data.get("identity") or {}).get("request_id")
             # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): the COMMITTED identity.  A record that is already
             # committed is not committed again: the measurement, the histogram and the population are counted
@@ -327,6 +347,12 @@ class TelemetryStore:
                 record.seq = 0
                 data.pop("seq", None)
                 record._terminal_counted = terminal_counted_before
+                # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01-CORRECTION-01: the terminal aggregation of this
+                # record is RESOLVED (it failed), and this store owns it.  A retry is refused: the dispatched
+                # population of this record was already resolved as MISSING evidence, and aggregating it again
+                # would account the same invocation a second time.
+                record._terminal_aggregation = "failed"
+                record._aggregation_owner = self.server_instance_id
                 if population_counted_here:
                     # the dispatch HAPPENED: it stays in the population, and it is MISSING evidence - the
                     # aggregation failed, so nothing was measured.  The identity `dispatched = accounted + missing`
@@ -353,7 +379,10 @@ class TelemetryStore:
                 self._committed[digest] = self.seq
                 while len(self._committed) > COMMITTED_RECORDS_LIMIT:
                     self._committed.pop(next(iter(self._committed)))
-                record._committed = True
+                # ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01-CORRECTION-01: the terminal aggregation of this
+                # record is RESOLVED (it committed), and this store owns it.
+                record._terminal_aggregation = "committed"
+                record._aggregation_owner = self.server_instance_id
                 record._committed_data = data
             finally:
                 # the transaction is closed: the membership filter is written again at once from now on
@@ -369,14 +398,39 @@ class TelemetryStore:
                 0, self.counters["native_invocations_unresolved"] - dispatched_total)
         return data
 
+    def _one_shot_locked(self, record):
+        """The terminal aggregation of a record is ONE-SHOT, and it is owned by ONE store.
+
+        ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01-CORRECTION-01: a failed aggregation RESOLVES the dispatched
+        population of its record - the dispatches are MISSING evidence.  Aggregating that record again would
+        account the SAME invocation a second time and leave the population counted twice (accounted AND
+        missing), so the retry is refused.
+
+        The store's OWNERSHIP of the record is established here: the store that resolved the terminal
+        aggregation owns the record.  A record that belongs to ANOTHER store is REFUSED - this store never
+        returns another store's committed receipt, and it never aggregates a foreign record.
+        """
+        state = getattr(record, "_terminal_aggregation", None)
+        if state is None:
+            return                                   # the terminal aggregation never ran: it may run now
+        owner = getattr(record, "_aggregation_owner", None)
+        if owner != self.server_instance_id:
+            raise ValueError("the record's terminal aggregation belongs to another store")
+        if state == "failed":
+            raise ValueError("the record's terminal aggregation already failed: it is not aggregated again")
+
     def _is_committed_locked(self, record, digest) -> bool:
         """Whether this record is ALREADY committed (R5).
 
         ACT-STRATA-TELEMETRY-ATOMIC-STORE-COMMIT-01 (R5): a committed record is not committed again.  It is
         recognized by its OWN content (the digest of the serialized record) and by the mark the commit left on
         the record itself, so the same measurement is never counted twice - whatever path brings it back.
+
+        The content-based deduplication is BOUNDED (see COMMITTED_RECORDS_LIMIT) and PER STORE: it protects
+        against the IMMEDIATE repeat of the same record, and it does NOT protect against an indefinite
+        historical replay.  A record whose digest has fallen out of the bound may be aggregated again.
         """
-        return bool(getattr(record, "_committed", False)) or digest in self._committed
+        return getattr(record, "_terminal_aggregation", None) == "committed" or digest in self._committed
 
     @staticmethod
     def _kept_size(payload: bytes, seq: int) -> int:

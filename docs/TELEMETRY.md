@@ -535,6 +535,19 @@ A third review looked at the store's COMMIT alone. What changed:
 The witnesses are `serve/test_telemetry_store_commit.py`, the reversals are
 `tools/test_telemetry_store_commit_mutations.py`.
 
+## The corrections of ACT-...-ATOMIC-STORE-COMMIT-01-CORRECTION-01
+
+A fourth review looked at the store's terminal aggregation alone. What changed:
+
+| Where | Before | Now |
+|---|---|---|
+| the retry of a failed aggregation | the failed aggregation resolved the record's dispatched population as **missing** evidence, and a retry through the store's own API **accounted the same invocation again**: the population was counted twice (accounted AND missing) | the terminal aggregation is **one-shot**: a record whose aggregation failed is **refused** when it is offered again, so the population stays resolved once and `dispatched = accounted + missing + unresolved` still holds |
+| the ownership of a record | the store returned the committed receipt of **another** store when such a record was offered to it | the store **owns** the records it aggregated: a record that belongs to another store is **refused**, and this store never returns another store's committed receipt |
+| the committed identities | they were bounded, but the bound was not stated | the bound is stated: the content-based deduplication is **bounded** (1024 identities) and **per store**. It protects against the **immediate** repeat of the same record; it is **not** a protection against an indefinite historical replay, and it is not claimed as one |
+
+The witnesses are `serve/test_telemetry_store_commit_correction.py`, the reversals are
+`tools/test_telemetry_store_commit_correction_mutations.py`.
+
 ## See also
 
 * [docs/DETAILS.md](DETAILS.md) - the engine's own workings.
