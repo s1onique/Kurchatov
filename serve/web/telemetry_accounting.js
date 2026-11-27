@@ -89,19 +89,30 @@ function invocationFacts(record) {
   return facts;
 }
 
+// The reuse RATIO, as the card shows it: a measured zero is "0.0%" and an unavailable ratio is "—" (never a zero).
+function reuseRatioText(reuse) {
+  const r = reuse || {};
+  const ratio = r.ratio;
+  return (typeof ratio === "number" && isFinite(ratio)) ? `${(ratio * 100).toFixed(1)}%` : "—";
+}
+
 // The coverage line of the summary.  ACT-...-AMENDMENT-01 (A1): the populations it names are the CORRECTED ones -
 // the dispatched native invocations (not the receipts that were kept) and the physical requests that reached a
 // terminal outcome (not the receipts that were stored).
+//
+// ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F4): the COVERAGE POPULATIONS stay visible when
+// the cache ratio itself is unavailable: a missing ratio lowers the certainty of the page, it does not hide the
+// populations the ratio would have covered.
 function reuseCoverageLine(reuse) {
   const r = reuse || {};
-  const ratio = r.ratio;
-  if (ratio === null || ratio === undefined) return "no request has a complete reuse accounting yet";
   const coverage = (typeof r.coverage === "number") ? `${(r.coverage * 100).toFixed(0)}%` : "—";
+  const note = (r.ratio === null || r.ratio === undefined)
+    ? " · no request has a complete reuse accounting yet" : "";
   return `${telemetryNum(r.reused_tokens)} of ${telemetryNum(r.submitted_tokens)} tokens reused · `
     + `${telemetryNum(r.eligible_invocations)} of ${telemetryNum(r.invocations)} native invocations accounted for (${coverage}) · `
-    + `${telemetryNum(r.requests_with_complete_accounting)} of ${telemetryNum(r.requests)} requests`;
+    + `${telemetryNum(r.requests_with_complete_accounting)} of ${telemetryNum(r.requests)} requests${note}`;
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { accountingBarParts, invocationFacts, reuseCoverageLine, telemetryNum, telemetryMs };
+  module.exports = { accountingBarParts, invocationFacts, reuseCoverageLine, reuseRatioText, telemetryNum, telemetryMs };
 }

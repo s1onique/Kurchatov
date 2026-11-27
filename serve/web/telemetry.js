@@ -100,7 +100,12 @@ function renderStatus(status, summary) {
   // function of serve/web/telemetry_accounting.js, so the page and its witness cannot drift apart.  The
   // populations it names are the corrected ones (A1): the dispatched native invocations and the physical
   // requests that reached a terminal outcome.
-  $("#reuse-detail").textContent = reuseCoverageLine(reuse);
+  //
+  // ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F4): the card's own value is drawn again
+  // (the RESUME-01 patch dropped it), and the element is looked up the way this page looks elements up:
+  // `$` is getElementById, so the id is "reuse-detail" and NOT "#reuse-detail".
+  $("reuse-ratio").textContent = reuseRatioText(reuse);
+  $("reuse-detail").textContent = reuseCoverageLine(reuse);
 }
 
 function renderTable() {

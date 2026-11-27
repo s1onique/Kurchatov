@@ -47,8 +47,14 @@ class InvocationReceipt:
     state.  Two invocations of the same request never share a field.
     """
 
-    def __init__(self, invocation_id, ordinal, engine_instance_id=None, model_id=None, build_revision=None):
+    def __init__(self, invocation_id, ordinal, engine_instance_id=None, model_id=None, build_revision=None,
+                 parent=None):
         self.invocation_id = invocation_id
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the PARENT record.  The prompt
+        # domain is a property of the DISPATCH, and the parent keeps the domain's MULTIPLICITY even when this
+        # receipt is later discarded: the request's own prompt coverage must not become more certain when the
+        # retention keeps fewer receipts.
+        self._parent = parent
         self.ordinal = ordinal
         self.engine_instance_id = engine_instance_id
         self.model_id = model_id
@@ -75,10 +81,13 @@ class InvocationReceipt:
         self.native_partial = False
         # the prompt this dispatch gave the engine (the invocation's OWN prompt domain)
         self.submitted_tokens = None
-        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C4): the NAME of the prompt domain this dispatch
-        # carried - "request", "continuation" or "other".  It is a word, not a hash and not content: the prompt's
-        # LENGTH is not its identity.
-        self.prompt_domain = None
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the NAME of the prompt domain this
+        # dispatch carried - "request", "continuation" or "other".  It is a word, not a hash and not content: the
+        # prompt's LENGTH is not its identity.
+        #
+        # F2: the domain is a PROPERTY, so that naming it is recorded by the PARENT record even when this receipt
+        # is later discarded: the request's own domain MULTIPLICITY must survive the retention of the receipts.
+        self._prompt_domain = None
         self.rendered_tokens = None
         self.slot_id = None
         self.matched_prefix_tokens = None
@@ -116,6 +125,25 @@ class InvocationReceipt:
         self.quality = COMPLETE
         self.accounting = {"state": "unevaluated", "valid": None, "problems": []}
 
+    # ------------------------------------------------------------------ the prompt domain (F2)
+    @property
+    def prompt_domain(self):
+        """The NAME of the prompt domain this dispatch carried ("request", "continuation", "other" or None)."""
+        return self._prompt_domain
+
+    @prompt_domain.setter
+    def prompt_domain(self, value):
+        """Naming the domain tells the PARENT that this dispatch carried it.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the parent counts the dispatches
+        per domain AT THE DISPATCH BOUNDARY.  The count lives in the parent, not in the receipts, so it survives
+        the retention of the receipts: the request's own prompt coverage can never become exact because a
+        receipt was DISCARDED.
+        """
+        self._prompt_domain = value
+        parent = getattr(self, "_parent", None)
+        if parent is not None:
+            parent.note_prompt_domain(self.invocation_id, value)
 
     # ------------------------------------------------------------------ the measurements
     def mark_unavailable(self, field, reason, quality=UNSUPPORTED):

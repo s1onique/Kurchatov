@@ -89,6 +89,27 @@ def _counter(value):
     return value
 
 
+def effective_terminal_inputs(positional: dict | None = None, terminal_state: str = "completed",
+                              native_state: str | None = None, native_segment_only: bool = False):
+    """The EFFECTIVE inputs of ONE terminal commit: the state that will be applied and the partial classification.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F3): there is ONE authority for the terminal
+    evidence.  The predecessor normalized the state and the partial classification from the POSITIONAL dictionary
+    while `apply_engine` applied SEPARATELY SUPPLIED arguments - so the evidence that was compared and the evidence
+    that was committed could disagree (a duplicate that changed the native outcome looked identical).
+
+    These are the values the commit actually consumes:
+      * the terminal state: the supplied native state, and the terminal state when none was supplied;
+      * the partial classification: the supplied flag, or the one the positional dictionary carries.
+    """
+    positional = positional or {}
+    if native_state is None:
+        native_state = positional.get("native_state")
+    state = native_state if native_state is not None else terminal_state
+    partial = bool(native_segment_only) or bool(positional.get("native_segment_only"))
+    return state, partial
+
+
 def normalize_terminal_evidence(figures: dict | None, positional: dict | None = None) -> dict:
     """The COMPLETE, NORMALIZED terminal evidence of ONE native dispatch (A3a).
 
@@ -97,6 +118,12 @@ def normalize_terminal_evidence(figures: dict | None, positional: dict | None = 
     the generation counters, the partial classification, the native finish reason, the native terminal state and
     the id the engine echoed.  Five prompt counters are not a terminal evidence: a duplicate that changed a
     duration, a generation count, the restoration's outcome or the native outcome is a CONFLICT.
+
+    ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F3): the state and the partial
+    classification are the EFFECTIVE ones - the very values the terminal commit consumes.  The caller puts them
+    into the positional dictionary (see `effective_terminal_inputs`) before calling this, so there is ONE
+    authority for the terminal evidence: a change of the effective terminal state or of the effective partial
+    classification is a CONFLICT, not an identical duplicate.
     """
     figures = figures or {}
     positional = positional or {}
@@ -222,7 +249,19 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
         receipt = record.adopt_legacy_invocation(expected)
     # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): the incoming evidence, normalized.
     # It is built BEFORE anything is applied, so the comparison below cannot be influenced by an application.
-    incoming = normalize_terminal_evidence(figures, positional)
+    #
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F3): there is ONE authority for the terminal
+    # evidence.  The EFFECTIVE inputs - the terminal state and the partial classification - are resolved ONCE, and
+    # the normalization consumes exactly those values, so the evidence that is COMPARED and the evidence that is
+    # COMMITTED can never disagree.  A duplicate that changed the effective state or the effective partial
+    # classification is a CONFLICT.
+    effective_state, effective_partial = effective_terminal_inputs(positional, terminal_state=terminal_state,
+                                                                   native_state=native_state,
+                                                                   native_segment_only=native_segment_only)
+    effective_positional = dict(positional or {})
+    effective_positional["native_state"] = effective_state
+    effective_positional["native_segment_only"] = effective_partial
+    incoming = normalize_terminal_evidence(figures, effective_positional)
     # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A3a): an ACCEPTED terminal receipt is never
     # silently overwritten.  The comparison is the COMPLETE evidence, and it happens BEFORE any measurement is
     # applied: an identical duplicate performs no update at all, a conflicting or a foreign one keeps the accepted
@@ -347,8 +386,8 @@ def apply_engine(record: RequestRecord, figures: dict | None, expected_invocatio
     # THIS dispatch.  Uncorrelated evidence does not establish one: the receipt stays "running" and the record's
     # seal turns it into "unknown" (never "completed", never "failed").
     if receipt.correlation == CORRELATION_VERIFIED:
-        receipt.state = native_state if native_state is not None else terminal_state
-    if native_segment_only:
+        receipt.state = effective_state
+    if effective_partial:
         receipt.native_partial = True
         receipt.mark_unavailable("cache",
                                  "the engine's batch slot reported only its admission segment: the native "

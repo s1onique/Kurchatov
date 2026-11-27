@@ -82,17 +82,20 @@ class ServerTelemetry:
         # invocations is the number of dispatches, and it must not depend on the receipt's storage: a request whose
         # terminal receipt is lost (a failed seal, a failed serialization, a failed store) keeps its dispatches in
         # the population, so the coverage falls instead of the population shrinking.
-        dispatched = self.store.count_dispatch_population(record)
-        counted_before = self.store.native_counters_snapshot()
+        self.store.count_dispatch_population(record)
         try:
             record.seal(state=state, http_status=http_status, finish_reason=finish_reason, detail=detail)
             data = self.store.add(record)
         except Exception:                   # noqa: BLE001 - a receipt that cannot be sealed is a lost receipt, not a
             # lost request: the terminal outcome above still stands.  The dispatches of this request are still
             # real work: they stay in the population and they are counted as MISSING evidence (A1).
-            accounted, missing = self.store.native_counters_snapshot()
-            already = (accounted - counted_before[0]) + (missing - counted_before[1])
-            self.store.count_unaccounted_dispatches(max(0, dispatched - already))
+            #
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F1): the accounting is
+            # REQUEST-LOCAL.  The predecessor compared the GLOBAL counters before and after the failure, so a
+            # CONCURRENT request that completed in between was read as this request's own progress: the failed
+            # request's dispatch was counted as accounted instead of missing.  Now the outcome is counted on
+            # this request's own bookkeeping, and the store's lock is not held across the sealing.
+            self.store.count_unaccounted_dispatches(record)
             self.store.receipt_failed()
             raise
         if self.evidence is not None:

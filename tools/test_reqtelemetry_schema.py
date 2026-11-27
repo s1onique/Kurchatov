@@ -45,6 +45,13 @@ def main() -> int:
           "the historical contract keeps its own identity")
     check(SCHEMA_V3["properties"]["schema_version"] == {"const": "strata.request-telemetry/3"},
           "the current contract has its own identity")
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F5): the two contracts are TWO schema
+    # RESOURCES: each has its own identifier, and the current one ends in its own version's file name.
+    check(SCHEMA_V2["$id"] != SCHEMA_V3["$id"], "the two contracts are two resources, not one")
+    check(SCHEMA_V2["$id"].endswith("strata-request-telemetry-2.json"),
+          f"the historical resource is the v2 one: {SCHEMA_V2['$id']}")
+    check(SCHEMA_V3["$id"].endswith("strata-request-telemetry-3.json"),
+          f"the current resource is the v3 one: {SCHEMA_V3['$id']}")
 
     # 2. a record the server produces validates
     tel = ServerTelemetry()

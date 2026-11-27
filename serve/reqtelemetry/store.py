@@ -105,6 +105,11 @@ class TelemetryStore:
             # INVOCATION: a receipt that never arrived is in the missing population, so a lost receipt lowers the
             # coverage instead of silently improving it.
             "native_invocations": 0, "native_invocations_accounted": 0, "native_invocations_missing": 0,
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F1): the UNRESOLVED population.
+            # A dispatched invocation is unresolved from the moment its dispatch is counted until the moment its
+            # aggregation outcome is known (accounted or missing).  It is the only population that is neither
+            # accounted nor missing, and it exists only WHILE a request is being finalized.
+            "native_invocations_unresolved": 0,
             # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (C2): the receipts that did not fit the bounds.
             # They are missing EVIDENCE: the invocation happened, its receipt did not survive.
             "native_invocations_dropped": 0,
@@ -137,6 +142,9 @@ class TelemetryStore:
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A4): the identities this store has EVER
         # observed.  It is the authority that a forgotten identity is not a new one (see _SeenEngines).
         self._seen_engines = _SeenEngines()
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the prompt-domain authority of the
+        # record being aggregated.  It is set for the duration of the aggregation (which runs under the lock).
+        self._authority = {}
         # The duration histograms, in SECONDS: name -> {"sum": seconds, "n": count, "buckets": [cumulative counts]}.
         # The record keeps its timings in milliseconds (the record's own unit is named in the section), and the store
         # converts them ONCE, here, when it observes them.  Everything downstream of this line is seconds.
@@ -181,13 +189,32 @@ class TelemetryStore:
             self.counters["evidence_delivery_failures"] += 1
 
     def add(self, record: RequestRecord) -> dict:
-        """Seal the record, keep it, and count it.  Returns the record's dict (what the API hands out)."""
+        """Seal the record, keep it, and count it.  Returns the record's dict (what the API hands out).
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F1): the SERIALIZATION happens OUTSIDE
+        the store's lock - the global lock is not held across an arbitrary serialization - and the counting is
+        ATOMIC: when the aggregation fails, the counters are rolled back to the state before it, so a failure
+        cannot partially commit measurements and then count them again.
+        """
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A1): the invocation POPULATION is
+        # counted at the terminal boundary, before the receipt is sealed, so it does not depend on the
+        # receipt's storage.  The fallback below is for a caller that stores a receipt without that boundary
+        # (the store's own API): it counts the DISPATCHES, never the receipts (a compatibility receipt is
+        # not a dispatch).
+        data = record.to_dict()
+        size = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
         with self.lock:
+            # ACT-...-AMENDMENT-01 (F1): the state before ANY mutation.  A failure inside the aggregation
+            # restores it, so nothing is partially committed and nothing is counted twice afterwards.
+            snapshot = dict(self.counters)
+            evictions_before = dict(self._evictions_by_engine)
+            retired_before = dict(self._retired_evictions)
+            unattributable_before = set(self._unattributable_engines)
+            histograms_before = {k: {"sum": v["sum"], "n": v["n"], "buckets": list(v["buckets"])}
+                                 for k, v in self.histograms.items()}
             self.seq += 1
             record.seq = self.seq
-            data = record.to_dict()
             data["seq"] = self.seq
-            size = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
             self.records.append((self.seq, data, size))
             self.bytes += size
             self._evict_locked()
@@ -202,15 +229,56 @@ class TelemetryStore:
                 if key is not None:
                     self.counters[key] += 1
                     record._terminal_counted = True
-            self._count_locked(data)
-            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A1): the invocation POPULATION is
-            # counted at the terminal boundary, before the receipt is sealed, so it does not depend on the
-            # receipt's storage.  The fallback below is for a caller that stores a receipt without that boundary
-            # (the store's own API): it counts the DISPATCHES, never the receipts (a compatibility receipt is
-            # not a dispatch).
+            dispatched_total = int((data.get("measurement_quality") or {}).get("invocations_dispatched") or 0)
+            population_counted_here = False
             if not getattr(record, "_population_counted", False):
-                self.counters["native_invocations"] += int(
-                    (data.get("measurement_quality") or {}).get("invocations_dispatched") or 0)
+                # the fallback boundary: this record's dispatch population is counted here
+                self.counters["native_invocations"] += dispatched_total
+                self.counters["native_invocations_unresolved"] += dispatched_total
+                record._population_counted = True
+                record._population_dispatched = dispatched_total
+                population_counted_here = True
+            # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the request's own domain
+            # authority is in force for this record: the uniqueness of the request's own prompt domain is decided
+            # by the DISPATCH boundary, not by the receipts that survived the retention.
+            self._authority = self._domain_authority(record)
+            try:
+                self._count_locked(data)
+            except Exception:
+                # ACT-...-AMENDMENT-01 (F1): the aggregation is ATOMIC.  A failure inside it rolls the counters
+                # and the bookkeeping back: no measurement is partially committed, and nothing is counted twice
+                # afterwards.  The record itself is rolled back too - it was never aggregated.
+                self.counters.clear()
+                self.counters.update(snapshot)
+                self._evictions_by_engine.clear()
+                self._evictions_by_engine.update(evictions_before)
+                self._retired_evictions.clear()
+                self._retired_evictions.update(retired_before)
+                self._unattributable_engines.clear()
+                self._unattributable_engines.update(unattributable_before)
+                self.histograms.clear()
+                self.histograms.update(histograms_before)
+                self.records.pop()
+                self.bytes -= size
+                self.seq -= 1
+                record.seq = 0
+                if population_counted_here:
+                    # the dispatch HAPPENED: it stays in the population, and it is MISSING evidence - the
+                    # aggregation failed, so nothing was measured.  The identity `dispatched = accounted + missing`
+                    # holds here too.
+                    self.counters["native_invocations"] += dispatched_total
+                    self.counters["native_invocations_missing"] += dispatched_total
+                    record._population_missing = dispatched_total
+                raise
+            # ACT-...-AMENDMENT-01 (F1): the outcome of THIS request's dispatches is its own: the dispatches it
+            # dispatched, less the ones its own aggregation resolved.  A concurrent request never enters here.
+            accounted = self.counters["native_invocations_accounted"] - snapshot["native_invocations_accounted"]
+            missing = self.counters["native_invocations_missing"] - snapshot["native_invocations_missing"]
+            record._population_accounted = accounted
+            record._population_missing = missing
+            # the dispatches of THIS request are resolved now: they leave the unresolved population.
+            self.counters["native_invocations_unresolved"] = max(
+                0, self.counters["native_invocations_unresolved"] - dispatched_total)
         return data
 
     # ------------------------------------------------------------------ the native dispatch population (A1)
@@ -219,37 +287,57 @@ class TelemetryStore:
 
         ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A1): the population of the native
         invocations is the number of DISPATCHES, and it is counted where the dispatch is FINALIZED - before the
-        receipt is sealed - so it does not depend on the receipt's storage at all.  A request whose terminal receipt
+        receipt is sealed - so it does not depend on the receipt's storage.  A request whose terminal receipt
         was lost (a failed seal, a failed serialization, a failed store) keeps its dispatches in the population:
         the coverage falls instead of the population shrinking.
 
         A request that is STILL RUNNING has no terminal outcome yet: its dispatches are not in the population until
-        the request ends.  Every dispatch is counted EXACTLY ONCE - the record remembers that it was counted.
+        the request ends.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F1): the accounting is REQUEST-LOCAL and
+        IDEMPOTENT.  The check and the mark happen INSIDE the store's lock - the synchronized accounting boundary -
+        so two terminalizations of one request can never count its population twice, and the count of ONE request
+        never depends on the counters of ANOTHER request.
+
+        The dispatches of a request that is being finalized are UNRESOLVED: their aggregation outcome is not known
+        yet.  They are neither accounted nor missing until it is known, and at quiescence the unresolved
+        population is empty and `dispatched = accounted + missing`.
         """
-        dispatched = int(getattr(record, "invocations_total", 0) or 0)
         with self.lock:
+            if getattr(record, "_population_counted", False):
+                # already counted at the synchronized boundary: counting it again would double the population
+                return int(getattr(record, "_population_dispatched", 0) or 0)
+            dispatched = int(getattr(record, "invocations_total", 0) or 0)
             self.counters["native_invocations"] += dispatched
-        if record is not None:
-            record._population_counted = True
-        return dispatched
+            self.counters["native_invocations_unresolved"] += dispatched
+            if record is not None:
+                record._population_counted = True
+                record._population_dispatched = dispatched
+            return dispatched
 
-    def native_counters_snapshot(self) -> tuple:
-        """The (accounted, missing) counters of the native population, for a delta around a failure (A1)."""
-        with self.lock:
-            return (self.counters["native_invocations_accounted"],
-                    self.counters["native_invocations_missing"])
+    def count_unaccounted_dispatches(self, record):
+        """The dispatches of THIS request whose aggregation outcome is not known: they are MISSING evidence (F1).
 
-    def count_unaccounted_dispatches(self, count):
-        """Dispatches whose receipt was never aggregated: they are MISSING evidence (A1).
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F1): the accounting is REQUEST-LOCAL.
+        The predecessor compared the GLOBAL counters before and after the failure, so a CONCURRENT request that
+        completed in between was read as this request's own progress: the failed request's dispatches were
+        counted as accounted instead of missing, and the coverage rose on a failure.
 
-        They stay in the population (the dispatch happened) and they are counted as missing, never as accounted.
+        Now the outcome is counted on the REQUEST's own bookkeeping: the dispatches it dispatched, less the ones
+        its own aggregation already resolved.  A concurrent request's counters are never read here.
         """
-        count = int(count or 0)
-        if count <= 0:
-            return 0
         with self.lock:
-            self.counters["native_invocations_missing"] += count
-        return count
+            dispatched = int(getattr(record, "_population_dispatched", 0) or 0)
+            accounted = int(getattr(record, "_population_accounted", 0) or 0)
+            missing = int(getattr(record, "_population_missing", 0) or 0)
+            outstanding = max(0, dispatched - accounted - missing)
+            if outstanding:
+                self.counters["native_invocations_missing"] += outstanding
+                self.counters["native_invocations_unresolved"] = max(
+                    0, self.counters["native_invocations_unresolved"] - outstanding)
+                if record is not None:
+                    record._population_missing = missing + outstanding
+            return outstanding
 
     def _evict_locked(self):
         """The old records go first, until the store is inside both ceilings."""
@@ -269,8 +357,16 @@ class TelemetryStore:
         keep their own authority, the durations need a correlated WHOLE invocation, and the complete cache-reuse
         ratio needs an accounting that SATISFIED.  The same native work is never counted twice: a measurement that
         the parent mirrors from its single receipt is counted from the receipt, not from the parent.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): `authority` is the REQUEST's own
+        prompt-domain bookkeeping - how many dispatches carried each domain, counted at the dispatch boundary.
+        The uniqueness of the request's own prompt domain is decided by THAT, never by the receipts that survived
+        the retention: a discarded receipt must not make the request's coverage look exact.
         """
         c = self.counters
+        authority = self._authority or {}
+        domain_counts = authority.get("domain_counts") or {}
+        request_domain_dispatches = int(domain_counts.get("request", 0) or 0)
         c["requests_total"] += 1
         state = data["lifecycle"]["state"]
         if state == "completed":
@@ -299,17 +395,12 @@ class TelemetryStore:
         # invocation carried that domain, the sum of their positions is NOT the request's distinct coverage (the
         # same prompt was executed twice), so the request-level coverage stays UNAVAILABLE: only the cumulative
         # native work is counted.
-        request_domain = []
-        for invocation in data.get("invocations") or []:
-            iprompt = invocation.get("prompt") or {}
-            if iprompt.get("domain") == "request":
-                request_domain.append((invocation.get("identity") or {}).get("engine_invocation_id"))
-        unique_request_domain = None
-        if len(request_domain) > 1:
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the MULTIPLICITY comes from the
+        # request's own dispatch-time bookkeeping, so it does not change when a receipt is discarded.
+        if request_domain_dispatches > 1:
             c["requests_with_ambiguous_prompt_coverage"] += 1
         coverage_ids = self._request_coverage_ids(data.get("invocations") or [])
-        if coverage_ids:
-            unique_request_domain = coverage_ids[0]
+        unique_request_domain = coverage_ids[0] if coverage_ids else None
         eligible = {}
         for invocation in data.get("invocations") or []:
             identity = (invocation.get("identity") or {}).get("engine_invocation_id")
@@ -342,20 +433,43 @@ class TelemetryStore:
             c["records_aggregate_excluded"] += 1
         self._observe_locked(data)
 
+    def _domain_authority(self, record) -> dict:
+        """The REQUEST's own prompt-domain authority (F2).
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the authority is the REQUEST's own
+        dispatch-time bookkeeping - how many dispatches carried which prompt domain.  It is NOT derived from the
+        receipts that survived the retention: a discarded receipt must never make the request's own prompt
+        coverage look exact.  The domain is a NAME, never a prompt hash and never content.
+        """
+        if record is None:
+            return {"domain_counts": {}, "request_domain_ids": [], "unique_request_domain": None}
+        counts = record.domain_counts()
+        request_ids = [invocation_id for invocation_id, domain in record.domain_state().items()
+                       if domain == "request"]
+        return {"domain_counts": counts,
+                "request_domain_ids": request_ids,
+                "unique_request_domain": record.unique_request_domain_invocation()}
+
     def _request_coverage_ids(self, invocations) -> list:
-        """The invocation(s) whose positions ARE the request's own prompt coverage (A2).
+        """The invocation(s) whose positions ARE the request's own prompt coverage (A2, F2).
 
         The request's own prompt domain was carried by exactly ONE native dispatch: only that dispatch's
         positions are the request's prompt coverage.  When SEVERAL dispatches carried it, the sum of their
         positions is not one prompt's coverage (the same prompt was executed more than once), so the coverage is
         UNAVAILABLE - and the cumulative native work is counted instead.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the MULTIPLICITY is the REQUEST's own
+        (see `_domain_authority`), so it does not change when a receipt is discarded: the uniqueness is decided
+        by the dispatch boundary, not by the retention.  When the authority cannot establish the uniqueness, the
+        exact request-level coverage is REFUSED - never guessed from the receipts that survived.
         """
-        ids = []
+        unique = (self._authority or {}).get("unique_request_domain")
+        if unique is None:
+            return []
         for invocation in invocations:
-            prompt = invocation.get("prompt") or {}
-            if prompt.get("domain") == "request":
-                ids.append((invocation.get("identity") or {}).get("engine_invocation_id"))
-        return ids[:1] if len(ids) == 1 else []
+            if (invocation.get("identity") or {}).get("engine_invocation_id") == unique:
+                return [unique]
+        return []
 
     def _count_invocation_locked(self, c, invocation, request_submitted, unique_request_domain=None) -> bool:
         """One native invocation's receipt, counted under its OWN metric classes (G1, G2).

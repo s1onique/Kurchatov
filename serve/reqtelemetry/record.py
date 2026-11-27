@@ -178,9 +178,24 @@ class RequestRecord:
         # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01 (D2b): the ids this request DISPATCHED (bounded).
         # The dispatch boundary is the only authority that may create a dispatch; the terminal evidence may not.
         self.dispatched_ids = []
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the REQUEST's own prompt domain
+        # MULTIPLICITY, counted at the dispatch boundary.  It survives the retention of the receipts: a discarded
+        # receipt must not make the request's own coverage look exact.
+        # _domain_counts maps a domain NAME to the number of dispatches that carried it; the key None is the
+        # dispatches whose domain could not be established.
+        self._domain_counts = {None: 0}
+        self._domain_state = {}                 # invocation id -> its domain (bounded)
+        self._request_domain_id = None          # the id of the (single) request-domain dispatch
         self.invocations_bytes = 0
         self.invocations_dropped = 0
         self.invocations_dropped_bytes = 0
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F1): the REQUEST's own population
+        # bookkeeping.  It is the request's OWN record of how its dispatches were resolved, so the accounting of
+        # one request never depends on the counters of another request.
+        self._population_counted = False        # the dispatch population was counted at the terminal boundary
+        self._population_dispatched = 0         # how many native invocations this request dispatched
+        self._population_accounted = 0          # how many of them were accounted (aggregated as evidence)
+        self._population_missing = 0            # how many of them are missing evidence
         # AMENDMENT-02 (G1): the engine sent a measurement that is not a measurement (a negative count, a
         # fraction, a bool).  It was refused at the admission boundary and the record says so.
         self.measurements_invalid = False
@@ -393,17 +408,96 @@ class RequestRecord:
                                     else engine_instance_id,
                                     model_id=self.model_id if model_id is OMITTED else model_id,
                                     build_revision=self.build_revision if build_revision is OMITTED
-                                    else build_revision)
+                                    else build_revision,
+                                    parent=self)
         self.invocations_total += 1
         self.dispatched_ids.append(invocation_id)
         if len(self.dispatched_ids) > MAX_DISPATCHED_IDS:
             del self.dispatched_ids[:-MAX_DISPATCHED_IDS]
+        # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the dispatch is registered with an
+        # UNKNOWN domain.  The dispatch boundary names it right after; until it does, the request's own domain
+        # multiplicity cannot be established, and the exact request-level coverage is refused.
+        self._domain_state[invocation_id] = None
+        self._domain_counts[None] = self._domain_counts.get(None, 0) + 1
+        self._trim_domain_state()
         self._add_receipt(receipt)
         return receipt
 
     def dispatched(self, invocation_id) -> bool:
         """Whether THIS request dispatched that invocation id (the dispatch boundary is the only authority)."""
         return invocation_id is not None and invocation_id in self.dispatched_ids
+
+    # ------------------------------------------------------------------ the request's own prompt domain (F2)
+    def note_prompt_domain(self, invocation_id, domain):
+        """The dispatch boundary named the prompt domain of ONE dispatch (F2).
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the REQUEST's own domain
+        MULTIPLICITY is the property of the REQUEST, not of the receipts it still holds.  The count lives here,
+        at the dispatch boundary, and it is published in the record's own sections - so that the coverage
+        selector can tell "one dispatch carried the request's prompt" from "two did" even when one of the two
+        receipts was DISCARDED.  Retention must never improve the measurement's certainty.
+
+        The domain is a NAME ("request", "continuation", "other"), never a prompt hash and never content.
+        """
+        if invocation_id is None:
+            return
+        previous = self._domain_state.get(invocation_id, "missing")
+        if previous == "missing" or previous == domain:
+            return
+        self._domain_state[invocation_id] = domain
+        self._domain_counts[previous] = max(0, self._domain_counts.get(previous, 0) - 1)
+        self._domain_counts[domain] = self._domain_counts.get(domain, 0) + 1
+        if domain == "request":
+            if self._request_domain_id is None:
+                self._request_domain_id = invocation_id
+        elif previous == "request" and self._request_domain_id == invocation_id:
+            self._request_domain_id = None
+        self._trim_domain_state()
+
+    def domain_counts(self) -> dict:
+        """How many dispatches carried each prompt domain (F2).
+
+        The key None is the dispatches whose domain could NOT be established.  The counts are the REQUEST's own
+        bookkeeping: they do not change when a receipt is discarded.
+        """
+        return dict(self._domain_counts)
+
+    def domain_state(self) -> dict:
+        """The bounded per-dispatch domain memory: the invocation id -> the domain it carried (F2)."""
+        return dict(self._domain_state)
+
+    def unique_request_domain_invocation(self):
+        """The ONE invocation that carried the request's own prompt domain - or None (F2).
+
+        None when the request's own domain was NOT carried exactly once, or when a dispatch's domain could not
+        be established: in both cases the exact request-level coverage cannot be established, and it is refused
+        rather than guessed.
+        """
+        if self._domain_counts.get(None, 0):
+            return None
+        if self._domain_counts.get("request", 0) != 1:
+            return None
+        return self._request_domain_id
+
+    def _trim_domain_state(self):
+        """The per-dispatch domain memory is BOUNDED: the oldest entries go (the counts stay)."""
+        if len(self._domain_state) > MAX_DISPATCHED_IDS:
+            for invocation_id in list(self._domain_state)[:-MAX_DISPATCHED_IDS]:
+                del self._domain_state[invocation_id]
+
+    def request_domain_coverage_id(self):
+        """The invocation whose positions ARE the request's own prompt coverage - or None.
+
+        ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (F2): the answer is given by the
+        REQUEST's own domain multiplicity, which survives the retention of the receipts:
+
+          * exactly ONE dispatch carried the request's own domain and NO dispatch has an unknown domain: the
+            coverage is that dispatch's - if its receipt is still held;
+          * TWO dispatches carried it: the coverage is not the sum of their positions, it is UNAVAILABLE;
+          * a dispatch's domain could not be established: the request's own domain multiplicity cannot be
+            established either, so the exact coverage is REFUSED (conservatively).
+        """
+        return self.unique_request_domain_invocation()
 
     def adopt_legacy_invocation(self, invocation_id, ordinal=None):
         """The COMPATIBILITY path: a receipt for an invocation id this request never dispatched.

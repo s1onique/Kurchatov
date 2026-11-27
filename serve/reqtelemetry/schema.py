@@ -39,7 +39,10 @@ def _str_or_null(max_length=None):
 # executable test, so the contract on the wire and the contract in the code cannot drift apart.
 SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-2.json",
+    # ACT-STRATA-REQUEST-CAUSAL-TELEMETRY-01-CLOSURE-01-AMENDMENT-01 (A5c): the CURRENT contract has its OWN
+    # schema resource identity.  The historical one keeps strata-request-telemetry-2.json; the corrected one is
+    # strata-request-telemetry-3.json.  Two versions, two resources, two files.
+    "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-3.json",
     "title": "Strata per-request telemetry record",
     "type": "object",
     "required": ["schema_version", "identity", "lifecycle", "prompt", "cache", "timing_ms", "generation",

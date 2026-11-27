@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-2.json",
+  "$id": "https://github.com/s1onique/Kurchatov/schemas/strata-request-telemetry-3.json",
   "title": "Strata per-request telemetry record",
   "type": "object",
   "required": [

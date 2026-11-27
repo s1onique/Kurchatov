@@ -504,6 +504,23 @@ The witnesses are `serve/test_telemetry_amendment01.py`, the reversals are
 `tools/test_telemetry_amendment01_mutations.py`, and the browser's inspector is checked by
 `tools/test_telemetry_web_inspector.py`.
 
+## The corrections of ACT-...-CLOSURE-01-AMENDMENT-01 (FINAL-CORRECTION)
+
+A second review of the corrections above found five more defects. What changed:
+
+| Where | Before | Now |
+|---|---|---|
+| the native dispatch population on a failure | the outcome was read from the **global** counters before and after the failure, so a **concurrent** request that completed in between was read as this request's own progress | the outcome is counted on the **request's own** bookkeeping: the dispatches it dispatched, less the ones its own aggregation resolved. The dispatch-population boundary is **idempotent** and the check happens inside the store's lock. At quiescence `dispatched = accounted + missing`; a dispatch whose outcome is not known yet is in the **unresolved** population (`native_invocations_unresolved`) |
+| an aggregation that fails | it could commit part of its measurements and then count them again | it is **atomic**: a failure rolls the counters, the histograms and the stored record back, so nothing is partially committed and nothing is counted twice |
+| the request's own prompt coverage | the uniqueness was decided by the **retained** receipts: a discarded receipt made the surviving one look unique | the multiplicity is the **request's own**, counted at the dispatch boundary: it survives the retention. When the request's own domain was carried twice - or a dispatch's domain could not be established - the exact request-level coverage is **refused**, never guessed. Retention never improves the certainty |
+| the terminal evidence | the state and the partial classification were normalized from one dictionary and applied from another | there is **one** authority: the **effective** state and partial classification are resolved once, and the comparison consumes exactly the values the commit applies. A duplicate that changed the effective state or the effective partial classification is a **conflict** |
+| the cache-reuse card | the RESUME-01 patch dropped the assignment to the `reuse-ratio` element, and the coverage line disappeared when the ratio was unavailable | the card's value is drawn again (`$("reuse-ratio")`, looked up the way the page looks elements up: `$` is `getElementById`), and the **coverage populations stay visible** when the ratio itself is unavailable |
+| the wire contract | the current contract carried the historical resource identity | the two contracts are **two resources**: the historical `strata-request-telemetry-2.json` and the current `strata-request-telemetry-3.json` |
+
+The witnesses are `serve/test_telemetry_amendment01_final.py`, the reversals are
+`tools/test_telemetry_amendment01_final_mutations.py`, the card is checked by
+`tools/test_telemetry_web_status.py`, and the schema resources by `tools/test_reqtelemetry_schema.py`.
+
 ## See also
 
 * [docs/DETAILS.md](DETAILS.md) - the engine's own workings.
