@@ -1,0 +1,16 @@
+metrics_keys=build,conversation_cache,engine,hardware,hardware_static,history,live,requests,requests_kept,telemetry,time,totals
+telemetry_summary={"cache_reuse": {"coverage": null, "dropped_invocations": 0, "eligible_invocations": 0, "eligible_requests": 0, "invocations": 0, "missing_invocations": 0, "ratio": null, "request_coverage": null, "requests": 0, "requests_with_complete_accounting": 0, "reused_tokens": 0, "submitted_tokens": 0}, "counters": {"cache_evictions": 0, "cache_evictions_attribution_unavailable": 0, "cache_evictions_unattr
+upstream_compatible_families=10 present
+canonical_families=13 present
+canonical_families_are_process_scoped=true
+upstream_families_keep_model_label=86
+unmeasured_durations_publish_no_sample=true
+exposition_well_formed=true
+duration_buckets=19 latency_buckets=22
+[strata] done: 21 tokens in 0 s (no speed) (stop, cancel=False)
+request_usage={"completion_tokens": 21, "prompt_tokens": 246, "prompt_tokens_details": {"cached_tokens": 0}, "total_tokens": 267}
+populated_summary={"cache_evictions": 0, "cache_evictions_attribution_unavailable": 0, "cache_evictions_unattributed": 0, "cache_restore_attempts": 0, "cache_restore_failures": 0, "dropped_records": 0, "emitted_tokens": 0, "evidence_delivery_failures": 0, "generated_tokens": 0, "instrumentation_errors": 0, "native_invocations": 1, "native_invocations_accounted": 0, "native_invocations_dropped": 0, "native_invocatio
+http_exposition_bytes=18632 content_type=text/plain; version=0.0.4; charset=utf-8
+http_upstream_families=20
+http_canonical_families=31
+PROMETHEUS_EXPOSITION_OK
